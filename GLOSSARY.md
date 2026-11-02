@@ -69,8 +69,20 @@ A day on which breakpoint is on, together with the hours the user works on it. N
 _Avoid_: schedule, shift, business hours
 
 **Weekend**:
-The days the user does not work and breakpoint stays silent. Not necessarily Saturday and Sunday.
+The days the user does not work and breakpoint stays quiet. Friday and Saturday by default; not necessarily Saturday and Sunday.
 _Avoid_: days off, holidays
+
+**Quiet**:
+The state in which no nudge fires: outside work hours, on the weekend, or turned off. Starting quiet expires any pending occurrence; leaving it starts every cadence from zero.
+_Avoid_: silent, muted, paused, do not disturb
+
+**Off**:
+Quiet by the user's choice on a work day, until the next work day starts or the user turns breakpoint back on. Survives a restart.
+_Avoid_: disabled, paused, snoozed
+
+**Overtime**:
+Nudges turned on by the user outside work hours or on the weekend, until midnight.
+_Avoid_: override, extra hours, manual mode
 
 **Profile**:
 A named preset of cadence numbers: Gentle, Balanced or Strict. Picking one pre-fills the numbers; every number stays individually editable afterwards.
