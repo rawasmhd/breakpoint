@@ -25,7 +25,7 @@ How an occurrence ends without the thing being done: the user pressed Skip, or t
 _Avoid_: missed, ignored, dismissed, failed
 
 **Expired**:
-The way a pending occurrence is skipped when the next occurrence of the same nudge falls due before it was satisfied or skipped.
+The way a pending occurrence is skipped without the user pressing Skip: the next occurrence of the same nudge falls due, quiet starts, the user turns that nudge off, or breakpoint quits. The log records which it was.
 _Avoid_: timed out, lapsed, stale
 
 **Skip**:
@@ -85,7 +85,7 @@ Nudges turned on by the user outside work hours or on the weekend, until midnigh
 _Avoid_: override, extra hours, manual mode
 
 **Profile**:
-A named preset of cadence numbers: Gentle, Balanced or Strict. Picking one pre-fills the numbers; every number stays individually editable afterwards.
+A named preset of cadence numbers and enforcement levels: Gentle, Balanced or Strict. Picking one pre-fills them; every number stays individually editable afterwards. The profile is not stored but read off the numbers: when they match no preset, the settings window shows **Custom**.
 _Avoid_: mode, preset, level
 
 **Enforcement level**:
@@ -95,3 +95,11 @@ _Avoid_: strictness, severity, priority
 **Snooze**:
 Pushing a pending occurrence a few minutes into the future without ending it. It is still pending while snoozed, so being away can still satisfy it.
 _Avoid_: postpone, delay, remind later
+
+**Event log**:
+The local record of what happened to each occurrence: fired, snoozed, satisfied or skipped, and shown for Water. One line per event, one file per month, kept on this computer only and never sent anywhere. The Today count is built from it.
+_Avoid_: history, stats, telemetry, journal, activity log
+
+**Today count**:
+The tray line that shows how many Stand/Move and Pause occurrences fired today were taken (satisfied) and how many were skipped, e.g. "Today: 7 taken, 2 skipped". Water is not counted, and the count starts again at midnight.
+_Avoid_: score, streak, stats, summary
