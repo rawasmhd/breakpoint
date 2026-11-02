@@ -9,8 +9,36 @@ A recurring prompt to do one healthy thing: stand and move, drink water, pause. 
 _Avoid_: reminder, alert, notification (that is the OS mechanism, not the thing)
 
 **Occurrence**:
-One firing of a nudge. A nudge has many occurrences a day; each is satisfied, snoozed or skipped.
+One firing of a nudge. A nudge has many occurrences a day; each is pending from the moment it fires until it ends, satisfied or skipped. A nudge never has two pending occurrences at once.
 _Avoid_: instance, event, alarm
+
+**Pending**:
+The state of an occurrence that has fired and has not yet been satisfied or skipped. Snoozing keeps it pending.
+_Avoid_: open, active, outstanding
+
+**Satisfied**:
+How an occurrence ends well: the user did the thing. For Stand/Move and Pause only being away shows it; a Water occurrence is never satisfied because drinking cannot be seen.
+_Avoid_: done, completed, acknowledged, dismissed
+
+**Skipped**:
+How an occurrence ends without the thing being done: the user pressed Skip, or the occurrence expired.
+_Avoid_: missed, ignored, dismissed, failed
+
+**Expired**:
+The way a pending occurrence is skipped when the next occurrence of the same nudge falls due before it was satisfied or skipped.
+_Avoid_: timed out, lapsed, stale
+
+**Skip**:
+Ending a pending occurrence as skipped on purpose. Affects only that occurrence; the nudge stays on and its next occurrence comes as usual.
+_Avoid_: dismiss, ignore, cancel, mute
+
+**Away**:
+The presence state in which the user is not at the computer: no input for a while, with nothing on screen that explains the silence, or the session locked or the machine asleep. Any input ends it.
+_Avoid_: idle, inactive, AFK, absent
+
+**Stand length**:
+How long the user must stay away for a Stand/Move occurrence to count as satisfied. Being away that long also resets the Stand/Move cadence when nothing is pending.
+_Avoid_: stand duration, break length, minimum break
 
 **Cadence**:
 How often a nudge fires, measured in active time.
@@ -45,5 +73,5 @@ How insistent a nudge is. **Soft** prompts once and can be ignored. **Firm** kee
 _Avoid_: strictness, severity, priority
 
 **Snooze**:
-Pushing an occurrence a few minutes into the future without satisfying it.
+Pushing a pending occurrence a few minutes into the future without ending it. It is still pending while snoozed, so being away can still satisfy it.
 _Avoid_: postpone, delay, remind later
