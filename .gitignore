@@ -9,3 +9,6 @@ target/
 # OS
 Thumbs.db
 Desktop.ini
+
+# Claude Code session data and agent worktrees
+.claude/
