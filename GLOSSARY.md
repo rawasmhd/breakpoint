@@ -60,6 +60,10 @@ _Avoid_: break length, rest duration
 One prompt shown when several nudges fall due together. A Pause absorbs the Stand/Move it coincides with, so acting on the prompt acts on both; a due Water adds its line to whatever nudge is shown next and never prompts on its own while another nudge is on.
 _Avoid_: merged notification, stacked reminder, batch
 
+**Popup**:
+breakpoint's own small window above the tray that shows a nudge, with its Snooze and Skip buttons. It appears on top without taking focus, comes back unchanged for a Firm repeat, and ignores Windows Do not disturb; only breakpoint's own quiet rules silence it. The only way a nudge shows itself in v1.
+_Avoid_: toast, notification, dialog, alert
+
 **Active time**:
 Time the user is actually at the computer. Idle, locked and asleep periods do not count, so a cadence of 30 minutes means 30 minutes of being at the keyboard.
 _Avoid_: uptime, wall-clock time, elapsed time
