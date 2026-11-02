@@ -1,6 +1,6 @@
 # breakpoint: product and technical spec
 
-Status: draft v0.2, 2026-11-02. Companion to [RESEARCH.md](RESEARCH.md) (the why) and [BACKLOG.md](BACKLOG.md) (the tickets).
+Status: **draft v0.2, under revision.** Decisions are being made on the [wayfinder map](https://github.com/rawasmhd/breakpoint/issues/23); this file is rewritten from them when the map closes. Until then treat everything below as hypothesis except what the map's Notes list as settled. Already known to be superseded: v1 has three nudges (Stand/Move, Water, Stop Working), not six; a settings window and first-run wizard are in scope; the notification channel is undecided. Companion: [RESEARCH.md](RESEARCH.md) (the evidence) and [GLOSSARY.md](../GLOSSARY.md) (the vocabulary).
 
 ## 1. One-sentence pitch
 

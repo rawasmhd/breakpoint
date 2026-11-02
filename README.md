@@ -2,7 +2,7 @@
 
 **Breakpoints for humans.** A tiny Windows tray app that reminds you to rest your eyes, stand up, drink water, have lunch and stop working. Evidence-informed defaults, zero setup, native toasts, no screen takeovers, one small exe.
 
-**Status:** planning. Nothing to run yet. See the [spec](docs/SPEC.md), the [research behind the defaults](docs/RESEARCH.md) and the [backlog](docs/BACKLOG.md). Issues are the live task list.
+**Status:** planning. Nothing to run yet. Product decisions are being worked through on the [wayfinder map](https://github.com/rawasmhd/breakpoint/issues/23), one ticket at a time. The [spec](docs/SPEC.md) is a draft that gets rewritten when the map closes; the [research behind the defaults](docs/RESEARCH.md) and the [glossary](GLOSSARY.md) are current.
 
 ## Why
 
@@ -31,7 +31,7 @@ Rust, `tray-icon` for the tray, the `windows` crate for toasts and system state.
 
 ## Contributing
 
-Issues are the backlog. Pick one, comment, open a PR. You need stable Rust and the MSVC build tools.
+Build issues will be created from the locked spec once the [map](https://github.com/rawasmhd/breakpoint/issues/23) closes. Until then the open issues are decisions, not tasks. You need stable Rust and the MSVC build tools.
 
 ```
 cargo build --release
