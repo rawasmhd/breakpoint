@@ -65,7 +65,7 @@ breakpoint's own small window above the tray that shows a nudge, with its Snooze
 _Avoid_: toast, notification, dialog, alert
 
 **Active time**:
-Time the user is actually at the computer. Idle, locked and asleep periods do not count, so a cadence of 30 minutes means 30 minutes of being at the keyboard.
+Time the user is actually at the computer: typing, or sitting still while a full-screen app, a video or a presentation explains the silence. Away, locked and asleep periods do not count, so a cadence of 30 minutes means 30 minutes at the desk.
 _Avoid_: uptime, wall-clock time, elapsed time
 
 **Work day**:
