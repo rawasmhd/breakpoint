@@ -1,0 +1,18 @@
+[package]
+name = "toast"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Talks to the WinRT toast API through the `windows` crate directly.
+# tauri-winrt-notification 0.8.1 was the research pick, but it only sets a Tag
+# on progress toasts, writes literal progress values instead of {bindings}
+# (so in-place updates do not change what is shown) and hardcodes sequence
+# number 2 on every update. Going direct costs ~100 lines and one crate less.
+[dependencies]
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Data_Xml_Dom",
+    "UI_Notifications",
+] }

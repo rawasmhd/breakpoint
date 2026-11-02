@@ -1,0 +1,13 @@
+# PROTOTYPE, throwaway. Answers "Notification channel: toast vs popup".
+# Not the real app. Delete freely.
+[workspace]
+resolver = "2"
+members = ["toast", "popup", "baseline"]
+
+# Same size-tuned profile the spec plans for breakpoint.exe, so sizes compare.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
