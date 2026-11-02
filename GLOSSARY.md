@@ -45,12 +45,20 @@ How often a nudge fires, measured in active time.
 _Avoid_: interval, frequency, schedule
 
 **Focus period**:
-A run of active time between two Pauses. Thirty or sixty minutes long; restarts from zero when the user comes back from a Pause or any long absence.
+A run of active time between two Pauses. Thirty to ninety minutes long, depending on the profile; restarts from zero when the user comes back from a Pause or any long absence.
 _Avoid_: pomodoro, session, sprint, work block
 
 **Pause**:
 The nudge that ends a focus period: step away from the desk for a few minutes, then come back. Not the end of the work day; that nudge does not exist in v1.
 _Avoid_: stop working, break, long break, rest
+
+**Pause length**:
+How long the user must stay away for a Pause occurrence to count as satisfied. Five minutes in every profile.
+_Avoid_: break length, rest duration
+
+**Combined nudge**:
+One prompt shown when several nudges fall due together. A Pause absorbs the Stand/Move it coincides with, so acting on the prompt acts on both; a due Water adds its line to whatever nudge is shown next and never prompts on its own while another nudge is on.
+_Avoid_: merged notification, stacked reminder, batch
 
 **Active time**:
 Time the user is actually at the computer. Idle, locked and asleep periods do not count, so a cadence of 30 minutes means 30 minutes of being at the keyboard.
