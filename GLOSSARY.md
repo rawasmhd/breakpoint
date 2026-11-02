@@ -89,7 +89,7 @@ A named preset of cadence numbers: Gentle, Balanced or Strict. Picking one pre-f
 _Avoid_: mode, preset, level
 
 **Enforcement level**:
-How insistent a nudge is. **Soft** prompts once and can be ignored. **Firm** keeps prompting until the occurrence is satisfied. **Hard** (not in v1) blocks the screen for the break.
+How insistent a nudge is, chosen per nudge for Stand/Move and Pause; Water is always Soft. **Soft** prompts once and the prompt waits until the user acts on it or closes it. **Firm** does the same and then prompts again, unchanged, every few minutes of active time until the occurrence is satisfied, skipped or expired. A combined nudge is Firm if anything it absorbs is Firm. **Hard** (not in v1) blocks the screen for the break.
 _Avoid_: strictness, severity, priority
 
 **Snooze**:
