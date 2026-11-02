@@ -1,11 +1,11 @@
 # breakpoint
 
-Vocabulary for a Windows tray app that nudges a desk worker to stand, drink water and stop working. One context; this file is the whole glossary.
+Vocabulary for a Windows tray app that nudges a desk worker to stand, drink water and pause between focus periods. One context; this file is the whole glossary.
 
 ## Language
 
 **Nudge**:
-A recurring prompt to do one healthy thing: stand and move, drink water, stop working. The unit of everything breakpoint does.
+A recurring prompt to do one healthy thing: stand and move, drink water, pause. The unit of everything breakpoint does.
 _Avoid_: reminder, alert, notification (that is the OS mechanism, not the thing)
 
 **Occurrence**:
@@ -16,12 +16,20 @@ _Avoid_: instance, event, alarm
 How often a nudge fires, measured in active time.
 _Avoid_: interval, frequency, schedule
 
+**Focus period**:
+A run of active time between two Pauses. Thirty or sixty minutes long; restarts from zero when the user comes back from a Pause or any long absence.
+_Avoid_: pomodoro, session, sprint, work block
+
+**Pause**:
+The nudge that ends a focus period: step away from the desk for a few minutes, then come back. Not the end of the work day; that nudge does not exist in v1.
+_Avoid_: stop working, break, long break, rest
+
 **Active time**:
 Time the user is actually at the computer. Idle, locked and asleep periods do not count, so a cadence of 30 minutes means 30 minutes of being at the keyboard.
 _Avoid_: uptime, wall-clock time, elapsed time
 
 **Work day**:
-A day on which breakpoint is on, together with the hours the user works on it. For Rawas: Sunday to Thursday, 08:00 to 17:00.
+A day on which breakpoint is on, together with the hours the user works on it. No nudge marks the end of it. For Rawas: Sunday to Thursday, 08:00 to 17:00.
 _Avoid_: schedule, shift, business hours
 
 **Weekend**:
