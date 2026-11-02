@@ -1,0 +1,11 @@
+# Rust
+target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+Thumbs.db
+Desktop.ini
