@@ -6,8 +6,10 @@ mod platform;
 
 use std::cell::RefCell;
 use std::error::Error;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use breakpoint::core::config::{self, Config};
 use breakpoint::core::presence::{POLL_EVERY, Presence, Tracker};
 use breakpoint::core::scheduler::{Effect, Scheduler, away_left, countdown_text};
 use platform::popup::{Popup, WM_POPUP_SKIP, WM_POPUP_SNOOZE};
@@ -150,11 +152,20 @@ fn another_instance_running() -> bool {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
+    // Read once here and never watched (SPEC §10.1). No file yet is first run; the wizard
+    // comes with its own issue, so for now that runs on the defaults too.
+    let loaded = config_path().and_then(|path| config::load(&path, platform::clock::now()));
+    let (config, notice) = loaded.map_or((Config::default(), false), |l| (l.config, l.notice));
+
     let window = message_window()?;
+    let popup = Popup::new(window)?;
+    if notice {
+        popup.notice();
+    }
     APP.set(Some(App {
         started: Instant::now(),
-        scheduler: Scheduler::new(minute()),
-        popup: Popup::new(window)?,
+        scheduler: Scheduler::new(config.nudges, minute()),
+        popup,
         presence: Tracker::new(),
         vetoes: Vetoes::default(),
         last_presence: Presence::Active,
@@ -198,6 +209,16 @@ fn run() -> Result<(), Box<dyn Error>> {
     // SAFETY: `window` is the live message-only window.
     unsafe { DestroyWindow(window)? };
     Ok(())
+}
+
+/// `%APPDATA%\breakpoint\config.json`; its folder is created on the first save.
+fn config_path() -> Option<PathBuf> {
+    let app_data = std::env::var_os("APPDATA")?;
+    Some(
+        PathBuf::from(app_data)
+            .join("breakpoint")
+            .join("config.json"),
+    )
 }
 
 /// How long one minute of the cadences is. Debug builds honour `BREAKPOINT_MINUTE_SECS` so

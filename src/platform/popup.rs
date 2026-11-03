@@ -41,6 +41,11 @@ const ID_LINE: i32 = 2;
 const ID_SKIP: i32 = 3;
 const ID_COUNTDOWN: i32 = 4;
 const ID_SNOOZE: i32 = 5;
+const ID_NOTICE: i32 = 6;
+
+/// The bad-config notice (SPEC §10.1).
+const NOTICE: &str = "breakpoint couldn't read config.json and is using the defaults. \
+                      Saving from Settings will replace the file.";
 
 const STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_POPUP.0 | WS_CAPTION.0 | WS_SYSMENU.0);
 const EX_STYLE: WINDOW_EX_STYLE =
@@ -48,13 +53,16 @@ const EX_STYLE: WINDOW_EX_STYLE =
 
 /// Layout at 96 DPI, scaled for the monitor: the client size, then each child's rectangle.
 const CLIENT: (i32, i32) = (320, 148);
-const CHILDREN: [(i32, [i32; 4]); 5] = [
+const CHILDREN: [(i32, [i32; 4]); 6] = [
     (ID_TITLE, [14, 12, 292, 24]),
     (ID_LINE, [14, 40, 292, 36]),
     (ID_COUNTDOWN, [14, 80, 292, 20]),
     (ID_SNOOZE, [134, 108, 90, 28]),
     (ID_SKIP, [230, 108, 76, 28]),
+    (ID_NOTICE, [14, 12, 292, 124]),
 ];
+/// The children that make up a nudge's popup; the notice hides them all.
+const PROMPT: [i32; 5] = [ID_TITLE, ID_LINE, ID_COUNTDOWN, ID_SNOOZE, ID_SKIP];
 /// The gap between the popup and the work area's bottom-right corner, at 96 DPI.
 const MARGIN: i32 = 12;
 
@@ -101,6 +109,7 @@ impl Popup {
                 (ID_COUNTDOWN, w!("STATIC"), w!(""), WINDOW_STYLE(0)),
                 (ID_SNOOZE, w!("BUTTON"), w!("Snooze 5 min"), button),
                 (ID_SKIP, w!("BUTTON"), w!("Skip"), button),
+                (ID_NOTICE, w!("STATIC"), w!(""), WINDOW_STYLE(0)),
             ] {
                 CreateWindowExW(
                     WINDOW_EX_STYLE(0),
@@ -128,10 +137,30 @@ impl Popup {
             set_text(self.hwnd, ID_TITLE, prompt.title);
             set_text(self.hwnd, ID_LINE, &prompt.line);
             set_text(self.hwnd, ID_COUNTDOWN, countdown);
+            show_only(self.hwnd, &PROMPT);
             if let Ok(snooze) = GetDlgItem(Some(self.hwnd), ID_SNOOZE) {
                 let _ = ShowWindow(snooze, if prompt.snooze { SW_SHOW } else { SW_HIDE });
             }
-            // The work area or the scale may have changed while hidden, so lay out afresh.
+            self.raise();
+            let _ = PlaySoundW(w!("Notification.Default"), None, SND_ALIAS | SND_ASYNC);
+        }
+    }
+
+    /// Shows the bad-config notice in the popup's place: no buttons, silent, until closed with
+    /// X. A nudge shown later replaces it.
+    pub fn notice(&self) {
+        // SAFETY: `self.hwnd` is the live popup window; the string outlives the call.
+        unsafe {
+            set_text(self.hwnd, ID_NOTICE, NOTICE);
+            show_only(self.hwnd, &[ID_NOTICE]);
+            self.raise();
+        }
+    }
+
+    /// Lays the popup out afresh and puts it on top without activating it.
+    unsafe fn raise(&self) {
+        unsafe {
+            // The work area or the scale may have changed while hidden.
             layout(self.hwnd, primary_dpi());
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
             let _ = SetWindowPos(
@@ -143,7 +172,6 @@ impl Popup {
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
-            let _ = PlaySoundW(w!("Notification.Default"), None, SND_ALIAS | SND_ASYNC);
         }
     }
 
@@ -170,6 +198,17 @@ unsafe fn set_text(hwnd: HWND, id: i32, text: &str) {
     unsafe {
         if let Ok(child) = GetDlgItem(Some(hwnd), id) {
             let _ = SetWindowTextW(child, &HSTRING::from(text));
+        }
+    }
+}
+
+/// Shows the children in `ids` and hides the rest.
+unsafe fn show_only(hwnd: HWND, ids: &[i32]) {
+    unsafe {
+        for (id, _) in CHILDREN {
+            if let Ok(child) = GetDlgItem(Some(hwnd), id) {
+                let _ = ShowWindow(child, if ids.contains(&id) { SW_SHOW } else { SW_HIDE });
+            }
         }
     }
 }

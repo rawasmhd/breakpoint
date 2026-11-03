@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use breakpoint::core::config::{Nudges, Profile};
 use breakpoint::core::presence::{AwayReason, POLL_EVERY, Presence};
 use breakpoint::core::scheduler::{
     Effect, Event, Nudge, Prompt, SatisfyCause, Scheduler, SkipCause, away_left, countdown_text,
@@ -24,12 +25,13 @@ struct Sim {
 
 impl Sim {
     fn new() -> Self {
-        Self::with_minute(MIN)
+        Self::with(Nudges::default(), MIN)
     }
 
-    fn with_minute(minute: Duration) -> Self {
+    /// Runs the scheduler on `nudges` from config, with minutes of `minute`.
+    fn with(nudges: Nudges, minute: Duration) -> Self {
         let mut sim = Sim {
-            sched: Scheduler::new(minute),
+            sched: Scheduler::new(nudges, minute),
             now: Duration::ZERO,
             last_input: Duration::ZERO,
             held: None,
@@ -283,7 +285,7 @@ fn an_expired_pause_is_replaced_by_the_new_one() {
 #[test]
 fn a_shorter_minute_scales_the_cadence() {
     // BREAKPOINT_MINUTE_SECS=2: 30 "minutes" are a minute of real activity.
-    let mut sim = Sim::with_minute(2 * SEC);
+    let mut sim = Sim::with(Nudges::default(), 2 * SEC);
     sim.work(60 * SEC);
     assert_eq!(sim.fired_at(Nudge::Stand), [60 * SEC]);
 }
@@ -732,4 +734,50 @@ fn the_countdown_reads_minutes_and_seconds() {
         countdown_text(Duration::ZERO),
         "Away 0:00 more and it counts"
     );
+}
+
+#[test]
+fn cadences_come_from_config() {
+    let mut sim = Sim::with(Profile::Gentle.nudges(), MIN);
+    sim.work(90 * MIN);
+    assert_eq!(sim.fired_at(Nudge::Stand), [45 * MIN, 90 * MIN]);
+    assert_eq!(sim.fired_at(Nudge::Pause), [90 * MIN]);
+}
+
+#[test]
+fn the_pause_length_comes_from_config() {
+    let mut nudges = Nudges::default();
+    nudges.stand.on = false;
+    nudges.pause.length_minutes = 10;
+    let mut sim = Sim::with(nudges, MIN);
+    sim.work(60 * MIN);
+    let prompt = sim.sched.prompt().expect("the Pause is pending");
+    assert_eq!(prompt.line, "Step away from the screen for 10 minutes.");
+    assert_eq!(prompt.length, 10 * MIN);
+
+    // Five minutes away is the Balanced length, not this one: still pending.
+    sim.leave(5 * MIN);
+    assert!(sim.sched.pending(Nudge::Pause).is_some());
+    sim.leave(5 * MIN);
+    assert!(sim.sched.pending(Nudge::Pause).is_none());
+}
+
+#[test]
+fn a_nudge_turned_off_never_fires() {
+    for off in [Nudge::Stand, Nudge::Pause] {
+        let mut nudges = Nudges::default();
+        match off {
+            Nudge::Stand => nudges.stand.on = false,
+            Nudge::Pause => nudges.pause.on = false,
+        }
+        let mut sim = Sim::with(nudges, MIN);
+        sim.work(240 * MIN);
+        assert!(sim.fired_at(off).is_empty(), "{off:?} fired");
+        let other = if off == Nudge::Stand {
+            Nudge::Pause
+        } else {
+            Nudge::Stand
+        };
+        assert!(!sim.fired_at(other).is_empty(), "{other:?} did not fire");
+    }
 }
