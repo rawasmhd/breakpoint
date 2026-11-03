@@ -1,0 +1,24 @@
+[package]
+name = "breakpoint"
+version = "0.1.0"
+edition = "2024"
+description = "Breakpoints for humans: nudges to stand, drink water and pause"
+license = "MIT"
+repository = "https://github.com/rawasmhd/breakpoint"
+publish = false
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tray-icon = "0.26.1"
+windows = "0.62.2"
+
+[build-dependencies]
+winresource = "0.1.34"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
