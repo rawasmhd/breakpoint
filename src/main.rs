@@ -9,8 +9,8 @@ use std::error::Error;
 use std::time::{Duration, Instant};
 
 use breakpoint::core::presence::{POLL_EVERY, Presence};
-use breakpoint::core::scheduler::{Effect, Scheduler};
-use platform::popup::{Popup, WM_POPUP_SKIP};
+use breakpoint::core::scheduler::{Effect, Scheduler, away_left, countdown_text};
+use platform::popup::{Popup, WM_POPUP_SKIP, WM_POPUP_SNOOZE};
 use platform::tray::{Command, Tray};
 use windows::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM,
@@ -25,6 +25,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::w;
 
 const POLL_TIMER: usize = 1;
+/// Refreshes the popup's away countdown while it is on screen.
+const COUNTDOWN_TIMER: usize = 2;
+const COUNTDOWN_EVERY: Duration = Duration::from_secs(1);
 
 /// Everything the window procedure acts on. Lives on the UI thread only.
 struct App {
@@ -32,6 +35,7 @@ struct App {
     started: Instant,
     scheduler: Scheduler,
     popup: Popup,
+    tray: Tray,
 }
 
 thread_local! {
@@ -50,6 +54,11 @@ impl App {
         self.apply(effects);
     }
 
+    fn snooze(&mut self) {
+        let effects = self.scheduler.snooze(self.now());
+        self.apply(effects);
+    }
+
     fn skip(&mut self) {
         let effects = self.scheduler.skip(self.now());
         self.apply(effects);
@@ -60,15 +69,53 @@ impl App {
         self.apply(effects);
     }
 
-    fn apply(&self, effects: Vec<Effect>) {
+    fn apply(&mut self, effects: Vec<Effect>) {
+        if effects.is_empty() {
+            return;
+        }
         for effect in effects {
             match effect {
                 // The event log comes with its own issue; nothing is written yet.
                 Effect::Log(_) => {}
-                Effect::Show(prompt) => self.popup.show(&prompt),
+                Effect::Show(prompt) => self.popup.show(&prompt, &self.countdown(prompt.length)),
                 Effect::Close => self.popup.hide(),
             }
         }
+        self.tray.set_pending(self.scheduler.prompt().as_ref());
+    }
+
+    /// The countdown line for an occurrence of `length` as of now (SPEC §6).
+    fn countdown(&self, length: Duration) -> String {
+        let now = self.now();
+        // No veto holds it yet: `AtDesk` comes with the presence issue.
+        countdown_text(away_left(
+            length,
+            now,
+            platform::presence::last_input(now),
+            false,
+        ))
+    }
+
+    fn tick_countdown(&mut self) {
+        if self.popup.is_visible()
+            && let Some(prompt) = self.scheduler.prompt()
+        {
+            self.popup.set_countdown(&self.countdown(prompt.length));
+        }
+    }
+
+    /// Acts on the tray item picked, if any; false once the user chose Quit.
+    fn tray_command(&mut self) -> bool {
+        match self.tray.next_command() {
+            Some(Command::Snooze) => self.snooze(),
+            Some(Command::Skip) => self.skip(),
+            Some(Command::Quit) => {
+                self.quit();
+                return false;
+            }
+            None => {}
+        }
+        true
     }
 }
 
@@ -93,11 +140,11 @@ fn another_instance_running() -> bool {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let window = message_window()?;
-    let tray = Tray::new()?;
     APP.set(Some(App {
         started: Instant::now(),
         scheduler: Scheduler::new(minute()),
         popup: Popup::new(window)?,
+        tray: Tray::new()?,
     }));
     with_app(App::poll);
     // SAFETY: `window` is the live message-only window.
@@ -107,8 +154,14 @@ fn run() -> Result<(), Box<dyn Error>> {
             POLL_TIMER,
             POLL_EVERY.as_millis() as u32,
             None,
-        )
-    };
+        );
+        SetTimer(
+            Some(window),
+            COUNTDOWN_TIMER,
+            COUNTDOWN_EVERY.as_millis() as u32,
+            None,
+        );
+    }
 
     let mut msg = MSG::default();
     // SAFETY: the standard message loop over a valid MSG.
@@ -117,14 +170,14 @@ fn run() -> Result<(), Box<dyn Error>> {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        if let Some(Command::Quit) = tray.next_command() {
-            with_app(App::quit);
+        let mut running = true;
+        with_app(|app| running = app.tray_command());
+        if !running {
             break;
         }
     }
 
     APP.take();
-    drop(tray);
     // SAFETY: `window` is the live message-only window.
     unsafe { DestroyWindow(window)? };
     Ok(())
@@ -188,6 +241,8 @@ fn message_window() -> windows::core::Result<HWND> {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_TIMER if wparam.0 == POLL_TIMER => with_app(App::poll),
+        WM_TIMER if wparam.0 == COUNTDOWN_TIMER => with_app(App::tick_countdown),
+        WM_POPUP_SNOOZE => with_app(App::snooze),
         WM_POPUP_SKIP => with_app(App::skip),
         // SAFETY: forwarding the arguments this procedure was called with.
         _ => return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
