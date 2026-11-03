@@ -363,6 +363,7 @@ tests/
 
 - Release profile: `opt-level = "z"`, `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true`; `#![windows_subsystem = "windows"]` (no console).
 - Size reference (prototypes, this profile): bare `windows` exe 110 KB; with the popup 153 KB.
+- **Dev aid, debug builds only:** the environment variable `BREAKPOINT_MINUTE_SECS` (a positive number, fractions allowed) makes one minute that many seconds, for every duration given in minutes: cadences, stand and pause lengths, snooze, the Firm repeat and the combined-nudge window. The durations given in seconds (the 90 s Away threshold, the 5 s poll, the 10 s veto delay, Water alone's 7 s) stay real. Release builds ignore it.
 - Presence registration must retry `WTSRegisterSessionNotification` on early-logon failure, re-arm idle measurements after any resume, and fall back to a hidden top-level window if suspend broadcasts do not reach a message-only window (see the presence findings, "What this design will get wrong").
 
 ## 13. Distribution
