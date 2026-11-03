@@ -23,13 +23,24 @@ Break-reminder apps exist, but most are heavyweight, take over your screen, or m
 
 Gentle (45/90) and Strict (30/30, a Pomodoro) are picked in the first-run page or in Settings, and every number stays editable. Default work week: Sunday to Thursday, 08:00 to 17:00, changeable in Settings.
 
+## Install
+
+1. Download [`breakpoint.exe`](https://github.com/rawasmhd/breakpoint/releases/latest/download/breakpoint.exe) from the [latest release](https://github.com/rawasmhd/breakpoint/releases/latest) and put it wherever you like. There is no installer.
+2. Run it. The exe is not code-signed, so Windows SmartScreen may say *Windows protected your PC*. Click **More info**, then **Run anyway**. Windows remembers this for that file.
+
+To check the download, compare its hash with `breakpoint.exe.sha256` from the same release:
+
+```
+Get-FileHash breakpoint.exe -Algorithm SHA256
+```
+
 ## Tech
 
 Rust on the MSVC toolchain, `tray-icon` for the tray, the `windows` crate for everything else (raw Win32 dialogs and popup, presence detection). Why Rust: [ADR 0001](docs/adr/0001-rust-for-the-desktop-app.md). Design and crates: [SPEC.md, technical design](docs/SPEC.md#12-technical-design).
 
 ## Files
 
-Settings live in `%APPDATA%\breakpoint\config.json` and a local event log in `%APPDATA%\breakpoint\log\`. To uninstall: untick Start with Windows in Settings, quit from the tray, then delete `breakpoint.exe` and that folder.
+Settings live in `%APPDATA%\breakpoint\config.json` and a local event log in `%APPDATA%\breakpoint\log\`. To uninstall: untick Start with Windows in Settings (or delete the `breakpoint` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`), quit from the tray, then delete `breakpoint.exe` and that folder.
 
 ## Contributing
 
