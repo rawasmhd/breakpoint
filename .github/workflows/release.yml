@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Release build
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Stage exe and checksum
+        shell: bash
+        run: |
+          mkdir dist
+          cp target/x86_64-pc-windows-msvc/release/breakpoint.exe dist/
+          cd dist
+          sha256sum breakpoint.exe > breakpoint.exe.sha256
+          cat breakpoint.exe.sha256
+
+      # A tag with a hyphen (v0.2.0-rc1, v0.0.1-test) becomes a prerelease,
+      # so releases/latest keeps pointing at the last real release.
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          prerelease=()
+          if [[ "$TAG" == *-* ]]; then prerelease=(--prerelease); fi
+          gh release create "$TAG" dist/breakpoint.exe dist/breakpoint.exe.sha256 \
+            --verify-tag --title "breakpoint $TAG" --generate-notes "${prerelease[@]}"
