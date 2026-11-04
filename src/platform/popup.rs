@@ -3,7 +3,8 @@
 //! One window for the life of the app, hidden between occurrences (SPEC §6: at most one popup on
 //! screen). It sits bottom-right of the primary monitor's work area, just above the tray, always
 //! on top, and never takes focus: `WS_EX_NOACTIVATE`, `SW_SHOWNOACTIVATE` and `MA_NOACTIVATE`.
-//! Button presses are posted to the owner window as messages, so the app reacts from its own
+//! It carries the prompt's title and line, a live away countdown the app refreshes every second,
+//! and the Snooze 5 min and Skip buttons (Skip only after the snooze). Button presses are posted to the owner window as messages, so the app reacts from its own
 //! window procedure rather than from inside this one.
 
 use breakpoint::core::scheduler::Prompt;
@@ -20,8 +21,8 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, BS_PUSHBUTTON, CreateWindowExW, DefWindowProcW, GWLP_USERDATA, GetDlgItem,
-    GetWindowLongPtrW, HMENU, HWND_TOPMOST, IDC_ARROW, LoadCursorW, MA_NOACTIVATE,
-    NONCLIENTMETRICSW, PostMessageW, RegisterClassW, SPI_GETNONCLIENTMETRICS, SW_HIDE,
+    GetWindowLongPtrW, HMENU, HWND_TOPMOST, IDC_ARROW, IsWindowVisible, LoadCursorW, MA_NOACTIVATE,
+    NONCLIENTMETRICSW, PostMessageW, RegisterClassW, SPI_GETNONCLIENTMETRICS, SW_HIDE, SW_SHOW,
     SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
     SendMessageW, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, WINDOW_EX_STYLE,
     WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC, WM_DPICHANGED, WM_GETFONT,
@@ -32,21 +33,27 @@ use windows::core::{HSTRING, Result, w};
 
 /// Posted to the owner window when the user presses Skip.
 pub const WM_POPUP_SKIP: u32 = WM_APP + 1;
+/// Posted to the owner window when the user presses Snooze 5 min.
+pub const WM_POPUP_SNOOZE: u32 = WM_APP + 2;
 
 const ID_TITLE: i32 = 1;
 const ID_LINE: i32 = 2;
 const ID_SKIP: i32 = 3;
+const ID_COUNTDOWN: i32 = 4;
+const ID_SNOOZE: i32 = 5;
 
 const STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_POPUP.0 | WS_CAPTION.0 | WS_SYSMENU.0);
 const EX_STYLE: WINDOW_EX_STYLE =
     WINDOW_EX_STYLE(WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0);
 
 /// Layout at 96 DPI, scaled for the monitor: the client size, then each child's rectangle.
-const CLIENT: (i32, i32) = (320, 124);
-const CHILDREN: [(i32, [i32; 4]); 3] = [
+const CLIENT: (i32, i32) = (320, 148);
+const CHILDREN: [(i32, [i32; 4]); 5] = [
     (ID_TITLE, [14, 12, 292, 24]),
     (ID_LINE, [14, 40, 292, 36]),
-    (ID_SKIP, [230, 84, 76, 28]),
+    (ID_COUNTDOWN, [14, 80, 292, 20]),
+    (ID_SNOOZE, [134, 108, 90, 28]),
+    (ID_SKIP, [230, 108, 76, 28]),
 ];
 /// The gap between the popup and the work area's bottom-right corner, at 96 DPI.
 const MARGIN: i32 = 12;
@@ -91,6 +98,8 @@ impl Popup {
             for (id, class, text, style) in [
                 (ID_TITLE, w!("STATIC"), w!(""), WINDOW_STYLE(0)),
                 (ID_LINE, w!("STATIC"), w!(""), WINDOW_STYLE(0)),
+                (ID_COUNTDOWN, w!("STATIC"), w!(""), WINDOW_STYLE(0)),
+                (ID_SNOOZE, w!("BUTTON"), w!("Snooze 5 min"), button),
                 (ID_SKIP, w!("BUTTON"), w!("Skip"), button),
             ] {
                 CreateWindowExW(
@@ -113,11 +122,15 @@ impl Popup {
     }
 
     /// Shows `prompt` on top without taking focus, with the default notification sound.
-    pub fn show(&self, prompt: &Prompt) {
+    pub fn show(&self, prompt: &Prompt, countdown: &str) {
         // SAFETY: `self.hwnd` is the live popup window; the strings outlive the calls.
         unsafe {
             set_text(self.hwnd, ID_TITLE, prompt.title);
-            set_text(self.hwnd, ID_LINE, prompt.line);
+            set_text(self.hwnd, ID_LINE, &prompt.line);
+            set_text(self.hwnd, ID_COUNTDOWN, countdown);
+            if let Ok(snooze) = GetDlgItem(Some(self.hwnd), ID_SNOOZE) {
+                let _ = ShowWindow(snooze, if prompt.snooze { SW_SHOW } else { SW_HIDE });
+            }
             // The work area or the scale may have changed while hidden, so lay out afresh.
             layout(self.hwnd, primary_dpi());
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
@@ -132,6 +145,17 @@ impl Popup {
             );
             let _ = PlaySoundW(w!("Notification.Default"), None, SND_ALIAS | SND_ASYNC);
         }
+    }
+
+    /// Replaces the countdown line, e.g. "Away 1:59 more and it counts".
+    pub fn set_countdown(&self, text: &str) {
+        // SAFETY: `self.hwnd` is the live popup window; the string outlives the call.
+        unsafe { set_text(self.hwnd, ID_COUNTDOWN, text) }
+    }
+
+    pub fn is_visible(&self) -> bool {
+        // SAFETY: no pointers.
+        unsafe { IsWindowVisible(self.hwnd).as_bool() }
     }
 
     pub fn hide(&self) {
@@ -253,9 +277,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             WM_COMMAND => {
                 let (id, code) = ((wparam.0 & 0xFFFF) as i32, (wparam.0 >> 16) as u32);
-                if id == ID_SKIP && code == BN_CLICKED {
+                let press = match id {
+                    ID_SKIP => Some(WM_POPUP_SKIP),
+                    ID_SNOOZE => Some(WM_POPUP_SNOOZE),
+                    _ => None,
+                };
+                if let Some(press) = press
+                    && code == BN_CLICKED
+                {
                     let owner = HWND(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as _);
-                    let _ = PostMessageW(Some(owner), WM_POPUP_SKIP, WPARAM(0), LPARAM(0));
+                    let _ = PostMessageW(Some(owner), press, WPARAM(0), LPARAM(0));
                 }
                 LRESULT(0)
             }
