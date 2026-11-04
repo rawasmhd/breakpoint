@@ -2,16 +2,20 @@
 //!
 //! A pure state machine: the platform feeds it the time (an offset on one monotonic timeline),
 //! presence polls and user actions, and carries out the [`Effect`]s it returns. So far Stand/Move
-//! and Pause with satisfaction, snooze and expiry, the combined nudge and Water riding along, with
-//! their cadences, lengths and on/off from config.
+//! and Pause with satisfaction, snooze and expiry, Soft and Firm enforcement, the combined nudge
+//! and Water riding along, with their cadences, lengths, levels and on/off from config.
 
 use std::time::Duration;
 
-use super::config::{AwayNudge, Nudges};
+use super::config::{AwayNudge, Enforcement, Nudges};
 use super::presence::{AwayReason, Presence};
 
 /// How far a Snooze pushes an occurrence, in active minutes (SPEC §5.6). Fixed, not a setting.
 pub const SNOOZE_MINUTES: u32 = 5;
+
+/// How often a Firm occurrence's popup comes back while it is pending, in active minutes
+/// (SPEC §5.7). Fixed, not a setting.
+pub const FIRM_REPEAT_MINUTES: u32 = 5;
 
 /// The combined-nudge window, in active minutes (SPEC §5.3): when the first of Stand/Move and
 /// Pause falls due, the other fires with it if it is due within this. Fixed, not a setting.
@@ -127,7 +131,9 @@ pub enum Event {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     Log(Event),
-    /// Show the popup with this content, replacing whatever is on screen.
+    /// Show the popup with this content, replacing whatever is on screen, and play the Windows
+    /// default notification sound (SPEC §5.7): a first show, a post-snooze re-prompt or a Firm
+    /// repeat.
     Show(Prompt),
     /// Hide the popup: its occurrence ended, or was snoozed.
     Close,
@@ -155,6 +161,8 @@ pub struct Occurrence {
     /// The stand or pause length it fired with, kept even if Settings change it (SPEC §5.7).
     pub length_minutes: u32,
     pub length: Duration,
+    /// The enforcement level it fired with, kept even if Settings change it (SPEC §5.7).
+    pub level: Enforcement,
     pub snooze: Snooze,
 }
 
@@ -167,6 +175,7 @@ struct Clock {
     every: Duration,
     length_minutes: u32,
     length: Duration,
+    level: Enforcement,
     /// Active time since this clock last restarted.
     elapsed: Duration,
     pending: Option<Occurrence>,
@@ -205,6 +214,8 @@ pub struct Scheduler {
     water: WaterClock,
     /// The time and presence of the last call, which decide whether the time since was active.
     last: Option<(Duration, Presence)>,
+    /// Active time since the popup was last shown, which times a Firm repeat.
+    since_show: Duration,
     next_occ: u64,
 }
 
@@ -218,6 +229,7 @@ impl Scheduler {
             every: minute * settings.every_minutes,
             length_minutes: settings.length_minutes,
             length: minute * settings.length_minutes,
+            level: settings.enforcement,
             elapsed: Duration::ZERO,
             pending: None,
         };
@@ -233,6 +245,7 @@ impl Scheduler {
                 elapsed: Duration::ZERO,
             },
             last: None,
+            since_show: Duration::ZERO,
             next_occ: 1,
         }
     }
@@ -256,6 +269,12 @@ impl Scheduler {
             snooze: self.pendings().all(|o| o.snooze == Snooze::Unused),
             water: false,
         })
+    }
+
+    /// Sets the enforcement level of `nudge` from Settings. It applies from the next occurrence:
+    /// a pending one keeps the level it fired with (SPEC §5.7).
+    pub fn set_enforcement(&mut self, nudge: Nudge, level: Enforcement) {
+        self.clock_mut(nudge).level = level;
     }
 
     /// Drops a due Water that is waiting for a popup, restarting its clock. Quiet start does
@@ -345,6 +364,14 @@ impl Scheduler {
         }
         let fired = fired.contains(&true);
 
+        // Firm: the popup comes back every few active minutes while pending, but not while a
+        // snooze runs (SPEC §5.7). A combined nudge is Firm if either part is (SPEC §5.3).
+        let firm = self.pendings().any(|o| o.level == Enforcement::Firm);
+        let snoozing = self
+            .pendings()
+            .any(|o| matches!(o.snooze, Snooze::Running { .. }));
+        let repeat = firm && !snoozing && self.since_show >= self.minute * FIRM_REPEAT_MINUTES;
+
         // A due Water rides on the popup of a newly fired occurrence only (SPEC §5.4).
         let rides = fired && self.water.due();
         if rides {
@@ -352,7 +379,8 @@ impl Scheduler {
         }
 
         match self.prompt() {
-            Some(prompt) if show || fired || front != Some(prompt.nudge) => {
+            Some(prompt) if show || fired || repeat || front != Some(prompt.nudge) => {
+                self.since_show = Duration::ZERO;
                 effects.push(Effect::Show(Prompt {
                     water: rides,
                     ..prompt
@@ -436,6 +464,7 @@ impl Scheduler {
             occ,
             length_minutes: clock.length_minutes,
             length: clock.length,
+            level: clock.level,
             snooze: Snooze::Unused,
         });
         effects.push(Effect::Log(Event::Fired {
@@ -469,6 +498,7 @@ impl Scheduler {
                     }
                 }
                 self.water.elapsed += active;
+                self.since_show += active;
             }
             self.last = Some((now, presence));
         }
@@ -477,6 +507,13 @@ impl Scheduler {
     fn clock(&self, nudge: Nudge) -> &Clock {
         self.clocks
             .iter()
+            .find(|c| c.nudge == nudge)
+            .expect("every nudge has a clock")
+    }
+
+    fn clock_mut(&mut self, nudge: Nudge) -> &mut Clock {
+        self.clocks
+            .iter_mut()
             .find(|c| c.nudge == nudge)
             .expect("every nudge has a clock")
     }
