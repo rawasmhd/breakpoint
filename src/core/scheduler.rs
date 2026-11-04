@@ -221,8 +221,10 @@ impl Scheduler {
                         AwayReason::Lock => Some(SatisfyCause::Lock),
                         AwayReason::Suspend => Some(SatisfyCause::Suspend),
                         AwayReason::DisplayOff => Some(SatisfyCause::DisplayOff),
-                        AwayReason::NoInput if away >= occ.length => Some(SatisfyCause::Away),
-                        AwayReason::NoInput => None,
+                        AwayReason::NoInput | AwayReason::UserInactive if away >= occ.length => {
+                            Some(SatisfyCause::Away)
+                        }
+                        AwayReason::NoInput | AwayReason::UserInactive => None,
                     };
                     if let Some(by) = by {
                         clock.pending = None;

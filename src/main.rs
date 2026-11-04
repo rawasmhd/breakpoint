@@ -8,9 +8,10 @@ use std::cell::RefCell;
 use std::error::Error;
 use std::time::{Duration, Instant};
 
-use breakpoint::core::presence::{POLL_EVERY, Presence};
+use breakpoint::core::presence::{POLL_EVERY, Presence, Tracker};
 use breakpoint::core::scheduler::{Effect, Scheduler, away_left, countdown_text};
 use platform::popup::{Popup, WM_POPUP_SKIP, WM_POPUP_SNOOZE};
+use platform::presence::{Listener, Vetoes};
 use platform::tray::{Command, Tray};
 use windows::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM,
@@ -35,6 +36,10 @@ struct App {
     started: Instant,
     scheduler: Scheduler,
     popup: Popup,
+    presence: Tracker,
+    vetoes: Vetoes,
+    /// What the last poll said, which holds the popup's countdown under a veto.
+    last_presence: Presence,
     tray: Tray,
 }
 
@@ -49,7 +54,13 @@ impl App {
 
     fn poll(&mut self) {
         let now = self.now();
-        let presence = Presence::from_last_input(now, platform::presence::last_input(now));
+        let last_input = platform::presence::last_input(now);
+        for (at, signal) in platform::presence::take_signals() {
+            let at = at.saturating_duration_since(self.started);
+            self.presence.signal(at, last_input, signal);
+        }
+        let presence = self.presence.poll(now, last_input, &mut self.vetoes);
+        self.last_presence = presence;
         let effects = self.scheduler.poll(now, presence);
         self.apply(effects);
     }
@@ -87,12 +98,12 @@ impl App {
     /// The countdown line for an occurrence of `length` as of now (SPEC §6).
     fn countdown(&self, length: Duration) -> String {
         let now = self.now();
-        // No veto holds it yet: `AtDesk` comes with the presence issue.
+        let held = self.last_presence == Presence::AtDesk;
         countdown_text(away_left(
             length,
             now,
             platform::presence::last_input(now),
-            false,
+            held,
         ))
     }
 
@@ -144,8 +155,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         started: Instant::now(),
         scheduler: Scheduler::new(minute()),
         popup: Popup::new(window)?,
+        presence: Tracker::new(),
+        vetoes: Vetoes::default(),
+        last_presence: Presence::Active,
         tray: Tray::new()?,
     }));
+    // Session and power events take effect at once rather than at the next poll.
+    let listener = Listener::new(|| with_app(App::poll))?;
     with_app(App::poll);
     // SAFETY: `window` is the live message-only window.
     unsafe {
@@ -177,6 +193,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    drop(listener);
     APP.take();
     // SAFETY: `window` is the live message-only window.
     unsafe { DestroyWindow(window)? };

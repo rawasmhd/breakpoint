@@ -11,14 +11,14 @@ const MIN: Duration = Duration::from_secs(60);
 const SEC: Duration = Duration::from_secs(1);
 
 /// A fake clock and presence feed: polls the scheduler every [`POLL_EVERY`] like the platform,
-/// with the user either at the keyboard, gone, or behind a lock-type event, and records what came
-/// out and when.
+/// with the user either at the keyboard, gone, or in a state that an event or a veto decides,
+/// and records what came out and when.
 struct Sim {
     sched: Scheduler,
     now: Duration,
     last_input: Duration,
-    /// A lock-type `Away` in force, and since when.
-    locked: Option<(AwayReason, Duration)>,
+    /// A presence that events or vetoes decide, in force instead of the input-only verdict.
+    held: Option<Presence>,
     effects: Vec<(Duration, Effect)>,
 }
 
@@ -32,7 +32,7 @@ impl Sim {
             sched: Scheduler::new(minute),
             now: Duration::ZERO,
             last_input: Duration::ZERO,
-            locked: None,
+            held: None,
             effects: Vec::new(),
         };
         sim.poll();
@@ -49,11 +49,17 @@ impl Sim {
         self.run(d, false);
     }
 
-    /// The session is locked (or suspended, or the display off) for `d`; then the user is back.
+    /// The user is `Away` for `reason` for `d`, with no input; then the user is back.
     fn lock(&mut self, reason: AwayReason, d: Duration) {
-        self.locked = Some((reason, self.last_input));
+        let since = self.last_input;
+        self.hold(Presence::Away { since, reason }, d);
+    }
+
+    /// The presence is `presence` for `d`, with no input.
+    fn hold(&mut self, presence: Presence, d: Duration) {
+        self.held = Some(presence);
         self.leave(d);
-        self.locked = None;
+        self.held = None;
     }
 
     /// The user touches the keyboard again after an absence. Returns the moment active time
@@ -75,10 +81,9 @@ impl Sim {
     }
 
     fn poll(&mut self) {
-        let presence = match self.locked {
-            Some((reason, since)) => Presence::Away { since, reason },
-            None => Presence::from_last_input(self.now, self.last_input),
-        };
+        let presence = self
+            .held
+            .unwrap_or_else(|| Presence::from_last_input(self.now, self.last_input));
         let out = self.sched.poll(self.now, presence);
         self.record(out);
     }
@@ -497,6 +502,49 @@ fn a_pause_needs_the_pause_length_while_the_stand_with_it_needs_only_the_stand_l
             Effect::Close
         ]
     );
+}
+
+#[test]
+fn windows_user_inactive_verdict_satisfies_only_after_the_length() {
+    let mut sim = stand_pending();
+    sim.lock(AwayReason::UserInactive, MIN);
+    sim.come_back();
+    assert!(sim.take().is_empty(), "satisfied at once like a lock");
+    assert_eq!(sim.pending_occ(Nudge::Stand), Some(1));
+
+    sim.lock(AwayReason::UserInactive, 2 * MIN);
+    assert_eq!(
+        sim.take(),
+        [
+            satisfied(Nudge::Stand, 1, SatisfyCause::Away),
+            Effect::Close
+        ]
+    );
+}
+
+#[test]
+fn at_desk_counts_as_active_time_and_never_satisfies() {
+    let mut sim = Sim::new();
+    sim.work(10 * MIN);
+    // A video plays with no input: present, not typing.
+    sim.hold(Presence::AtDesk, 30 * MIN);
+    assert_eq!(sim.fired_at(Nudge::Stand), [30 * MIN]);
+    assert_eq!(
+        sim.pending_occ(Nudge::Stand),
+        Some(1),
+        "satisfied while AtDesk"
+    );
+}
+
+#[test]
+fn unknown_neither_advances_nor_restarts_the_clocks() {
+    let mut sim = Sim::new();
+    sim.work(20 * MIN);
+    // The machine woke itself and nobody touched it.
+    sim.hold(Presence::Unknown, 60 * MIN);
+    let back = sim.come_back();
+    sim.work(10 * MIN);
+    assert_eq!(sim.fired_at(Nudge::Stand), [back + 10 * MIN - POLL_EVERY]);
 }
 
 // SPEC §5.5 Ending: skipped.
