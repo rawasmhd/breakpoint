@@ -3,11 +3,15 @@
 //! One window for the life of the app, hidden between occurrences (SPEC §6: at most one popup on
 //! screen). It sits bottom-right of the primary monitor's work area, just above the tray, always
 //! on top, and never takes focus: `WS_EX_NOACTIVATE`, `SW_SHOWNOACTIVATE` and `MA_NOACTIVATE`.
-//! It carries the prompt's title and line, a live away countdown the app refreshes every second,
-//! and the Snooze 5 min and Skip buttons (Skip only after the snooze). Button presses are posted to the owner window as messages, so the app reacts from its own
-//! window procedure rather than from inside this one.
+//! It carries the prompt's title and line, a riding Water line if any, a live away countdown the
+//! app refreshes every second, and the Snooze 5 min and Skip buttons (Skip only after the snooze).
+//! Button presses are posted to the owner window as messages, so the app reacts from its own
+//! window procedure rather than from inside this one. Water alone uses the same window: the title
+//! only, silent, hiding itself after a few seconds.
 
-use breakpoint::core::scheduler::Prompt;
+use std::cell::Cell;
+
+use breakpoint::core::scheduler::{Prompt, WATER_ALONE_FOR, WATER_LINE, WATER_TITLE};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     COLOR_WINDOW, CreateFontIndirectW, DeleteObject, FW_BOLD, GetMonitorInfoW, GetSysColor,
@@ -21,13 +25,14 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, BS_PUSHBUTTON, CreateWindowExW, DefWindowProcW, GWLP_USERDATA, GetDlgItem,
-    GetWindowLongPtrW, HMENU, HWND_TOPMOST, IDC_ARROW, IsWindowVisible, LoadCursorW, MA_NOACTIVATE,
-    NONCLIENTMETRICSW, PostMessageW, RegisterClassW, SPI_GETNONCLIENTMETRICS, SW_HIDE, SW_SHOW,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    SendMessageW, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC, WM_DPICHANGED, WM_GETFONT,
-    WM_MOUSEACTIVATE, WM_SETFONT, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    GetWindowLongPtrW, HMENU, HWND_TOPMOST, IDC_ARROW, IsWindowVisible, KillTimer, LoadCursorW,
+    MA_NOACTIVATE, NONCLIENTMETRICSW, PostMessageW, RegisterClassW, SPI_GETNONCLIENTMETRICS,
+    SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SWP_SHOWWINDOW, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
+    ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC,
+    WM_DPICHANGED, WM_GETFONT, WM_MOUSEACTIVATE, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_CAPTION,
+    WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_SYSMENU, WS_TABSTOP,
+    WS_VISIBLE,
 };
 use windows::core::{HSTRING, Result, w};
 
@@ -42,6 +47,10 @@ const ID_SKIP: i32 = 3;
 const ID_COUNTDOWN: i32 = 4;
 const ID_SNOOZE: i32 = 5;
 const ID_NOTICE: i32 = 6;
+const ID_WATER: i32 = 7;
+
+/// Hides Water alone once it has been on screen for [`WATER_ALONE_FOR`].
+const WATER_TIMER: usize = 1;
 
 /// The bad-config notice (SPEC §10.1).
 const NOTICE: &str = "breakpoint couldn't read config.json and is using the defaults. \
@@ -51,20 +60,59 @@ const STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_POPUP.0 | WS_CAPTION.0 | WS_SYSMENU.
 const EX_STYLE: WINDOW_EX_STYLE =
     WINDOW_EX_STYLE(WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0);
 
-/// Layout at 96 DPI, scaled for the monitor: the client size, then each child's rectangle.
+/// Layout at 96 DPI, scaled for the monitor: the client size, then each child's rectangle, as
+/// they sit without the riding Water line.
 const CLIENT: (i32, i32) = (320, 148);
-const CHILDREN: [(i32, [i32; 4]); 6] = [
+const CHILDREN: [(i32, [i32; 4]); 7] = [
     (ID_TITLE, [14, 12, 292, 24]),
     (ID_LINE, [14, 40, 292, 36]),
+    (ID_WATER, [14, 80, 292, 20]),
     (ID_COUNTDOWN, [14, 80, 292, 20]),
     (ID_SNOOZE, [134, 108, 90, 28]),
     (ID_SKIP, [230, 108, 76, 28]),
     (ID_NOTICE, [14, 12, 292, 124]),
 ];
-/// The children that make up a nudge's popup; the notice hides them all.
+/// The children that make up a nudge's popup, Water line aside; the notice hides them all.
 const PROMPT: [i32; 5] = [ID_TITLE, ID_LINE, ID_COUNTDOWN, ID_SNOOZE, ID_SKIP];
+/// How far the riding Water line pushes the children below it down, and the popup taller.
+const WATER_ROW: i32 = 24;
+const BELOW_WATER: [i32; 3] = [ID_COUNTDOWN, ID_SNOOZE, ID_SKIP];
+/// The client height of Water alone: its title and the margins around it.
+const WATER_ALONE_HEIGHT: i32 = 48;
 /// The gap between the popup and the work area's bottom-right corner, at 96 DPI.
 const MARGIN: i32 = 12;
+
+/// What the popup holds, which decides its height and where its children sit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    Prompt { water: bool },
+    WaterAlone,
+    Notice,
+}
+
+impl Shape {
+    fn height(self) -> i32 {
+        match self {
+            Shape::Prompt { water: true } => CLIENT.1 + WATER_ROW,
+            Shape::WaterAlone => WATER_ALONE_HEIGHT,
+            Shape::Prompt { water: false } | Shape::Notice => CLIENT.1,
+        }
+    }
+
+    /// How far child `id` moves down from its place in [`CHILDREN`].
+    fn shift(self, id: i32) -> i32 {
+        if self == (Shape::Prompt { water: true }) && BELOW_WATER.contains(&id) {
+            WATER_ROW
+        } else {
+            0
+        }
+    }
+}
+
+thread_local! {
+    /// The shape on screen, which a DPI change lays out again.
+    static SHAPE: Cell<Shape> = const { Cell::new(Shape::Prompt { water: false }) };
+}
 
 pub struct Popup {
     hwnd: HWND,
@@ -110,6 +158,7 @@ impl Popup {
                 (ID_SNOOZE, w!("BUTTON"), w!("Snooze 5 min"), button),
                 (ID_SKIP, w!("BUTTON"), w!("Skip"), button),
                 (ID_NOTICE, w!("STATIC"), w!(""), WINDOW_STYLE(0)),
+                (ID_WATER, w!("STATIC"), w!(""), WINDOW_STYLE(0)),
             ] {
                 CreateWindowExW(
                     WINDOW_EX_STYLE(0),
@@ -136,13 +185,35 @@ impl Popup {
         unsafe {
             set_text(self.hwnd, ID_TITLE, prompt.title);
             set_text(self.hwnd, ID_LINE, &prompt.line);
+            set_text(self.hwnd, ID_WATER, WATER_LINE);
             set_text(self.hwnd, ID_COUNTDOWN, countdown);
             show_only(self.hwnd, &PROMPT);
-            if let Ok(snooze) = GetDlgItem(Some(self.hwnd), ID_SNOOZE) {
-                let _ = ShowWindow(snooze, if prompt.snooze { SW_SHOW } else { SW_HIDE });
+            for (id, shown) in [(ID_SNOOZE, prompt.snooze), (ID_WATER, prompt.water)] {
+                if let Ok(child) = GetDlgItem(Some(self.hwnd), id) {
+                    let _ = ShowWindow(child, if shown { SW_SHOW } else { SW_HIDE });
+                }
             }
-            self.raise();
+            self.raise(Shape::Prompt {
+                water: prompt.water,
+            });
             let _ = PlaySoundW(w!("Notification.Default"), None, SND_ALIAS | SND_ASYNC);
+        }
+    }
+
+    /// Shows Water alone (SPEC §5.4): its title only, no buttons, silent, hiding itself after
+    /// [`WATER_ALONE_FOR`].
+    pub fn water(&self) {
+        // SAFETY: `self.hwnd` is the live popup window; the string outlives the call.
+        unsafe {
+            set_text(self.hwnd, ID_TITLE, WATER_TITLE);
+            show_only(self.hwnd, &[ID_TITLE]);
+            self.raise(Shape::WaterAlone);
+            SetTimer(
+                Some(self.hwnd),
+                WATER_TIMER,
+                WATER_ALONE_FOR.as_millis() as u32,
+                None,
+            );
         }
     }
 
@@ -153,13 +224,16 @@ impl Popup {
         unsafe {
             set_text(self.hwnd, ID_NOTICE, NOTICE);
             show_only(self.hwnd, &[ID_NOTICE]);
-            self.raise();
+            self.raise(Shape::Notice);
         }
     }
 
-    /// Lays the popup out afresh and puts it on top without activating it.
-    unsafe fn raise(&self) {
+    /// Lays the popup out afresh as `shape` and puts it on top without activating it.
+    unsafe fn raise(&self, shape: Shape) {
         unsafe {
+            // Whatever comes next replaces Water alone, so its timer must not hide it.
+            let _ = KillTimer(Some(self.hwnd), WATER_TIMER);
+            SHAPE.set(shape);
             // The work area or the scale may have changed while hidden.
             layout(self.hwnd, primary_dpi());
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
@@ -189,6 +263,7 @@ impl Popup {
     pub fn hide(&self) {
         // SAFETY: `self.hwnd` is the live popup window.
         unsafe {
+            let _ = KillTimer(Some(self.hwnd), WATER_TIMER);
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
     }
@@ -225,10 +300,11 @@ fn primary_dpi() -> u32 {
     x
 }
 
-/// Sizes the fonts, the children and the window for `dpi` and moves it bottom-right of the
-/// primary monitor's work area.
+/// Sizes the fonts, the children and the window for `dpi` and the shape on screen, and moves it
+/// bottom-right of the primary monitor's work area.
 unsafe fn layout(hwnd: HWND, dpi: u32) {
     let px = |v: i32| v * dpi as i32 / 96;
+    let shape = SHAPE.get();
     unsafe {
         // The system message font at this DPI, and a larger bold copy for the title.
         let mut metrics = NONCLIENTMETRICSW {
@@ -269,7 +345,7 @@ unsafe fn layout(hwnd: HWND, dpi: u32) {
                 child,
                 None,
                 px(x),
-                px(y),
+                px(y + shape.shift(id)),
                 px(w),
                 px(h),
                 SWP_NOZORDER | SWP_NOACTIVATE,
@@ -283,7 +359,7 @@ unsafe fn layout(hwnd: HWND, dpi: u32) {
             left: 0,
             top: 0,
             right: px(CLIENT.0),
-            bottom: px(CLIENT.1),
+            bottom: px(shape.height()),
         };
         let _ = AdjustWindowRectExForDpi(&mut rect, STYLE, false, EX_STYLE, dpi);
         let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
@@ -331,6 +407,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             // X hides the popup; the occurrence stays pending (SPEC §6).
             WM_CLOSE => {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == WATER_TIMER => {
+                let _ = KillTimer(Some(hwnd), WATER_TIMER);
                 let _ = ShowWindow(hwnd, SW_HIDE);
                 LRESULT(0)
             }

@@ -5,7 +5,8 @@ use std::time::Duration;
 use breakpoint::core::config::{Nudges, Profile};
 use breakpoint::core::presence::{AwayReason, POLL_EVERY, Presence};
 use breakpoint::core::scheduler::{
-    Effect, Event, Nudge, Prompt, SatisfyCause, Scheduler, SkipCause, away_left, countdown_text,
+    Effect, Event, Nudge, Prompt, SatisfyCause, Scheduler, SkipCause, WATER_LINE, WATER_TITLE,
+    away_left, countdown_text,
 };
 
 const MIN: Duration = Duration::from_secs(60);
@@ -122,6 +123,15 @@ impl Sim {
             .collect()
     }
 
+    /// The times at which Water was shown, riding along or alone.
+    fn water_shown_at(&self) -> Vec<Duration> {
+        self.effects
+            .iter()
+            .filter(|(_, e)| matches!(e, Effect::Log(Event::Shown { .. })))
+            .map(|&(t, _)| t)
+            .collect()
+    }
+
     fn take(&mut self) -> Vec<Effect> {
         self.effects.drain(..).map(|(_, e)| e).collect()
     }
@@ -132,7 +142,24 @@ impl Sim {
 }
 
 fn fired(nudge: Nudge, occ: u64) -> Effect {
-    Effect::Log(Event::Fired { nudge, occ })
+    Effect::Log(Event::Fired {
+        nudge,
+        occ,
+        into: None,
+    })
+}
+
+/// A Stand/Move `occ` fired into the Pause `into`, as one combined nudge.
+fn joined(occ: u64, into: u64) -> Effect {
+    Effect::Log(Event::Fired {
+        nudge: Nudge::Stand,
+        occ,
+        into: Some(into),
+    })
+}
+
+fn water_shown(occ: u64) -> Effect {
+    Effect::Log(Event::Shown { occ })
 }
 
 fn snoozed(nudge: Nudge, occ: u64) -> Effect {
@@ -158,11 +185,52 @@ fn prompt(nudge: Nudge, snooze: bool) -> Prompt {
         line: line.into(),
         length: minutes * MIN,
         snooze,
+        water: false,
     }
 }
 
 fn show(nudge: Nudge) -> Effect {
     Effect::Show(prompt(nudge, true))
+}
+
+/// The show of a newly fired `nudge` with the Water line riding on it.
+fn show_with_water(nudge: Nudge) -> Effect {
+    Effect::Show(Prompt {
+        water: true,
+        ..prompt(nudge, true)
+    })
+}
+
+/// Balanced, with these cadences in active minutes.
+fn every(stand: u32, pause: u32, water: u32) -> Nudges {
+    let mut nudges = Nudges::default();
+    nudges.stand.every_minutes = stand;
+    nudges.pause.every_minutes = pause;
+    nudges.water.every_minutes = water;
+    nudges
+}
+
+/// Balanced with Water off, so its line does not get in the way.
+fn no_water() -> Nudges {
+    let mut nudges = Nudges::default();
+    nudges.water.on = false;
+    nudges
+}
+
+/// A Sim, Water off, where Stand/Move and Pause drifted out of phase after an absence: the Pause
+/// (occ 2) fired on its own and the Stand/Move (occ 3) has just fired into it.
+fn stand_joined_pause() -> Sim {
+    let mut sim = Sim::with(no_water(), MIN);
+    sim.work(50 * MIN);
+    // 3 min away satisfy the Stand/Move of 30 and restart its clock, but not the Pause's.
+    sim.leave(3 * MIN);
+    sim.come_back();
+    sim.take();
+    sim.work(9 * MIN);
+    assert_eq!(sim.take(), [fired(Nudge::Pause, 2), show(Nudge::Pause)]);
+    sim.work(21 * MIN);
+    assert_eq!(sim.take(), [joined(3, 2), show(Nudge::Pause)]);
+    sim
 }
 
 /// A Sim with the first Stand/Move (occ 1) just fired and its popup taken.
@@ -199,6 +267,8 @@ fn the_popup_shows_each_nudges_copy() {
         Nudge::Pause.line(5),
         "Step away from the screen for 5 minutes."
     );
+    assert_eq!(WATER_LINE, "Drink some water.");
+    assert_eq!(WATER_TITLE, "Drink some water");
 }
 
 // SPEC §5.1 Firing.
@@ -226,8 +296,9 @@ fn pause_fires_after_60_active_minutes_and_shows_in_front() {
         sim.take(),
         [
             fired(Nudge::Pause, 2),
-            fired(Nudge::Stand, 3),
-            show(Nudge::Pause)
+            joined(3, 2),
+            water_shown(4),
+            show_with_water(Nudge::Pause)
         ]
     );
 }
@@ -256,8 +327,9 @@ fn the_next_falling_due_while_pending_expires_the_old_and_shows_the_new() {
         [
             fired(Nudge::Pause, 2),
             skipped(Nudge::Stand, 1, SkipCause::Next),
-            fired(Nudge::Stand, 3),
-            show(Nudge::Pause)
+            joined(3, 2),
+            water_shown(4),
+            show_with_water(Nudge::Pause)
         ]
     );
 }
@@ -273,12 +345,12 @@ fn an_expired_pause_is_replaced_by_the_new_one() {
     sim.take();
     sim.work(30 * MIN);
     sim.take();
-    assert_eq!(sim.pending_occ(Nudge::Pause), Some(5));
+    assert_eq!(sim.pending_occ(Nudge::Pause), Some(6));
 
     sim.work(60 * MIN);
     let out = sim.take();
-    assert!(out.contains(&skipped(Nudge::Pause, 5, SkipCause::Next)));
-    assert!(out.contains(&show(Nudge::Pause)));
+    assert!(out.contains(&skipped(Nudge::Pause, 6, SkipCause::Next)));
+    assert!(out.contains(&show_with_water(Nudge::Pause)));
     assert!(!out.contains(&Effect::Close), "replaced, not closed");
 }
 
@@ -701,6 +773,268 @@ fn a_new_occurrence_after_an_expiry_can_be_snoozed_again() {
     sim.work(30 * MIN);
     sim.take();
     assert_eq!(sim.sched.prompt().map(|p| p.snooze), Some(true));
+}
+
+// SPEC §5.3 Combined nudge.
+
+#[test]
+fn a_pause_due_within_2_active_minutes_of_a_stand_fires_with_it() {
+    let mut sim = Sim::with(every(30, 32, 60), MIN);
+    sim.work(30 * MIN);
+    assert_eq!(
+        sim.take(),
+        [fired(Nudge::Pause, 1), joined(2, 1), show(Nudge::Pause)]
+    );
+
+    // Both clocks restarted at 30, so the Pause is again within 2 minutes of the Stand/Move.
+    sim.skip();
+    sim.work(30 * MIN);
+    assert_eq!(sim.fired_at(Nudge::Stand), [60 * MIN]);
+    assert_eq!(sim.fired_at(Nudge::Pause), [60 * MIN]);
+}
+
+#[test]
+fn a_stand_due_within_2_active_minutes_of_a_pause_fires_with_it() {
+    let mut sim = Sim::with(every(32, 30, 60), MIN);
+    sim.work(30 * MIN);
+    assert_eq!(
+        sim.take(),
+        [fired(Nudge::Pause, 1), joined(2, 1), show(Nudge::Pause)]
+    );
+}
+
+#[test]
+fn a_nudge_due_more_than_2_active_minutes_later_waits_for_its_own_time() {
+    let mut sim = Sim::with(every(30, 33, 60), MIN);
+    sim.work(33 * MIN);
+    assert_eq!(sim.fired_at(Nudge::Stand), [30 * MIN]);
+    assert_eq!(sim.fired_at(Nudge::Pause), [33 * MIN]);
+}
+
+#[test]
+fn a_drifted_pending_stand_joins_a_newly_fired_pause() {
+    let mut sim = Sim::with(no_water(), MIN);
+    sim.work(20 * MIN);
+    // 3 min away restart the Stand/Move clock but not the Pause's: they drift apart.
+    sim.leave(3 * MIN);
+    sim.come_back();
+    sim.work(30 * MIN);
+    assert_eq!(sim.take(), [fired(Nudge::Stand, 1), show(Nudge::Stand)]);
+
+    sim.work(10 * MIN);
+    // The Pause takes the pending Stand/Move in, with no log line for it.
+    assert_eq!(sim.take(), [fired(Nudge::Pause, 2), show(Nudge::Pause)]);
+    assert_eq!(sim.pending_occ(Nudge::Stand), Some(1));
+    assert_eq!(sim.sched.prompt(), Some(prompt(Nudge::Pause, true)));
+}
+
+#[test]
+fn a_stand_fired_while_a_pause_is_pending_joins_it() {
+    let sim = stand_joined_pause();
+    assert_eq!(sim.pending_occ(Nudge::Pause), Some(2));
+    assert_eq!(sim.pending_occ(Nudge::Stand), Some(3));
+    // One popup: the Pause's title, line and countdown length.
+    assert_eq!(sim.sched.prompt(), Some(prompt(Nudge::Pause, true)));
+}
+
+#[test]
+fn one_skip_ends_both_parts_of_a_combined_nudge() {
+    let mut sim = stand_joined_pause();
+    sim.skip();
+    assert_eq!(
+        sim.take(),
+        [
+            skipped(Nudge::Pause, 2, SkipCause::User),
+            skipped(Nudge::Stand, 3, SkipCause::User),
+            Effect::Close
+        ]
+    );
+    assert_eq!(sim.sched.prompt(), None);
+}
+
+#[test]
+fn one_snooze_acts_on_both_parts_of_a_combined_nudge() {
+    let mut sim = stand_joined_pause();
+    sim.snooze();
+    assert_eq!(
+        sim.take(),
+        [
+            snoozed(Nudge::Pause, 2),
+            snoozed(Nudge::Stand, 3),
+            Effect::Close
+        ]
+    );
+    sim.work(5 * MIN);
+    assert_eq!(sim.take(), [Effect::Show(prompt(Nudge::Pause, false))]);
+}
+
+#[test]
+fn an_absorbed_stand_is_satisfied_after_the_stand_length_while_the_pause_stays_pending() {
+    let mut sim = stand_joined_pause();
+    sim.leave(2 * MIN);
+    assert_eq!(
+        sim.take(),
+        [satisfied(Nudge::Stand, 3, SatisfyCause::Away)],
+        "the Pause stays on screen"
+    );
+    assert_eq!(sim.pending_occ(Nudge::Pause), Some(2));
+    assert_eq!(sim.sched.prompt(), Some(prompt(Nudge::Pause, true)));
+
+    sim.leave(3 * MIN);
+    assert_eq!(
+        sim.take(),
+        [
+            satisfied(Nudge::Pause, 2, SatisfyCause::Away),
+            Effect::Close
+        ]
+    );
+}
+
+#[test]
+fn a_snoozed_part_makes_the_combined_nudge_snoozed() {
+    let mut nudges = every(30, 33, 60);
+    nudges.water.on = false;
+    let mut sim = Sim::with(nudges, MIN);
+    sim.work(30 * MIN);
+    sim.snooze();
+    sim.take();
+
+    // The Pause joins the snoozed Stand/Move: Skip only, and no second snooze.
+    sim.work(3 * MIN);
+    assert_eq!(
+        sim.take(),
+        [
+            fired(Nudge::Pause, 2),
+            Effect::Show(prompt(Nudge::Pause, false))
+        ]
+    );
+    sim.snooze();
+    assert!(sim.take().is_empty(), "snoozed a snoozed combined nudge");
+
+    // The snooze still ends at 35, with one re-prompt for both.
+    sim.work(2 * MIN);
+    assert_eq!(sim.take(), [Effect::Show(prompt(Nudge::Pause, false))]);
+    sim.work(20 * MIN);
+    assert!(sim.take().is_empty(), "prompted again");
+}
+
+// SPEC §5.4 Water rides along.
+
+#[test]
+fn water_rides_on_the_next_newly_fired_popup() {
+    let mut sim = Sim::with(every(30, 60, 10), MIN);
+    sim.work(30 * MIN - POLL_EVERY);
+    assert!(sim.take().is_empty(), "Water prompted on its own");
+
+    sim.work(POLL_EVERY);
+    assert_eq!(
+        sim.take(),
+        [
+            fired(Nudge::Stand, 1),
+            water_shown(2),
+            show_with_water(Nudge::Stand)
+        ]
+    );
+    // The popup and the tray keep no Water line once it has been shown.
+    assert_eq!(sim.sched.prompt(), Some(prompt(Nudge::Stand, true)));
+}
+
+#[test]
+fn a_second_due_while_water_waits_does_nothing() {
+    // Due at 10 and again at 20, shown once at 30; then due at 40, shown at 60.
+    let mut sim = Sim::with(every(30, 60, 10), MIN);
+    sim.work(60 * MIN);
+    assert_eq!(sim.water_shown_at(), [30 * MIN, 60 * MIN]);
+}
+
+#[test]
+fn the_water_clock_restarts_when_shown() {
+    // Due at 35 and shown at 60; due again 35 minutes after that, so shown at 120, not 90.
+    let mut sim = Sim::with(every(30, 60, 35), MIN);
+    sim.work(120 * MIN);
+    assert_eq!(sim.water_shown_at(), [60 * MIN, 120 * MIN]);
+}
+
+#[test]
+fn water_never_joins_a_popup_on_screen_or_a_reprompt() {
+    let mut sim = Sim::with(every(30, 60, 40), MIN);
+    sim.work(30 * MIN);
+    sim.take();
+    sim.work(8 * MIN);
+    sim.snooze();
+    sim.take();
+
+    // Due at 40 while the Stand/Move waits for its re-prompt at 43.
+    sim.work(5 * MIN);
+    assert_eq!(sim.take(), [Effect::Show(prompt(Nudge::Stand, false))]);
+
+    // It rides on the next newly fired popup, the Pause at 60.
+    sim.work(17 * MIN);
+    assert_eq!(sim.water_shown_at(), [60 * MIN]);
+    assert!(sim.take().contains(&show_with_water(Nudge::Pause)));
+}
+
+#[test]
+fn the_water_clock_is_never_reset_by_presence() {
+    let mut sim = Sim::new();
+    sim.work(50 * MIN);
+    // Lunch restarts the Stand/Move and Pause clocks; 51.5 active minutes stay on Water's.
+    sim.leave(30 * MIN);
+    let back = sim.come_back();
+    sim.take();
+    sim.work(30 * MIN);
+    assert_eq!(sim.fired_at(Nudge::Stand), [back + 30 * MIN]);
+    assert_eq!(sim.water_shown_at(), [back + 30 * MIN]);
+}
+
+#[test]
+fn water_alone_fires_at_once_when_stand_and_pause_are_both_off() {
+    let mut nudges = Nudges::default();
+    nudges.stand.on = false;
+    nudges.pause.on = false;
+    let mut sim = Sim::with(nudges, MIN);
+    sim.work(60 * MIN - POLL_EVERY);
+    assert!(sim.take().is_empty());
+
+    sim.work(POLL_EVERY);
+    assert_eq!(sim.take(), [water_shown(1), Effect::ShowWater]);
+    assert_eq!(sim.sched.prompt(), None, "Water alone is not pending");
+    sim.work(60 * MIN);
+    assert_eq!(sim.take(), [water_shown(2), Effect::ShowWater]);
+}
+
+#[test]
+fn water_rides_rather_than_shows_alone_while_either_nudge_is_on() {
+    let mut nudges = Nudges::default();
+    nudges.stand.on = false;
+    let mut sim = Sim::with(nudges, MIN);
+    sim.work(60 * MIN);
+    assert_eq!(
+        sim.take(),
+        [
+            fired(Nudge::Pause, 1),
+            water_shown(2),
+            show_with_water(Nudge::Pause)
+        ]
+    );
+}
+
+#[test]
+fn water_turned_off_is_never_shown() {
+    let mut sim = Sim::with(no_water(), MIN);
+    sim.work(240 * MIN);
+    assert!(sim.water_shown_at().is_empty());
+}
+
+#[test]
+fn a_dropped_water_waits_a_whole_cadence_again() {
+    // The hook quiet start uses (SPEC §5.4): due at 15, dropped at 20, so not on the Stand/Move
+    // at 30 but due again at 35.
+    let mut sim = Sim::with(every(30, 60, 15), MIN);
+    sim.work(20 * MIN);
+    sim.sched.drop_water();
+    sim.work(40 * MIN);
+    assert_eq!(sim.water_shown_at(), [60 * MIN]);
 }
 
 // SPEC §6: the popup's countdown.
