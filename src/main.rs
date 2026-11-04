@@ -8,9 +8,10 @@ use std::cell::RefCell;
 use std::error::Error;
 use std::time::{Duration, Instant};
 
-use breakpoint::core::presence::{POLL_EVERY, Presence};
+use breakpoint::core::presence::{POLL_EVERY, Tracker};
 use breakpoint::core::scheduler::{Effect, Scheduler};
 use platform::popup::{Popup, WM_POPUP_SKIP};
+use platform::presence::{Listener, Vetoes};
 use platform::tray::{Command, Tray};
 use windows::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM,
@@ -32,6 +33,8 @@ struct App {
     started: Instant,
     scheduler: Scheduler,
     popup: Popup,
+    presence: Tracker,
+    vetoes: Vetoes,
 }
 
 thread_local! {
@@ -45,7 +48,12 @@ impl App {
 
     fn poll(&mut self) {
         let now = self.now();
-        let presence = Presence::from_last_input(now, platform::presence::last_input(now));
+        let last_input = platform::presence::last_input(now);
+        for (at, signal) in platform::presence::take_signals() {
+            let at = at.saturating_duration_since(self.started);
+            self.presence.signal(at, last_input, signal);
+        }
+        let presence = self.presence.poll(now, last_input, &mut self.vetoes);
         let effects = self.scheduler.poll(now, presence);
         self.apply(effects);
     }
@@ -98,7 +106,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         started: Instant::now(),
         scheduler: Scheduler::new(minute()),
         popup: Popup::new(window)?,
+        presence: Tracker::new(),
+        vetoes: Vetoes::default(),
     }));
+    // Session and power events take effect at once rather than at the next poll.
+    let listener = Listener::new(|| with_app(App::poll))?;
     with_app(App::poll);
     // SAFETY: `window` is the live message-only window.
     unsafe {
@@ -123,6 +135,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    drop(listener);
     APP.take();
     drop(tray);
     // SAFETY: `window` is the live message-only window.
