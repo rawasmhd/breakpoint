@@ -2,19 +2,14 @@
 //!
 //! A pure state machine: the platform feeds it the time (an offset on one monotonic timeline),
 //! presence polls and user actions, and carries out the [`Effect`]s it returns. So far Stand/Move
-//! and Pause with satisfaction, snooze and expiry, at the Balanced numbers hard-coded below until
-//! config lands. Combining and Water come with their own issue; until then two pending
-//! occurrences share the popup with Pause in front, and Snooze and Skip act on both.
+//! and Pause with satisfaction, snooze and expiry, with their cadences, lengths and on/off from
+//! config. Combining and Water come with their own issue; until then two pending occurrences
+//! share the popup with Pause in front, and Snooze and Skip act on both.
 
 use std::time::Duration;
 
+use super::config::{AwayNudge, Nudges};
 use super::presence::{AwayReason, Presence};
-
-// Balanced (SPEC §3), in minutes. The one place the config issue swaps for config values.
-pub const STAND_EVERY_MINUTES: u32 = 30;
-pub const STAND_LENGTH_MINUTES: u32 = 2;
-pub const PAUSE_EVERY_MINUTES: u32 = 60;
-pub const PAUSE_LENGTH_MINUTES: u32 = 5;
 
 /// How far a Snooze pushes an occurrence, in active minutes (SPEC §5.6). Fixed, not a setting.
 pub const SNOOZE_MINUTES: u32 = 5;
@@ -143,6 +138,8 @@ pub struct Occurrence {
 #[derive(Debug)]
 struct Clock {
     nudge: Nudge,
+    /// Off: the clock never fires.
+    on: bool,
     every: Duration,
     length_minutes: u32,
     length: Duration,
@@ -162,22 +159,23 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    /// `minute` is how long one minute of the cadences is: 60 s, except under the debug-build
-    /// `BREAKPOINT_MINUTE_SECS` dev aid.
-    pub fn new(minute: Duration) -> Self {
-        let clock = |nudge, every: u32, length_minutes: u32| Clock {
+    /// `nudges` are the settings from config. `minute` is how long one of their minutes is:
+    /// 60 s, except under the debug-build `BREAKPOINT_MINUTE_SECS` dev aid.
+    pub fn new(nudges: Nudges, minute: Duration) -> Self {
+        let clock = |nudge, settings: AwayNudge| Clock {
             nudge,
-            every: minute * every,
-            length_minutes,
-            length: minute * length_minutes,
+            on: settings.on,
+            every: minute * settings.every_minutes,
+            length_minutes: settings.length_minutes,
+            length: minute * settings.length_minutes,
             elapsed: Duration::ZERO,
             pending: None,
         };
         Self {
             minute,
             clocks: [
-                clock(Nudge::Pause, PAUSE_EVERY_MINUTES, PAUSE_LENGTH_MINUTES),
-                clock(Nudge::Stand, STAND_EVERY_MINUTES, STAND_LENGTH_MINUTES),
+                clock(Nudge::Pause, nudges.pause),
+                clock(Nudge::Stand, nudges.stand),
             ],
             last: None,
             next_occ: 1,
@@ -259,7 +257,7 @@ impl Scheduler {
         }
 
         for i in 0..self.clocks.len() {
-            if self.clocks[i].elapsed >= self.clocks[i].every {
+            if self.clocks[i].on && self.clocks[i].elapsed >= self.clocks[i].every {
                 self.fire(i, &mut effects);
                 show = true;
             }
