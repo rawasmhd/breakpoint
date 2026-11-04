@@ -2,9 +2,8 @@
 //!
 //! A pure state machine: the platform feeds it the time (an offset on one monotonic timeline),
 //! presence polls and user actions, and carries out the [`Effect`]s it returns. So far Stand/Move
-//! and Pause with satisfaction, snooze and expiry, with their cadences, lengths and on/off from
-//! config. Combining and Water come with their own issue; until then two pending occurrences
-//! share the popup with Pause in front, and Snooze and Skip act on both.
+//! and Pause with satisfaction, snooze and expiry, the combined nudge and Water riding along, with
+//! their cadences, lengths and on/off from config.
 
 use std::time::Duration;
 
@@ -13,6 +12,20 @@ use super::presence::{AwayReason, Presence};
 
 /// How far a Snooze pushes an occurrence, in active minutes (SPEC §5.6). Fixed, not a setting.
 pub const SNOOZE_MINUTES: u32 = 5;
+
+/// The combined-nudge window, in active minutes (SPEC §5.3): when the first of Stand/Move and
+/// Pause falls due, the other fires with it if it is due within this. Fixed, not a setting.
+pub const COMBINE_MINUTES: u32 = 2;
+
+/// The line a due Water adds to the next newly fired popup (SPEC §3, §5.4).
+pub const WATER_LINE: &str = "Drink some water.";
+
+/// The title of Water alone, the popup shown when Stand/Move and Pause are both off (SPEC §3).
+pub const WATER_TITLE: &str = "Drink some water";
+
+/// How long Water alone stays on screen before it hides itself (SPEC §5.4). Real seconds, even
+/// under the `BREAKPOINT_MINUTE_SECS` dev aid.
+pub const WATER_ALONE_FOR: Duration = Duration::from_secs(7);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Nudge {
@@ -56,6 +69,8 @@ pub struct Prompt {
     pub length: Duration,
     /// Whether the Snooze button shows: not once the one snooze is used (SPEC §5.6).
     pub snooze: bool,
+    /// Whether the riding Water line shows: only on the show of a newly fired occurrence.
+    pub water: bool,
 }
 
 /// How an occurrence was satisfied: the `by` of a `satisfied` log line (SPEC §10.2).
@@ -85,6 +100,8 @@ pub enum Event {
     Fired {
         nudge: Nudge,
         occ: u64,
+        /// For a Stand/Move that joins a Pause in a combined nudge: the Pause's `occ`.
+        into: Option<u64>,
     },
     Snoozed {
         nudge: Nudge,
@@ -100,6 +117,10 @@ pub enum Event {
         occ: u64,
         by: SkipCause,
     },
+    /// Water was shown, riding along or alone; it gets its own `occ`.
+    Shown {
+        occ: u64,
+    },
 }
 
 /// What the platform must do after a call into the scheduler, in order.
@@ -110,6 +131,9 @@ pub enum Effect {
     Show(Prompt),
     /// Hide the popup: its occurrence ended, or was snoozed.
     Close,
+    /// Show Water alone: a small silent popup titled [`WATER_TITLE`], with no buttons, that
+    /// hides itself after [`WATER_ALONE_FOR`].
+    ShowWater,
 }
 
 /// Where an occurrence stands with its one snooze (SPEC §5.6).
@@ -148,11 +172,37 @@ struct Clock {
     pending: Option<Occurrence>,
 }
 
+impl Clock {
+    /// Whether it is on and due within `within` from now.
+    fn due(&self, within: Duration) -> bool {
+        self.on && self.elapsed + within >= self.every
+    }
+}
+
+/// Water's numbers and state. It has no occurrence to keep: a due Water waits for a popup to
+/// ride on, and its clock restarts only when it is shown.
+#[derive(Debug)]
+struct WaterClock {
+    on: bool,
+    every: Duration,
+    /// Active time since Water was last shown. Never reset by presence (SPEC §5.2).
+    elapsed: Duration,
+}
+
+impl WaterClock {
+    /// Due and waiting to be shown. A second due while waiting changes nothing.
+    fn due(&self) -> bool {
+        self.on && self.elapsed >= self.every
+    }
+}
+
 #[derive(Debug)]
 pub struct Scheduler {
     minute: Duration,
-    /// Pause first: it is the one in front when both are pending, and fires first.
+    /// Pause first: it is the one in front of a combined nudge, and fires first so that a
+    /// Stand/Move firing with it can join it.
     clocks: [Clock; 2],
+    water: WaterClock,
     /// The time and presence of the last call, which decide whether the time since was active.
     last: Option<(Duration, Presence)>,
     next_occ: u64,
@@ -177,6 +227,11 @@ impl Scheduler {
                 clock(Nudge::Pause, nudges.pause),
                 clock(Nudge::Stand, nudges.stand),
             ],
+            water: WaterClock {
+                on: nudges.water.on,
+                every: minute * nudges.water.every_minutes,
+                elapsed: Duration::ZERO,
+            },
             last: None,
             next_occ: 1,
         }
@@ -187,8 +242,10 @@ impl Scheduler {
         self.clock(nudge).pending
     }
 
-    /// What the popup and the tray offer while anything is pending: the occurrence in front
-    /// (Pause over Stand/Move), with Snooze only if nothing pending has used its snooze.
+    /// What the popup and the tray offer while anything is pending. A Stand/Move and a Pause
+    /// pending together are one combined nudge, the Pause absorbing (SPEC §5.3): its title, line
+    /// and countdown, with Snooze only if neither part is snoozed. Never with the Water line,
+    /// which rides only on the show that [`Scheduler::poll`] returns when an occurrence fires.
     pub fn prompt(&self) -> Option<Prompt> {
         let front = self.pendings().next()?;
         Some(Prompt {
@@ -197,7 +254,16 @@ impl Scheduler {
             line: front.nudge.line(front.length_minutes),
             length: front.length,
             snooze: self.pendings().all(|o| o.snooze == Snooze::Unused),
+            water: false,
         })
+    }
+
+    /// Drops a due Water that is waiting for a popup, restarting its clock. Quiet start does
+    /// this (SPEC §5.4); the quiet rules come with their own issue.
+    pub fn drop_water(&mut self) {
+        if self.water.due() {
+            self.water.elapsed = Duration::ZERO;
+        }
     }
 
     /// A presence poll at `now`. The time since the previous call counts as active if the
@@ -256,20 +322,50 @@ impl Scheduler {
             }
         }
 
-        for i in 0..self.clocks.len() {
-            if self.clocks[i].on && self.clocks[i].elapsed >= self.clocks[i].every {
-                self.fire(i, &mut effects);
-                show = true;
+        // Firing (SPEC §5.1). The first of the two to fall due brings the other along if it is
+        // due within the combined-nudge window (SPEC §5.3).
+        let fired = if self.clocks.iter().any(|c| c.due(Duration::ZERO)) {
+            let window = self.minute * COMBINE_MINUTES;
+            self.clocks.each_ref().map(|c| c.due(window))
+        } else {
+            [false; 2]
+        };
+        for i in (0..fired.len()).filter(|&i| fired[i]) {
+            self.fire(i, &mut effects);
+        }
+        // One part fired and joined the other, pending from before: if that one is snoozed, the
+        // combined nudge is snoozed (SPEC §5.3), so the new part takes on its snooze.
+        if let [true, false] | [false, true] = fired {
+            let (new, old) = if fired[0] { (0, 1) } else { (1, 0) };
+            if let Some(old) = self.clocks[old].pending
+                && let Some(new) = &mut self.clocks[new].pending
+            {
+                new.snooze = old.snooze;
             }
         }
+        let fired = fired.contains(&true);
 
-        let after = self.prompt();
-        match after {
-            Some(prompt) if show || front != Some(prompt.nudge) => {
-                effects.push(Effect::Show(prompt))
+        // A due Water rides on the popup of a newly fired occurrence only (SPEC §5.4).
+        let rides = fired && self.water.due();
+        if rides {
+            self.show_water(&mut effects);
+        }
+
+        match self.prompt() {
+            Some(prompt) if show || fired || front != Some(prompt.nudge) => {
+                effects.push(Effect::Show(Prompt {
+                    water: rides,
+                    ..prompt
+                }))
             }
             None if front.is_some() => effects.push(Effect::Close),
             _ => {}
+        }
+
+        // With Stand/Move and Pause both off, a due Water shows alone at once (SPEC §5.4).
+        if self.water.due() && self.clocks.iter().all(|c| !c.on) {
+            self.show_water(&mut effects);
+            effects.push(Effect::ShowWater);
         }
         effects
     }
@@ -321,10 +417,15 @@ impl Scheduler {
         effects
     }
 
-    /// Fires the nudge of `self.clocks[i]`, expiring its pending occurrence (SPEC §5.1).
+    /// Fires the nudge of `self.clocks[i]`, expiring its pending occurrence (SPEC §5.1). A
+    /// Stand/Move that fires while a Pause is pending joins it (SPEC §5.3).
     fn fire(&mut self, i: usize, effects: &mut Vec<Effect>) {
         let occ = self.next_occ;
         self.next_occ += 1;
+        let into = match self.clocks[i].nudge {
+            Nudge::Stand => self.pending(Nudge::Pause).map(|p| p.occ),
+            Nudge::Pause => None,
+        };
         let clock = &mut self.clocks[i];
         clock.elapsed = Duration::ZERO;
         if let Some(old) = clock.pending.take() {
@@ -340,10 +441,19 @@ impl Scheduler {
         effects.push(Effect::Log(Event::Fired {
             nudge: clock.nudge,
             occ,
+            into,
         }));
     }
 
-    /// Adds the time since the last call to the clocks and snoozes if it was active time.
+    /// Logs Water as shown and restarts its clock (SPEC §5.4).
+    fn show_water(&mut self, effects: &mut Vec<Effect>) {
+        effects.push(Effect::Log(Event::Shown { occ: self.next_occ }));
+        self.next_occ += 1;
+        self.water.elapsed = Duration::ZERO;
+    }
+
+    /// Adds the time since the last call to the clocks, Water's included, and snoozes if it
+    /// was active time.
     fn advance(&mut self, now: Duration) {
         if let Some((then, presence)) = self.last {
             if presence.counts_as_active() {
@@ -358,6 +468,7 @@ impl Scheduler {
                         *left = left.saturating_sub(active);
                     }
                 }
+                self.water.elapsed += active;
             }
             self.last = Some((now, presence));
         }

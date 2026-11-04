@@ -92,6 +92,7 @@ impl App {
                 Effect::Log(_) => {}
                 Effect::Show(prompt) => self.popup.show(&prompt, &self.countdown(prompt.length)),
                 Effect::Close => self.popup.hide(),
+                Effect::ShowWater => self.popup.water(),
             }
         }
         self.tray.set_pending(self.scheduler.prompt().as_ref());
