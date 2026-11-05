@@ -761,7 +761,14 @@ fn snooze_acts_on_both_pending_occurrences() {
         ]
     );
     sim.work(5 * MIN);
-    assert_eq!(sim.take(), [Effect::Show(prompt(Nudge::Pause, false))]);
+    // The Water line that rode on the first show comes back with the re-prompt.
+    assert_eq!(
+        sim.take(),
+        [Effect::Show(Prompt {
+            water: true,
+            ..prompt(Nudge::Pause, false)
+        })]
+    );
 }
 
 #[test]
@@ -943,8 +950,33 @@ fn water_rides_on_the_next_newly_fired_popup() {
             show_with_water(Nudge::Stand)
         ]
     );
-    // The popup and the tray keep no Water line once it has been shown.
-    assert_eq!(sim.sched.prompt(), Some(prompt(Nudge::Stand, true)));
+    // The occurrence keeps the line for its later shows.
+    assert_eq!(
+        sim.sched.prompt(),
+        Some(Prompt {
+            water: true,
+            ..prompt(Nudge::Stand, true)
+        })
+    );
+}
+
+#[test]
+fn the_reprompt_shows_the_riding_water_line_again_with_skip_only() {
+    let mut sim = Sim::with(every(30, 60, 30), MIN);
+    sim.work(30 * MIN);
+    assert!(sim.take().contains(&show_with_water(Nudge::Stand)));
+    sim.snooze();
+    sim.take();
+
+    sim.work(5 * MIN);
+    assert_eq!(
+        sim.take(),
+        [Effect::Show(Prompt {
+            water: true,
+            ..prompt(Nudge::Stand, false)
+        })],
+        "re-prompted without the line, or logged Water again"
+    );
 }
 
 #[test]
@@ -1306,14 +1338,40 @@ fn a_pending_soft_occurrence_stays_soft_after_a_change_to_firm() {
 }
 
 #[test]
-fn water_does_not_ride_on_a_firm_repeat() {
+fn a_firm_repeat_keeps_the_water_line_of_its_first_show() {
     let mut nudges = Nudges::default();
     nudges.stand.on = false;
     let mut sim = Sim::with(nudges, MIN);
     sim.work(60 * MIN);
-    assert!(sim.take().contains(&show_with_water(Nudge::Pause)));
-    sim.work(5 * MIN);
-    assert_eq!(sim.take(), [show(Nudge::Pause)]);
+    assert_eq!(
+        sim.take(),
+        [
+            fired(Nudge::Pause, 1),
+            water_shown(2),
+            show_with_water(Nudge::Pause)
+        ]
+    );
+
+    // Identical repeats, with no second Water `shown`.
+    sim.work(10 * MIN);
+    assert_eq!(
+        sim.take(),
+        [show_with_water(Nudge::Pause), show_with_water(Nudge::Pause)]
+    );
+}
+
+#[test]
+fn a_water_due_later_does_not_join_a_firm_repeat() {
+    // The Pause fires at 60 with no Water due; Water falls due at 62 and waits for the next
+    // newly fired popup.
+    let mut nudges = every(30, 60, 62);
+    nudges.stand.on = false;
+    let mut sim = Sim::with(nudges, MIN);
+    sim.work(60 * MIN);
+    assert_eq!(sim.take(), [fired(Nudge::Pause, 1), show(Nudge::Pause)]);
+    sim.work(10 * MIN);
+    assert_eq!(sim.take(), [show(Nudge::Pause), show(Nudge::Pause)]);
+    assert!(sim.water_shown_at().is_empty());
 }
 
 // SPEC §6: the popup's countdown.

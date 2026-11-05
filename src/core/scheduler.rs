@@ -73,7 +73,8 @@ pub struct Prompt {
     pub length: Duration,
     /// Whether the Snooze button shows: not once the one snooze is used (SPEC §5.6).
     pub snooze: bool,
-    /// Whether the riding Water line shows: only on the show of a newly fired occurrence.
+    /// Whether the riding Water line shows: when it rode on the occurrence's first show, and then
+    /// on every show of it after that (SPEC §5.4, §5.7).
     pub water: bool,
 }
 
@@ -164,6 +165,8 @@ pub struct Occurrence {
     /// The enforcement level it fired with, kept even if Settings change it (SPEC §5.7).
     pub level: Enforcement,
     pub snooze: Snooze,
+    /// Whether a Water line rode on its popup, which a re-prompt or Firm repeat shows again.
+    pub water: bool,
 }
 
 /// One nudge's numbers and state.
@@ -257,8 +260,8 @@ impl Scheduler {
 
     /// What the popup and the tray offer while anything is pending. A Stand/Move and a Pause
     /// pending together are one combined nudge, the Pause absorbing (SPEC §5.3): its title, line
-    /// and countdown, with Snooze only if neither part is snoozed. Never with the Water line,
-    /// which rides only on the show that [`Scheduler::poll`] returns when an occurrence fires.
+    /// and countdown, with Snooze only if neither part is snoozed. With the Water line if it
+    /// rode on this popup when it first showed: a Water that falls due later never joins it.
     pub fn prompt(&self) -> Option<Prompt> {
         let front = self.pendings().next()?;
         Some(Prompt {
@@ -267,7 +270,7 @@ impl Scheduler {
             line: front.nudge.line(front.length_minutes),
             length: front.length,
             snooze: self.pendings().all(|o| o.snooze == Snooze::Unused),
-            water: false,
+            water: self.pendings().any(|o| o.water),
         })
     }
 
@@ -372,19 +375,21 @@ impl Scheduler {
             .any(|o| matches!(o.snooze, Snooze::Running { .. }));
         let repeat = firm && !snoozing && self.since_show >= self.minute * FIRM_REPEAT_MINUTES;
 
-        // A due Water rides on the popup of a newly fired occurrence only (SPEC §5.4).
-        let rides = fired && self.water.due();
-        if rides {
+        // A due Water rides on the popup of a newly fired occurrence only (SPEC §5.4). Every
+        // part of that popup keeps the line for its later shows, logged as shown once.
+        if fired && self.water.due() {
             self.show_water(&mut effects);
+            for clock in &mut self.clocks {
+                if let Some(occ) = &mut clock.pending {
+                    occ.water = true;
+                }
+            }
         }
 
         match self.prompt() {
             Some(prompt) if show || fired || repeat || front != Some(prompt.nudge) => {
                 self.since_show = Duration::ZERO;
-                effects.push(Effect::Show(Prompt {
-                    water: rides,
-                    ..prompt
-                }))
+                effects.push(Effect::Show(prompt))
             }
             None if front.is_some() => effects.push(Effect::Close),
             _ => {}
@@ -466,6 +471,7 @@ impl Scheduler {
             length: clock.length,
             level: clock.level,
             snooze: Snooze::Unused,
+            water: false,
         });
         effects.push(Effect::Log(Event::Fired {
             nudge: clock.nudge,
