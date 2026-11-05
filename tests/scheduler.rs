@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use breakpoint::core::config::{Nudges, Profile};
+use breakpoint::core::config::{Enforcement, Nudges, Profile};
 use breakpoint::core::presence::{AwayReason, POLL_EVERY, Presence};
 use breakpoint::core::scheduler::{
     Effect, Event, Nudge, Prompt, SatisfyCause, Scheduler, SkipCause, WATER_LINE, WATER_TITLE,
@@ -217,10 +217,18 @@ fn no_water() -> Nudges {
     nudges
 }
 
-/// A Sim, Water off, where Stand/Move and Pause drifted out of phase after an absence: the Pause
-/// (occ 2) fired on its own and the Stand/Move (occ 3) has just fired into it.
+/// Balanced with Water off and both nudges Soft, so no Firm repeat gets in the way.
+fn soft() -> Nudges {
+    let mut nudges = no_water();
+    nudges.stand.enforcement = Enforcement::Soft;
+    nudges.pause.enforcement = Enforcement::Soft;
+    nudges
+}
+
+/// A Sim, Water off and all Soft, where Stand/Move and Pause drifted out of phase after an
+/// absence: the Pause (occ 2) fired on its own and the Stand/Move (occ 3) has just fired into it.
 fn stand_joined_pause() -> Sim {
-    let mut sim = Sim::with(no_water(), MIN);
+    let mut sim = Sim::with(soft(), MIN);
     sim.work(50 * MIN);
     // 3 min away satisfy the Stand/Move of 30 and restart its clock, but not the Pause's.
     sim.leave(3 * MIN);
@@ -753,7 +761,14 @@ fn snooze_acts_on_both_pending_occurrences() {
         ]
     );
     sim.work(5 * MIN);
-    assert_eq!(sim.take(), [Effect::Show(prompt(Nudge::Pause, false))]);
+    // The Water line that rode on the first show comes back with the re-prompt.
+    assert_eq!(
+        sim.take(),
+        [Effect::Show(Prompt {
+            water: true,
+            ..prompt(Nudge::Pause, false)
+        })]
+    );
 }
 
 #[test]
@@ -892,8 +907,8 @@ fn an_absorbed_stand_is_satisfied_after_the_stand_length_while_the_pause_stays_p
 
 #[test]
 fn a_snoozed_part_makes_the_combined_nudge_snoozed() {
-    let mut nudges = every(30, 33, 60);
-    nudges.water.on = false;
+    let mut nudges = soft();
+    nudges.pause.every_minutes = 33;
     let mut sim = Sim::with(nudges, MIN);
     sim.work(30 * MIN);
     sim.snooze();
@@ -935,8 +950,33 @@ fn water_rides_on_the_next_newly_fired_popup() {
             show_with_water(Nudge::Stand)
         ]
     );
-    // The popup and the tray keep no Water line once it has been shown.
-    assert_eq!(sim.sched.prompt(), Some(prompt(Nudge::Stand, true)));
+    // The occurrence keeps the line for its later shows.
+    assert_eq!(
+        sim.sched.prompt(),
+        Some(Prompt {
+            water: true,
+            ..prompt(Nudge::Stand, true)
+        })
+    );
+}
+
+#[test]
+fn the_reprompt_shows_the_riding_water_line_again_with_skip_only() {
+    let mut sim = Sim::with(every(30, 60, 30), MIN);
+    sim.work(30 * MIN);
+    assert!(sim.take().contains(&show_with_water(Nudge::Stand)));
+    sim.snooze();
+    sim.take();
+
+    sim.work(5 * MIN);
+    assert_eq!(
+        sim.take(),
+        [Effect::Show(Prompt {
+            water: true,
+            ..prompt(Nudge::Stand, false)
+        })],
+        "re-prompted without the line, or logged Water again"
+    );
 }
 
 #[test]
@@ -1035,6 +1075,303 @@ fn a_dropped_water_waits_a_whole_cadence_again() {
     sim.sched.drop_water();
     sim.work(40 * MIN);
     assert_eq!(sim.water_shown_at(), [60 * MIN]);
+}
+
+// SPEC §5.7 Enforcement: Soft and Firm.
+
+/// Balanced with Water off and only `nudge` on.
+fn only(nudge: Nudge) -> Nudges {
+    let mut nudges = no_water();
+    match nudge {
+        Nudge::Stand => nudges.pause.on = false,
+        Nudge::Pause => nudges.stand.on = false,
+    }
+    nudges
+}
+
+/// A Sim with only a Firm Pause, its first (occ 1) just fired at 60 and its popup taken.
+fn firm_pause_pending() -> Sim {
+    let mut sim = Sim::with(only(Nudge::Pause), MIN);
+    sim.work(60 * MIN);
+    assert_eq!(sim.take(), [fired(Nudge::Pause, 1), show(Nudge::Pause)]);
+    sim
+}
+
+#[test]
+fn balanced_has_stand_soft_and_pause_firm() {
+    let nudges = Nudges::default();
+    assert_eq!(nudges.stand.enforcement, Enforcement::Soft);
+    assert_eq!(nudges.pause.enforcement, Enforcement::Firm);
+}
+
+#[test]
+fn soft_shows_once_and_waits_until_the_occurrence_ends() {
+    let mut sim = stand_pending();
+    // Nothing shows again before the next Stand/Move, due at 60.
+    sim.work(30 * MIN - POLL_EVERY);
+    assert!(sim.take().is_empty());
+    assert_eq!(sim.pending_occ(Nudge::Stand), Some(1));
+}
+
+#[test]
+fn firm_comes_back_every_5_active_minutes_unchanged() {
+    let mut sim = firm_pause_pending();
+    sim.work(5 * MIN - POLL_EVERY);
+    assert!(sim.take().is_empty());
+
+    // The same prompt again, Snooze included, with no log line.
+    sim.work(POLL_EVERY);
+    assert_eq!(sim.take(), [show(Nudge::Pause)]);
+    sim.work(5 * MIN);
+    assert_eq!(sim.take(), [show(Nudge::Pause)]);
+}
+
+#[test]
+fn firm_repeats_have_no_cap() {
+    let mut sim = firm_pause_pending();
+    // Every 5 active minutes from 65 to 115, then the next Pause fires at 120.
+    sim.work(60 * MIN);
+    let shows: Vec<_> = (13..=24).map(|i| i * 5 * MIN).collect();
+    assert_eq!(sim.shown_at(), shows);
+    assert_eq!(sim.fired_at(Nudge::Pause), [120 * MIN]);
+}
+
+#[test]
+fn firm_repeats_count_active_time_only() {
+    let mut sim = firm_pause_pending();
+    let shown_at = sim.now;
+    sim.work(3 * MIN);
+    // 7 minutes since the show, but only 4.5 of them active: the last 2.5 are Away, too short
+    // to satisfy the Pause.
+    sim.leave(4 * MIN);
+    assert!(sim.take().is_empty(), "repeated during Away");
+    assert_eq!(sim.pending_occ(Nudge::Pause), Some(1));
+
+    // The poll that notices the return is not active either.
+    sim.work(5 * MIN);
+    assert_eq!(sim.shown_at(), [shown_at + 7 * MIN + POLL_EVERY + 30 * SEC]);
+}
+
+#[test]
+fn firm_repeats_stop_when_satisfied() {
+    let mut sim = firm_pause_pending();
+    sim.work(2 * MIN);
+    sim.leave(5 * MIN);
+    assert_eq!(
+        sim.take(),
+        [
+            satisfied(Nudge::Pause, 1, SatisfyCause::Away),
+            Effect::Close
+        ]
+    );
+    sim.come_back();
+    sim.work(30 * MIN);
+    assert!(sim.take().is_empty(), "repeated after satisfaction");
+}
+
+#[test]
+fn firm_repeats_stop_when_skipped() {
+    let mut sim = firm_pause_pending();
+    sim.work(7 * MIN);
+    sim.skip();
+    sim.take();
+    sim.work(50 * MIN);
+    assert!(sim.take().is_empty(), "repeated after Skip");
+}
+
+#[test]
+fn firm_repeats_stop_when_expired() {
+    let mut sim = firm_pause_pending();
+    sim.work(57 * MIN);
+    sim.take();
+
+    // At 120 the next Pause expires this one; the repeats run from the new one's show.
+    sim.work(3 * MIN);
+    assert_eq!(
+        sim.take(),
+        [
+            skipped(Nudge::Pause, 1, SkipCause::Next),
+            fired(Nudge::Pause, 2),
+            show(Nudge::Pause)
+        ]
+    );
+    sim.work(5 * MIN);
+    assert_eq!(sim.shown_at(), [125 * MIN]);
+
+    // Quitting expires it too, and nothing shows again.
+    sim.take();
+    let out = sim.sched.quit(sim.now);
+    assert_eq!(
+        out,
+        [skipped(Nudge::Pause, 2, SkipCause::Exit), Effect::Close]
+    );
+    sim.work(30 * MIN);
+    assert!(sim.take().is_empty(), "repeated after quitting");
+}
+
+#[test]
+fn firm_waits_out_the_snooze_then_repeats_with_skip_only() {
+    let mut sim = firm_pause_pending();
+    sim.work(2 * MIN);
+    sim.snooze();
+    assert_eq!(sim.take(), [snoozed(Nudge::Pause, 1), Effect::Close]);
+
+    // No repeat while the snooze runs; the re-prompt comes when it ends, Skip only.
+    sim.work(5 * MIN - POLL_EVERY);
+    assert!(sim.take().is_empty(), "repeated while snoozed");
+    sim.work(POLL_EVERY);
+    assert_eq!(sim.take(), [Effect::Show(prompt(Nudge::Pause, false))]);
+
+    // Then every 5 active minutes, Skip only.
+    sim.work(10 * MIN);
+    assert_eq!(
+        sim.take(),
+        [
+            Effect::Show(prompt(Nudge::Pause, false)),
+            Effect::Show(prompt(Nudge::Pause, false))
+        ]
+    );
+}
+
+#[test]
+fn a_combined_nudge_is_firm_if_the_absorbed_stand_is_firm() {
+    let mut nudges = soft();
+    nudges.stand.enforcement = Enforcement::Firm;
+    nudges.pause.every_minutes = 30;
+    let mut sim = Sim::with(nudges, MIN);
+    sim.work(30 * MIN);
+    assert_eq!(
+        sim.take(),
+        [fired(Nudge::Pause, 1), joined(2, 1), show(Nudge::Pause)]
+    );
+    sim.work(5 * MIN);
+    assert_eq!(sim.take(), [show(Nudge::Pause)]);
+
+    // Once the Firm Stand/Move is satisfied, the Soft Pause left on its own repeats no more.
+    sim.leave(2 * MIN);
+    assert_eq!(sim.take(), [satisfied(Nudge::Stand, 2, SatisfyCause::Away)]);
+    sim.come_back();
+    sim.work(20 * MIN);
+    assert!(sim.take().is_empty(), "a Soft Pause repeated");
+}
+
+#[test]
+fn a_combined_nudge_is_firm_if_the_pause_is_firm() {
+    let mut nudges = no_water();
+    nudges.pause.every_minutes = 30;
+    let mut sim = Sim::with(nudges, MIN);
+    sim.work(30 * MIN);
+    sim.take();
+    sim.work(5 * MIN);
+    assert_eq!(sim.take(), [show(Nudge::Pause)]);
+}
+
+#[test]
+fn a_combined_nudge_of_two_soft_parts_is_soft() {
+    let mut nudges = soft();
+    nudges.pause.every_minutes = 30;
+    let mut sim = Sim::with(nudges, MIN);
+    sim.work(30 * MIN);
+    sim.take();
+    sim.work(30 * MIN - POLL_EVERY);
+    assert!(sim.take().is_empty());
+}
+
+#[test]
+fn a_soft_pause_that_takes_in_a_firm_stand_is_firm() {
+    let mut nudges = soft();
+    nudges.stand.enforcement = Enforcement::Firm;
+    let mut sim = Sim::with(nudges, MIN);
+    sim.work(20 * MIN);
+    // 3 min away restart the Stand/Move clock but not the Pause's: they drift apart.
+    sim.leave(3 * MIN);
+    sim.come_back();
+    sim.work(30 * MIN);
+    assert_eq!(sim.take(), [fired(Nudge::Stand, 1), show(Nudge::Stand)]);
+    sim.work(5 * MIN);
+    assert_eq!(sim.take(), [show(Nudge::Stand)]);
+
+    // The Pause fires 8.5 minutes after the Stand/Move and takes it in: still Firm.
+    sim.work(5 * MIN);
+    assert_eq!(sim.take(), [fired(Nudge::Pause, 2), show(Nudge::Pause)]);
+    sim.work(5 * MIN);
+    assert_eq!(sim.take(), [show(Nudge::Pause)]);
+}
+
+#[test]
+fn a_pending_firm_occurrence_stays_firm_after_a_change_to_soft() {
+    let mut sim = firm_pause_pending();
+    sim.sched.set_enforcement(Nudge::Pause, Enforcement::Soft);
+    sim.work(5 * MIN);
+    assert_eq!(sim.take(), [show(Nudge::Pause)]);
+
+    // The next Pause, at 120, fires Soft.
+    sim.skip();
+    sim.take();
+    sim.work(55 * MIN);
+    assert_eq!(sim.take(), [fired(Nudge::Pause, 2), show(Nudge::Pause)]);
+    sim.work(10 * MIN);
+    assert!(sim.take().is_empty(), "the next Pause repeated");
+}
+
+#[test]
+fn a_pending_soft_occurrence_stays_soft_after_a_change_to_firm() {
+    let mut sim = Sim::with(only(Nudge::Stand), MIN);
+    sim.work(30 * MIN);
+    sim.take();
+    sim.sched.set_enforcement(Nudge::Stand, Enforcement::Firm);
+    sim.work(30 * MIN - POLL_EVERY);
+    assert!(sim.take().is_empty(), "the pending Stand/Move repeated");
+
+    // The next Stand/Move, at 60, fires Firm.
+    sim.work(POLL_EVERY);
+    assert_eq!(
+        sim.take(),
+        [
+            skipped(Nudge::Stand, 1, SkipCause::Next),
+            fired(Nudge::Stand, 2),
+            show(Nudge::Stand)
+        ]
+    );
+    sim.work(5 * MIN);
+    assert_eq!(sim.take(), [show(Nudge::Stand)]);
+}
+
+#[test]
+fn a_firm_repeat_keeps_the_water_line_of_its_first_show() {
+    let mut nudges = Nudges::default();
+    nudges.stand.on = false;
+    let mut sim = Sim::with(nudges, MIN);
+    sim.work(60 * MIN);
+    assert_eq!(
+        sim.take(),
+        [
+            fired(Nudge::Pause, 1),
+            water_shown(2),
+            show_with_water(Nudge::Pause)
+        ]
+    );
+
+    // Identical repeats, with no second Water `shown`.
+    sim.work(10 * MIN);
+    assert_eq!(
+        sim.take(),
+        [show_with_water(Nudge::Pause), show_with_water(Nudge::Pause)]
+    );
+}
+
+#[test]
+fn a_water_due_later_does_not_join_a_firm_repeat() {
+    // The Pause fires at 60 with no Water due; Water falls due at 62 and waits for the next
+    // newly fired popup.
+    let mut nudges = every(30, 60, 62);
+    nudges.stand.on = false;
+    let mut sim = Sim::with(nudges, MIN);
+    sim.work(60 * MIN);
+    assert_eq!(sim.take(), [fired(Nudge::Pause, 1), show(Nudge::Pause)]);
+    sim.work(10 * MIN);
+    assert_eq!(sim.take(), [show(Nudge::Pause), show(Nudge::Pause)]);
+    assert!(sim.water_shown_at().is_empty());
 }
 
 // SPEC §6: the popup's countdown.

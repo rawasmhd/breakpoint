@@ -114,7 +114,7 @@ Decided in [How a nudge is satisfied](https://github.com/rawasmhd/breakpoint/iss
 ### 5.4 Water rides along
 
 - Water's clock makes it **due** every 60 active minutes; it does not prompt by itself while Stand/Move or Pause is on.
-- A due Water adds the line "Drink some water." to the popup of the **next newly fired** Stand/Move or Pause occurrence. That is its *shown* event, and the Water clock restarts then. It never joins a popup already on screen, a Firm repeat or a post-snooze re-prompt. While it waits, a second due does nothing.
+- A due Water adds the line "Drink some water." to the popup of the **next newly fired** Stand/Move or Pause occurrence. That is its *shown* event, and the Water clock restarts then. It never joins a popup already on screen, a Firm repeat or a post-snooze re-prompt. A line that rode on a popup's first show stays on that occurrence's re-prompt and Firm repeats, so they are identical (§5.7), and is logged as `shown` once. While it waits, a second due does nothing.
 - Quiet start drops a waiting Water (every clock restarts when quiet ends anyway).
 - Whenever Water is due and Stand/Move and Pause are both off, Water fires alone at once as a small silent popup with no buttons that hides itself after about 7 seconds.
 - Water never changes a popup's enforcement level and never adds a button.
