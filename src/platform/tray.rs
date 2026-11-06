@@ -1,7 +1,7 @@
 //! The tray-icon menu and icon states.
 //!
 //! So far the off switch with its tooltip and normal or greyed icon (SPEC §7, §8 item 1), the
-//! pending section (§8 item 3), the Today count (§8 item 4) and Quit. `tray-icon` runs on the app's own message loop.
+//! pending section (§8 item 3), the Today count (§8 item 4), Settings… and Quit. `tray-icon` runs on the app's own message loop.
 
 use std::error::Error;
 
@@ -24,6 +24,8 @@ pub enum Command {
     Switch,
     Snooze,
     Skip,
+    /// Settings… (SPEC §8 item 6).
+    Settings,
     Quit,
 }
 
@@ -42,6 +44,7 @@ pub struct Tray {
     skip: MenuItem,
     /// The disabled Today count line, e.g. "Today: 7 taken, 2 skipped".
     today: MenuItem,
+    settings: MenuId,
     /// How many items of the pending section are in the menu now, all at [`PENDING_AT`].
     shown: usize,
     quit: MenuId,
@@ -54,6 +57,7 @@ impl Tray {
 
         let switch = MenuItem::new("", true, None);
         let today = MenuItem::new("", false, None);
+        let settings = MenuItem::new("Settings…", true, None);
         let quit = MenuItem::new("Quit", true, None);
         let menu = Menu::new();
         menu.append_items(&[
@@ -61,6 +65,7 @@ impl Tray {
             &PredefinedMenuItem::separator(),
             &today,
             &PredefinedMenuItem::separator(),
+            &settings,
             &quit,
         ])?;
         // SAFETY: no pointers; plain metric queries.
@@ -84,6 +89,7 @@ impl Tray {
             snooze: MenuItem::new("Snooze 5 min", true, None),
             skip: MenuItem::new("Skip", true, None),
             today,
+            settings: settings.id().clone(),
             shown: 0,
             quit: quit.id().clone(),
         })
@@ -148,6 +154,8 @@ impl Tray {
                 return Some(Command::Snooze);
             } else if event.id == *self.skip.id() {
                 return Some(Command::Skip);
+            } else if event.id == self.settings {
+                return Some(Command::Settings);
             }
         }
         None

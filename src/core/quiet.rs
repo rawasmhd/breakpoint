@@ -168,6 +168,12 @@ impl Quiet {
         }
     }
 
+    /// Replaces the work days and hours, from a Settings Save. An Off or Overtime in force keeps
+    /// its end moment (SPEC §9.2). Call [`Quiet::sync`] next to apply the change at once.
+    pub fn set_week(&mut self, week: WorkWeek) {
+        self.week = week;
+    }
+
     /// The Off or Overtime in force at `now`; one whose end moment has come is not.
     pub fn switch(&self, now: LocalTime) -> Option<Switch> {
         self.switch.filter(|s| s.until().unix > now.unix)

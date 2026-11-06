@@ -5,4 +5,5 @@ pub mod log;
 pub mod presence;
 pub mod quiet;
 pub mod scheduler;
+pub mod settings;
 pub mod time;

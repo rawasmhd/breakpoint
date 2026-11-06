@@ -343,6 +343,58 @@ impl Scheduler {
         self.clock_mut(nudge).level = level;
     }
 
+    /// Applies new settings from a Save at `now` (SPEC §9.2). A nudge whose on/off, cadence or
+    /// length changed restarts its clock from zero, Water's included; its pending occurrence
+    /// stays pending, with the length and level it fired with, and expires at the new next due.
+    /// Turning Stand/Move or Pause off expires its pending occurrence (cause `settings`). A
+    /// level applies from the next occurrence. When that changes what the popup shows, it shows
+    /// the rest of the prompt, or closes.
+    pub fn set_nudges(&mut self, now: Duration, nudges: Nudges) -> Vec<Effect> {
+        self.advance(now);
+        let before = self.prompt();
+        let minute = self.minute;
+        let mut effects = Vec::new();
+        for clock in &mut self.clocks {
+            let settings = match clock.nudge {
+                Nudge::Stand => nudges.stand,
+                Nudge::Pause => nudges.pause,
+            };
+            let every = minute * settings.every_minutes;
+            let length = minute * settings.length_minutes;
+            if (clock.on, clock.every, clock.length) != (settings.on, every, length) {
+                clock.elapsed = Duration::ZERO;
+            }
+            clock.on = settings.on;
+            clock.every = every;
+            clock.length_minutes = settings.length_minutes;
+            clock.length = length;
+            clock.level = settings.enforcement;
+            if !clock.on
+                && let Some(occ) = clock.pending.take()
+            {
+                effects.push(Effect::Log(skipped(occ, SkipCause::Settings)));
+            }
+        }
+        let every = minute * nudges.water.every_minutes;
+        if (self.water.on, self.water.every) != (nudges.water.on, every) {
+            self.water.elapsed = Duration::ZERO;
+        }
+        self.water.on = nudges.water.on;
+        self.water.every = every;
+
+        let after = self.prompt();
+        if after != before {
+            match after {
+                Some(prompt) => {
+                    self.since_show = Duration::ZERO;
+                    effects.push(Effect::Show(prompt));
+                }
+                None => effects.push(Effect::Close),
+            }
+        }
+        effects
+    }
+
     /// Drops a due Water that is waiting for a popup, restarting its clock. Quiet start does
     /// this (SPEC §5.4).
     pub fn drop_water(&mut self) {
