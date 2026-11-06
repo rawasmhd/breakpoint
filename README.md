@@ -2,7 +2,7 @@
 
 **Breakpoints for humans.** A tiny Windows tray app that nudges you to stand and move, drink water and pause between focus periods. It notices when you actually step away, so a nudge you already obeyed goes away by itself. One small exe, no installer, no telemetry.
 
-**Status:** v1 is built. Every feature of the [v1 spec](docs/SPEC.md) works, from the first-run page to the event log. No release is published yet, so until the first one, build it from source (see [Contributing](#contributing)). The spec was settled on the [wayfinder map](https://github.com/rawasmhd/breakpoint/issues/23) and built through the [v1 build issues](https://github.com/rawasmhd/breakpoint/issues/37). The [research behind the defaults](docs/RESEARCH.md) and the [glossary](GLOSSARY.md) are current.
+**Status:** v1 is built. Every feature of the [v1 spec](docs/SPEC.md) works, from the first-run page to the event log. Download it from the [latest release](https://github.com/rawasmhd/breakpoint/releases/latest) (see [Install](#install)). The spec was settled on the [wayfinder map](https://github.com/rawasmhd/breakpoint/issues/23) and built through the [v1 build issues](https://github.com/rawasmhd/breakpoint/issues/37). The [research behind the defaults](docs/RESEARCH.md) and the [glossary](GLOSSARY.md) are current.
 
 ## Why
 
