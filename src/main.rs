@@ -14,6 +14,8 @@ use breakpoint::core::log::Today;
 use breakpoint::core::presence::{POLL_EVERY, Presence, Tracker};
 use breakpoint::core::quiet::Quiet;
 use breakpoint::core::scheduler::{Effect, Scheduler, away_left, countdown_text};
+use breakpoint::core::settings::{self, Form};
+use platform::dialogs::{WM_OPEN_SETTINGS, WM_SETTINGS_SAVED};
 use platform::log::Log;
 use platform::popup::{Popup, WM_POPUP_SKIP, WM_POPUP_SNOOZE};
 use platform::presence::{Listener, Vetoes};
@@ -24,11 +26,14 @@ use windows::Win32::Foundation::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, MSG,
-    RegisterClassW, SetTimer, TranslateMessage, WM_ENDSESSION, WM_TIMER, WNDCLASSW,
-    WS_EX_TOOLWINDOW, WS_POPUP,
+    ASFW_ANY, AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, DestroyWindow,
+    DispatchMessageW, FindWindowW, GetMessageW, MSG, PostMessageW, RegisterClassW, SetTimer,
+    TranslateMessage, WM_ENDSESSION, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::w;
+
+/// The main window's class, which a second launch looks for (SPEC §11).
+const MAIN_CLASS: windows::core::PCWSTR = w!("breakpoint.main");
 
 const POLL_TIMER: usize = 1;
 /// Refreshes the popup's away countdown while it is on screen.
@@ -39,7 +44,10 @@ const COUNTDOWN_EVERY: Duration = Duration::from_secs(1);
 struct App {
     /// The origin of the core's timeline.
     started: Instant,
-    /// The settings as read at start-up, kept to write back the Off or Overtime end moment.
+    /// The hidden main window, which a Settings Save is posted to.
+    window: HWND,
+    /// The one in-memory copy of the settings: read at start-up, changed by a Settings Save and
+    /// by the off switch, and written whole to `config.json` by either.
     config: Config,
     /// Where `config.json` lives; `None` if `%APPDATA%` is unknown, and then nothing is saved.
     config_path: Option<PathBuf>,
@@ -101,6 +109,53 @@ impl App {
             let _ = config::save(path, &self.config);
         }
         self.sync_quiet();
+    }
+
+    /// Settings…, or a second launch: opens the settings window filled from the config, or
+    /// brings it to the front (SPEC §9.2, §11).
+    fn open_settings(&mut self) {
+        platform::dialogs::open_settings(
+            self.window,
+            &Form::new(&self.config),
+            platform::startup::is_on(),
+        );
+    }
+
+    /// A valid Save closed the settings window: apply it at once (SPEC §9.2), write
+    /// `config.json` and the Run value. Returns what could not be written, to tell the user.
+    fn settings_saved(&mut self) -> Option<String> {
+        let saved = platform::dialogs::take_saved()?;
+        let wall = platform::clock::now();
+        let now = self.now();
+        let effects = settings::save(
+            &saved.settings,
+            &mut self.config,
+            &mut self.quiet,
+            &mut self.scheduler,
+            wall,
+            now,
+        );
+        self.apply(effects);
+        self.tray.set_switch(&self.quiet.item(wall));
+
+        let mut failed = Vec::new();
+        match &self.config_path {
+            Some(path) => {
+                if let Err(e) = config::save(path, &self.config) {
+                    failed.push(format!("couldn't write config.json ({e})"));
+                }
+            }
+            None => failed.push("couldn't find %APPDATA% to save config.json".into()),
+        }
+        if let Err(e) = platform::startup::set(saved.start_with_windows) {
+            failed.push(format!("couldn't change Start with Windows ({e})"));
+        }
+        (!failed.is_empty()).then(|| {
+            format!(
+                "The new settings apply until breakpoint quits, but breakpoint {}.",
+                failed.join(" and ")
+            )
+        })
     }
 
     fn snooze(&mut self) {
@@ -166,6 +221,7 @@ impl App {
             Some(Command::Switch) => self.press_switch(),
             Some(Command::Snooze) => self.snooze(),
             Some(Command::Skip) => self.skip(),
+            Some(Command::Settings) => self.open_settings(),
             Some(Command::Quit) => {
                 self.quit();
                 return false;
@@ -178,6 +234,7 @@ impl App {
 
 fn main() {
     if another_instance_running() {
+        open_settings_in_running_instance();
         return;
     }
     // With no console there is nowhere to report a start-up failure yet; exit quietly.
@@ -195,7 +252,22 @@ fn another_instance_running() -> bool {
     }
 }
 
+/// A second launch asks the running breakpoint to open its Settings, then exits (SPEC §11). It
+/// lets that instance take the foreground, which a background process may not do on its own.
+fn open_settings_in_running_instance() {
+    // SAFETY: no pointers beyond the static class name.
+    unsafe {
+        if let Ok(window) = FindWindowW(MAIN_CLASS, None) {
+            let _ = AllowSetForegroundWindow(ASFW_ANY);
+            let _ = PostMessageW(Some(window), WM_OPEN_SETTINGS, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
 fn run() -> Result<(), Box<dyn Error>> {
+    // Moving the exe must not break autostart: an existing Run value gets the current path.
+    platform::startup::refresh();
+
     // Read once here and never watched (SPEC §10.1). No file yet is first run; the wizard
     // comes with its own issue, so for now that runs on the defaults too.
     let config_path = config_path();
@@ -217,6 +289,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     APP.set(Some(App {
         started: Instant::now(),
+        window,
         quiet: Quiet::new(&config),
         scheduler,
         config,
@@ -251,9 +324,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut msg = MSG::default();
     // SAFETY: the standard message loop over a valid MSG.
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
-        unsafe {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        // The settings window takes its keys (Tab, Enter, Esc) before anything else.
+        if !platform::dialogs::is_dialog_message(&msg) {
+            unsafe {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
         }
         let mut running = true;
         with_app(|app| running = app.tray_command());
@@ -311,7 +387,7 @@ fn main_window() -> windows::core::Result<HWND> {
     // SAFETY: plain Win32 window creation.
     unsafe {
         let instance = GetModuleHandleW(None)?.into();
-        let class = w!("breakpoint.main");
+        let class = MAIN_CLASS;
         RegisterClassW(&WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: instance,
@@ -341,6 +417,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_TIMER if wparam.0 == COUNTDOWN_TIMER => with_app(App::tick_countdown),
         WM_POPUP_SNOOZE => with_app(App::snooze),
         WM_POPUP_SKIP => with_app(App::skip),
+        WM_OPEN_SETTINGS => with_app(App::open_settings),
+        WM_SETTINGS_SAVED => {
+            let mut failed = None;
+            with_app(|app| failed = app.settings_saved());
+            // Shown outside the app, so its modal loop does not hold up the polls.
+            if let Some(text) = failed {
+                platform::dialogs::error(&text);
+            }
+        }
         // Windows is ending the session and may end the process once this returns.
         WM_ENDSESSION if wparam.0 != 0 => with_app(App::quit),
         // SAFETY: forwarding the arguments this procedure was called with.
