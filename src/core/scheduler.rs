@@ -89,6 +89,15 @@ pub enum SatisfyCause {
     DisplayOff,
 }
 
+impl SatisfyCause {
+    pub const ALL: [SatisfyCause; 4] = [
+        SatisfyCause::Away,
+        SatisfyCause::Lock,
+        SatisfyCause::Suspend,
+        SatisfyCause::DisplayOff,
+    ];
+}
+
 /// Why an occurrence ended skipped: the `by` of a `skipped` log line (SPEC §10.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipCause {
@@ -98,8 +107,20 @@ pub enum SkipCause {
     Next,
     /// Expired: quiet time started (SPEC §7).
     Quiet,
-    /// Expired: breakpoint quit.
+    /// Expired: the user turned that nudge off in Settings.
+    Settings,
+    /// Expired: breakpoint quit (tray Quit, or Windows ending the session).
     Exit,
+}
+
+impl SkipCause {
+    pub const ALL: [SkipCause; 5] = [
+        SkipCause::User,
+        SkipCause::Next,
+        SkipCause::Quiet,
+        SkipCause::Settings,
+        SkipCause::Exit,
+    ];
 }
 
 /// Something that happened to an occurrence; each becomes one event-log line.
@@ -257,6 +278,12 @@ impl Scheduler {
             next_occ: 1,
             quiet: false,
         }
+    }
+
+    /// Continues the occurrence ids after `last`, the highest `occ` in the newest log file, so
+    /// they keep increasing across the whole log (SPEC §10.2). Call before anything fires.
+    pub fn continue_from(&mut self, last: u64) {
+        self.next_occ = last + 1;
     }
 
     /// Whether it is quiet time now, as last told by [`Scheduler::set_quiet`].

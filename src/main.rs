@@ -10,9 +10,11 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use breakpoint::core::config::{self, Config};
+use breakpoint::core::log::Today;
 use breakpoint::core::presence::{POLL_EVERY, Presence, Tracker};
 use breakpoint::core::quiet::Quiet;
 use breakpoint::core::scheduler::{Effect, Scheduler, away_left, countdown_text};
+use platform::log::Log;
 use platform::popup::{Popup, WM_POPUP_SKIP, WM_POPUP_SNOOZE};
 use platform::presence::{Listener, Vetoes};
 use platform::tray::{Command, Tray};
@@ -22,9 +24,9 @@ use windows::Win32::Foundation::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, HWND_MESSAGE,
-    MSG, RegisterClassW, SetTimer, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_TIMER,
-    WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, MSG,
+    RegisterClassW, SetTimer, TranslateMessage, WM_ENDSESSION, WM_TIMER, WNDCLASSW,
+    WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::w;
 
@@ -49,6 +51,8 @@ struct App {
     /// What the last poll said, which holds the popup's countdown under a veto.
     last_presence: Presence,
     tray: Tray,
+    log: Log,
+    today: Today,
 }
 
 thread_local! {
@@ -72,6 +76,9 @@ impl App {
         self.last_presence = presence;
         let effects = self.scheduler.poll(now, presence);
         self.apply(effects);
+        // Midnight starts the count again (SPEC §10.3).
+        self.tray
+            .set_today(&self.today.text(platform::clock::now()));
     }
 
     /// Applies the quiet rules as of the wall clock now (SPEC §7): an edge expires what is
@@ -106,6 +113,8 @@ impl App {
         self.apply(effects);
     }
 
+    /// breakpoint is quitting, from the tray or because Windows ends the session: the pending
+    /// occurrences expire (cause `exit`) and are logged before it goes (SPEC §11).
     fn quit(&mut self) {
         let effects = self.scheduler.quit(self.now());
         self.apply(effects);
@@ -115,16 +124,20 @@ impl App {
         if effects.is_empty() {
             return;
         }
+        let wall = platform::clock::now();
         for effect in effects {
             match effect {
-                // The event log comes with its own issue; nothing is written yet.
-                Effect::Log(_) => {}
+                Effect::Log(event) => {
+                    self.log.append(wall, &event);
+                    self.today.record(wall, &event);
+                }
                 Effect::Show(prompt) => self.popup.show(&prompt, &self.countdown(prompt.length)),
                 Effect::Close => self.popup.hide(),
                 Effect::ShowWater => self.popup.water(),
             }
         }
         self.tray.set_pending(self.scheduler.prompt().as_ref());
+        self.tray.set_today(&self.today.text(wall));
     }
 
     /// The countdown line for an occurrence of `length` as of now (SPEC §6).
@@ -191,7 +204,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         .and_then(|path| config::load(path, platform::clock::now()));
     let (config, notice) = loaded.map_or((Config::default(), false), |l| (l.config, l.notice));
 
-    let window = message_window()?;
+    // The occurrence ids go on from the log, and the Today count is rebuilt from it (SPEC §10).
+    let log = Log::new();
+    let (last_occ, today) = log.start(platform::clock::now());
+    let mut scheduler = Scheduler::new(config.nudges, minute());
+    scheduler.continue_from(last_occ);
+
+    let window = main_window()?;
     let popup = Popup::new(window)?;
     if notice {
         popup.notice();
@@ -199,7 +218,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     APP.set(Some(App {
         started: Instant::now(),
         quiet: Quiet::new(&config),
-        scheduler: Scheduler::new(config.nudges, minute()),
+        scheduler,
         config,
         config_path,
         popup,
@@ -207,6 +226,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         vetoes: Vetoes::default(),
         last_presence: Presence::Active,
         tray: Tray::new()?,
+        log,
+        today,
     }));
     // Session and power events take effect at once rather than at the next poll.
     let listener = Listener::new(|| with_app(App::poll))?;
@@ -284,8 +305,9 @@ fn with_app(f: impl FnOnce(&mut App)) {
     });
 }
 
-/// The hidden message-only window that owns the poll timer and receives the popup's buttons.
-fn message_window() -> windows::core::Result<HWND> {
+/// The hidden window that owns the poll timer and receives the popup's buttons. Top-level, never
+/// shown, rather than message-only: only top-level windows hear that Windows is ending the session.
+fn main_window() -> windows::core::Result<HWND> {
     // SAFETY: plain Win32 window creation.
     unsafe {
         let instance = GetModuleHandleW(None)?.into();
@@ -297,15 +319,15 @@ fn message_window() -> windows::core::Result<HWND> {
             ..Default::default()
         });
         CreateWindowExW(
-            WINDOW_EX_STYLE(0),
+            WS_EX_TOOLWINDOW,
             class,
             w!("breakpoint"),
-            WINDOW_STYLE(0),
+            WS_POPUP,
             0,
             0,
             0,
             0,
-            Some(HWND_MESSAGE),
+            None,
             None,
             Some(instance),
             None,
@@ -319,6 +341,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_TIMER if wparam.0 == COUNTDOWN_TIMER => with_app(App::tick_countdown),
         WM_POPUP_SNOOZE => with_app(App::snooze),
         WM_POPUP_SKIP => with_app(App::skip),
+        // Windows is ending the session and may end the process once this returns.
+        WM_ENDSESSION if wparam.0 != 0 => with_app(App::quit),
         // SAFETY: forwarding the arguments this procedure was called with.
         _ => return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }

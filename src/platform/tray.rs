@@ -1,7 +1,7 @@
 //! The tray-icon menu and icon states.
 //!
 //! So far the off switch with its tooltip and normal or greyed icon (SPEC §7, §8 item 1), the
-//! pending section (§8 item 3) and Quit. `tray-icon` runs on the app's own message loop.
+//! pending section (§8 item 3), the Today count (§8 item 4) and Quit. `tray-icon` runs on the app's own message loop.
 
 use std::error::Error;
 
@@ -15,7 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON, SM_
 const NORMAL_ICON: u16 = 1;
 const GREY_ICON: u16 = 2;
 
-/// Where the pending section goes: under the off switch and its separator.
+/// Where the pending section goes: under the off switch and its separator, above Today.
 const PENDING_AT: usize = 2;
 
 /// A menu item the user picked.
@@ -40,7 +40,8 @@ pub struct Tray {
     pending: MenuItem,
     snooze: MenuItem,
     skip: MenuItem,
-    separator: PredefinedMenuItem,
+    /// The disabled Today count line, e.g. "Today: 7 taken, 2 skipped".
+    today: MenuItem,
     /// How many items of the pending section are in the menu now, all at [`PENDING_AT`].
     shown: usize,
     quit: MenuId,
@@ -52,9 +53,16 @@ impl Tray {
         TrayIconEvent::set_event_handler(Some(|_| {}));
 
         let switch = MenuItem::new("", true, None);
+        let today = MenuItem::new("", false, None);
         let quit = MenuItem::new("Quit", true, None);
         let menu = Menu::new();
-        menu.append_items(&[&switch, &PredefinedMenuItem::separator(), &quit])?;
+        menu.append_items(&[
+            &switch,
+            &PredefinedMenuItem::separator(),
+            &today,
+            &PredefinedMenuItem::separator(),
+            &quit,
+        ])?;
         // SAFETY: no pointers; plain metric queries.
         let size = unsafe { (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON)) };
         let size = Some((size.0 as u32, size.1 as u32));
@@ -75,7 +83,7 @@ impl Tray {
             pending: MenuItem::new("", false, None),
             snooze: MenuItem::new("Snooze 5 min", true, None),
             skip: MenuItem::new("Skip", true, None),
-            separator: PredefinedMenuItem::separator(),
+            today,
             shown: 0,
             quit: quit.id().clone(),
         })
@@ -114,12 +122,19 @@ impl Tray {
         if prompt.snooze {
             items.push(&self.snooze);
         }
-        items.extend([&self.skip as &dyn IsMenuItem, &self.separator]);
+        items.push(&self.skip);
         self.shown = items
             .iter()
             .enumerate()
             .take_while(|&(i, item)| self.menu.insert(*item, PENDING_AT + i).is_ok())
             .count();
+    }
+
+    /// Shows the Today count line (SPEC §10.3). Only a change touches the menu.
+    pub fn set_today(&self, text: &str) {
+        if self.today.text() != text {
+            self.today.set_text(text);
+        }
     }
 
     /// The next menu item picked since the last call, if any. Call after each dispatched message.
