@@ -3,7 +3,8 @@
 //! A pure state machine: the platform feeds it the time (an offset on one monotonic timeline),
 //! presence polls and user actions, and carries out the [`Effect`]s it returns. So far Stand/Move
 //! and Pause with satisfaction, snooze and expiry, Soft and Firm enforcement, the combined nudge
-//! and Water riding along, with their cadences, lengths, levels and on/off from config.
+//! and Water riding along, with their cadences, lengths, levels and on/off from config. Whether
+//! it is quiet time comes from outside ([`super::quiet`]) through [`Scheduler::set_quiet`].
 
 use std::time::Duration;
 
@@ -95,6 +96,8 @@ pub enum SkipCause {
     User,
     /// Expired: the next occurrence of the same nudge fell due.
     Next,
+    /// Expired: quiet time started (SPEC §7).
+    Quiet,
     /// Expired: breakpoint quit.
     Exit,
 }
@@ -220,6 +223,8 @@ pub struct Scheduler {
     /// Active time since the popup was last shown, which times a Firm repeat.
     since_show: Duration,
     next_occ: u64,
+    /// Quiet time (SPEC §7): nothing fires and no clock runs.
+    quiet: bool,
 }
 
 impl Scheduler {
@@ -250,6 +255,37 @@ impl Scheduler {
             last: None,
             since_show: Duration::ZERO,
             next_occ: 1,
+            quiet: false,
+        }
+    }
+
+    /// Whether it is quiet time now, as last told by [`Scheduler::set_quiet`].
+    pub fn is_quiet(&self) -> bool {
+        self.quiet
+    }
+
+    /// Tells the scheduler whether `now` is quiet time (SPEC §7). Only a change does anything.
+    /// Starting quiet expires every pending occurrence (cause `quiet`) and drops a waiting Water;
+    /// while quiet no clock runs and nothing fires. Leaving quiet restarts every clock from zero,
+    /// Water's included: a fresh focus period.
+    pub fn set_quiet(&mut self, now: Duration, quiet: bool) -> Vec<Effect> {
+        if quiet == self.quiet {
+            return Vec::new();
+        }
+        if quiet {
+            let effects = self.end(now, SkipCause::Quiet);
+            self.drop_water();
+            self.quiet = true;
+            effects
+        } else {
+            self.advance(now);
+            self.quiet = false;
+            for clock in &mut self.clocks {
+                clock.elapsed = Duration::ZERO;
+            }
+            self.water.elapsed = Duration::ZERO;
+            self.since_show = Duration::ZERO;
+            Vec::new()
         }
     }
 
@@ -281,7 +317,7 @@ impl Scheduler {
     }
 
     /// Drops a due Water that is waiting for a popup, restarting its clock. Quiet start does
-    /// this (SPEC §5.4); the quiet rules come with their own issue.
+    /// this (SPEC §5.4).
     pub fn drop_water(&mut self) {
         if self.water.due() {
             self.water.elapsed = Duration::ZERO;
@@ -293,6 +329,9 @@ impl Scheduler {
     pub fn poll(&mut self, now: Duration, presence: Presence) -> Vec<Effect> {
         self.advance(now);
         self.last = Some((now, presence));
+        if self.quiet {
+            return Vec::new();
+        }
         let front = self.prompt().map(|p| p.nudge);
         let mut effects = Vec::new();
         let mut show = false;
@@ -488,10 +527,10 @@ impl Scheduler {
     }
 
     /// Adds the time since the last call to the clocks, Water's included, and snoozes if it
-    /// was active time.
+    /// was active time. Quiet time is never active time (SPEC §4).
     fn advance(&mut self, now: Duration) {
         if let Some((then, presence)) = self.last {
-            if presence.counts_as_active() {
+            if presence.counts_as_active() && !self.quiet {
                 let active = now.saturating_sub(then);
                 for clock in &mut self.clocks {
                     clock.elapsed += active;

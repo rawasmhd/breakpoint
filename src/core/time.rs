@@ -44,6 +44,19 @@ impl Weekday {
     pub fn from_key(key: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|day| day.key() == key)
     }
+
+    /// The day's name in English, as the tray tooltip shows it: `Sunday` to `Saturday`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Weekday::Sun => "Sunday",
+            Weekday::Mon => "Monday",
+            Weekday::Tue => "Tuesday",
+            Weekday::Wed => "Wednesday",
+            Weekday::Thu => "Thursday",
+            Weekday::Fri => "Friday",
+            Weekday::Sat => "Saturday",
+        }
+    }
 }
 
 /// A time of day in whole minutes, 00:00 to 23:59.
@@ -155,9 +168,25 @@ impl LocalTime {
     }
 
     pub fn weekday(self) -> Weekday {
-        let days = (self.unix + i64::from(self.offset_minutes) * 60).div_euclid(86_400);
         // 1970-01-01 was a Thursday.
-        Weekday::ALL[(days + 4).rem_euclid(7) as usize]
+        Weekday::ALL[(self.local_days() + 4).rem_euclid(7) as usize]
+    }
+
+    /// The moment `time` strikes on the local date `days` after this one's, read with this
+    /// moment's offset. A daylight-saving change in between is not known here, so the result can
+    /// be an hour off across one.
+    pub fn on_day_at(self, days: i64, time: TimeOfDay) -> Self {
+        let offset = i64::from(self.offset_minutes) * 60;
+        let local = (self.local_days() + days) * 86_400 + i64::from(time.minutes()) * 60;
+        Self {
+            unix: local - offset,
+            offset_minutes: self.offset_minutes,
+        }
+    }
+
+    /// Days since 1970-01-01 on the local clock.
+    fn local_days(self) -> i64 {
+        (self.unix + i64::from(self.offset_minutes) * 60).div_euclid(86_400)
     }
 
     pub fn time_of_day(self) -> TimeOfDay {

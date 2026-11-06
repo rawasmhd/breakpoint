@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use breakpoint::core::config::{self, Config};
 use breakpoint::core::presence::{POLL_EVERY, Presence, Tracker};
+use breakpoint::core::quiet::Quiet;
 use breakpoint::core::scheduler::{Effect, Scheduler, away_left, countdown_text};
 use platform::popup::{Popup, WM_POPUP_SKIP, WM_POPUP_SNOOZE};
 use platform::presence::{Listener, Vetoes};
@@ -36,6 +37,11 @@ const COUNTDOWN_EVERY: Duration = Duration::from_secs(1);
 struct App {
     /// The origin of the core's timeline.
     started: Instant,
+    /// The settings as read at start-up, kept to write back the Off or Overtime end moment.
+    config: Config,
+    /// Where `config.json` lives; `None` if `%APPDATA%` is unknown, and then nothing is saved.
+    config_path: Option<PathBuf>,
+    quiet: Quiet,
     scheduler: Scheduler,
     popup: Popup,
     presence: Tracker,
@@ -55,6 +61,7 @@ impl App {
     }
 
     fn poll(&mut self) {
+        self.sync_quiet();
         let now = self.now();
         let last_input = platform::presence::last_input(now);
         for (at, signal) in platform::presence::take_signals() {
@@ -65,6 +72,28 @@ impl App {
         self.last_presence = presence;
         let effects = self.scheduler.poll(now, presence);
         self.apply(effects);
+    }
+
+    /// Applies the quiet rules as of the wall clock now (SPEC §7): an edge expires what is
+    /// pending or restarts the clocks. Then the tray's off switch, tooltip and icon follow.
+    fn sync_quiet(&mut self) {
+        let wall = platform::clock::now();
+        let now = self.now();
+        let effects = self.quiet.sync(wall, &mut self.scheduler, now);
+        self.apply(effects);
+        self.tray.set_switch(&self.quiet.item(wall));
+    }
+
+    /// The user pressed the off switch: start or end Off or Overtime, save its end moment in
+    /// `config.json` so a restart keeps it, and apply the quiet rules at once.
+    fn press_switch(&mut self) {
+        self.quiet.press(platform::clock::now());
+        self.quiet.store(&mut self.config);
+        if let Some(path) = &self.config_path {
+            // Best effort: if the write fails the switch still holds until breakpoint quits.
+            let _ = config::save(path, &self.config);
+        }
+        self.sync_quiet();
     }
 
     fn snooze(&mut self) {
@@ -121,6 +150,7 @@ impl App {
     /// Acts on the tray item picked, if any; false once the user chose Quit.
     fn tray_command(&mut self) -> bool {
         match self.tray.next_command() {
+            Some(Command::Switch) => self.press_switch(),
             Some(Command::Snooze) => self.snooze(),
             Some(Command::Skip) => self.skip(),
             Some(Command::Quit) => {
@@ -155,7 +185,10 @@ fn another_instance_running() -> bool {
 fn run() -> Result<(), Box<dyn Error>> {
     // Read once here and never watched (SPEC §10.1). No file yet is first run; the wizard
     // comes with its own issue, so for now that runs on the defaults too.
-    let loaded = config_path().and_then(|path| config::load(&path, platform::clock::now()));
+    let config_path = config_path();
+    let loaded = config_path
+        .as_deref()
+        .and_then(|path| config::load(path, platform::clock::now()));
     let (config, notice) = loaded.map_or((Config::default(), false), |l| (l.config, l.notice));
 
     let window = message_window()?;
@@ -165,7 +198,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     APP.set(Some(App {
         started: Instant::now(),
+        quiet: Quiet::new(&config),
         scheduler: Scheduler::new(config.nudges, minute()),
+        config,
+        config_path,
         popup,
         presence: Tracker::new(),
         vetoes: Vetoes::default(),
