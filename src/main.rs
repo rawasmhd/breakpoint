@@ -15,7 +15,10 @@ use breakpoint::core::presence::{POLL_EVERY, Presence, Tracker};
 use breakpoint::core::quiet::Quiet;
 use breakpoint::core::scheduler::{Effect, Scheduler, away_left, countdown_text};
 use breakpoint::core::settings::{self, Form};
-use platform::dialogs::{WM_OPEN_SETTINGS, WM_SETTINGS_SAVED};
+use breakpoint::core::wizard::Picks;
+use platform::dialogs::{
+    Saved, WM_OPEN_SETTINGS, WM_SETTINGS_CANCELLED, WM_SETTINGS_SAVED, WM_WIZARD_DONE, WizardDone,
+};
 use platform::log::Log;
 use platform::popup::{Popup, WM_POPUP_SKIP, WM_POPUP_SNOOZE};
 use platform::presence::{Listener, Vetoes};
@@ -51,6 +54,9 @@ struct App {
     config: Config,
     /// Where `config.json` lives; `None` if `%APPDATA%` is unknown, and then nothing is saved.
     config_path: Option<PathBuf>,
+    /// First run (SPEC §9.1): the wizard's picks while the wizard, or the settings window its
+    /// Change… opened, is still up. Until then nothing nudges and nothing is saved.
+    first_run: Option<Picks>,
     quiet: Quiet,
     scheduler: Scheduler,
     popup: Popup,
@@ -82,8 +88,11 @@ impl App {
         }
         let presence = self.presence.poll(now, last_input, &mut self.vetoes);
         self.last_presence = presence;
-        let effects = self.scheduler.poll(now, presence);
-        self.apply(effects);
+        // During first run no clock runs: the first poll after it starts them from zero.
+        if self.first_run.is_none() {
+            let effects = self.scheduler.poll(now, presence);
+            self.apply(effects);
+        }
         // Midnight starts the count again (SPEC §10.3).
         self.tray
             .set_today(&self.today.text(platform::clock::now()));
@@ -112,19 +121,63 @@ impl App {
     }
 
     /// Settings…, or a second launch: opens the settings window filled from the config, or
-    /// brings it to the front (SPEC §9.2, §11).
+    /// brings it to the front (SPEC §9.2, §11). During first run it brings the wizard (or the
+    /// settings window its Change… opened) to the front instead.
     fn open_settings(&mut self) {
+        if self.first_run.is_some() {
+            platform::dialogs::to_front();
+            return;
+        }
         platform::dialogs::open_settings(
             self.window,
             &Form::new(&self.config),
             platform::startup::is_on(),
+            None,
         );
     }
 
-    /// A valid Save closed the settings window: apply it at once (SPEC §9.2), write
-    /// `config.json` and the Run value. Returns what could not be written, to tell the user.
+    /// The wizard closed (SPEC §9.1). Start, X and Esc accept its picks; Change… opens the
+    /// settings window in its place, with the picks and defaults for the rest.
+    fn wizard_done(&mut self) -> Option<String> {
+        match platform::dialogs::take_wizard()? {
+            WizardDone::Start(picks) => self.finish_first_run(picks),
+            WizardDone::Change(picks, at) => {
+                self.first_run = Some(picks);
+                platform::dialogs::open_settings(
+                    self.window,
+                    &picks.form(),
+                    picks.start_with_windows,
+                    Some(at),
+                );
+                None
+            }
+        }
+    }
+
+    /// The settings window closed without a Save. After the wizard's Change… that finishes
+    /// first run as closing the wizard would: its picks are written, the edits discarded.
+    fn settings_cancelled(&mut self) -> Option<String> {
+        let picks = self.first_run?;
+        self.finish_first_run(picks)
+    }
+
+    /// Accepts the wizard's picks: written and applied as a Save of them would be.
+    fn finish_first_run(&mut self, picks: Picks) -> Option<String> {
+        self.apply_saved(Saved {
+            settings: picks.settings(),
+            start_with_windows: picks.start_with_windows,
+        })
+    }
+
+    /// A valid Save closed the settings window. During first run that Save finishes it.
     fn settings_saved(&mut self) -> Option<String> {
         let saved = platform::dialogs::take_saved()?;
+        self.apply_saved(saved)
+    }
+
+    /// Applies settings at once (SPEC §9.2), writes `config.json` and the Run value, and ends
+    /// first run, so nudging starts. Returns what could not be written, to tell the user.
+    fn apply_saved(&mut self, saved: Saved) -> Option<String> {
         let wall = platform::clock::now();
         let now = self.now();
         let effects = settings::save(
@@ -149,6 +202,9 @@ impl App {
         }
         if let Err(e) = platform::startup::set(saved.start_with_windows) {
             failed.push(format!("couldn't change Start with Windows ({e})"));
+        }
+        if self.first_run.take().is_some() {
+            self.poll();
         }
         (!failed.is_empty()).then(|| {
             format!(
@@ -218,6 +274,8 @@ impl App {
     /// Acts on the tray item picked, if any; false once the user chose Quit.
     fn tray_command(&mut self) -> bool {
         match self.tray.next_command() {
+            // During first run the switch would save a config: it shows the wizard instead.
+            Some(Command::Switch) if self.first_run.is_some() => self.open_settings(),
             Some(Command::Switch) => self.press_switch(),
             Some(Command::Snooze) => self.snooze(),
             Some(Command::Skip) => self.skip(),
@@ -268,13 +326,18 @@ fn run() -> Result<(), Box<dyn Error>> {
     // Moving the exe must not break autostart: an existing Run value gets the current path.
     platform::startup::refresh();
 
-    // Read once here and never watched (SPEC §10.1). No file yet is first run; the wizard
-    // comes with its own issue, so for now that runs on the defaults too.
+    // Read once here and never watched (SPEC §10.1). No file yet is first run, which shows the
+    // wizard and runs on its preselected picks until it closes (SPEC §9.1). An unreadable file
+    // is not first run: it runs on the defaults with the notice.
     let config_path = config_path();
     let loaded = config_path
         .as_deref()
         .and_then(|path| config::load(path, platform::clock::now()));
-    let (config, notice) = loaded.map_or((Config::default(), false), |l| (l.config, l.notice));
+    let first_run = (config_path.is_some() && loaded.is_none()).then(Picks::default);
+    let (config, notice) = match loaded {
+        Some(loaded) => (loaded.config, loaded.notice),
+        None => (first_run.unwrap_or_default().config(), false),
+    };
 
     // The occurrence ids go on from the log, and the Today count is rebuilt from it (SPEC §10).
     let log = Log::new();
@@ -294,6 +357,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         scheduler,
         config,
         config_path,
+        first_run,
         popup,
         presence: Tracker::new(),
         vetoes: Vetoes::default(),
@@ -305,6 +369,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     // Session and power events take effect at once rather than at the next poll.
     let listener = Listener::new(|| with_app(App::poll))?;
     with_app(App::poll);
+    if let Some(picks) = first_run {
+        platform::dialogs::open_wizard(window, picks);
+    }
     // SAFETY: `window` is the live message-only window.
     unsafe {
         SetTimer(
@@ -324,7 +391,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut msg = MSG::default();
     // SAFETY: the standard message loop over a valid MSG.
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
-        // The settings window takes its keys (Tab, Enter, Esc) before anything else.
+        // The wizard and the settings window take their keys (Tab, Enter, Esc) first.
         if !platform::dialogs::is_dialog_message(&msg) {
             unsafe {
                 let _ = TranslateMessage(&msg);
@@ -368,6 +435,16 @@ fn minute() -> Duration {
         return minute;
     }
     Duration::from_secs(60)
+}
+
+/// Runs `f`, then shows what it says could not be written. The message box is shown outside
+/// the app, so its modal loop does not hold up the polls.
+fn report(f: impl FnOnce(&mut App) -> Option<String>) {
+    let mut failed = None;
+    with_app(|app| failed = f(app));
+    if let Some(text) = failed {
+        platform::dialogs::error(&text);
+    }
 }
 
 fn with_app(f: impl FnOnce(&mut App)) {
@@ -418,14 +495,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_POPUP_SNOOZE => with_app(App::snooze),
         WM_POPUP_SKIP => with_app(App::skip),
         WM_OPEN_SETTINGS => with_app(App::open_settings),
-        WM_SETTINGS_SAVED => {
-            let mut failed = None;
-            with_app(|app| failed = app.settings_saved());
-            // Shown outside the app, so its modal loop does not hold up the polls.
-            if let Some(text) = failed {
-                platform::dialogs::error(&text);
-            }
-        }
+        WM_SETTINGS_SAVED => report(App::settings_saved),
+        WM_SETTINGS_CANCELLED => report(App::settings_cancelled),
+        WM_WIZARD_DONE => report(App::wizard_done),
         // Windows is ending the session and may end the process once this returns.
         WM_ENDSESSION if wparam.0 != 0 => with_app(App::quit),
         // SAFETY: forwarding the arguments this procedure was called with.

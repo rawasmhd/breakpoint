@@ -1,33 +1,41 @@
 //! The first-run wizard and settings window DIALOGEX procedures.
 //!
-//! So far the settings window (SPEC §9.2): a modeless dialog from the `IDD_SETTINGS` template
-//! that `build.rs` embeds, at most one at a time, run by the app's own message loop through
-//! [`is_dialog_message`] so nudges keep firing while it is open. The dialog copies its controls
-//! into a [`Form`] and back; the core decides the profile shown, what picking one fills in and
-//! whether a Save is valid. A valid Save closes the window and posts [`WM_SETTINGS_SAVED`] to the
-//! owner, which collects it with [`take_saved`] and applies it from its own window procedure.
+//! Both are modeless dialogs from templates that `build.rs` embeds, at most one of each at a
+//! time, run by the app's own message loop through [`is_dialog_message`].
+//!
+//! The settings window (SPEC §9.2) lets nudges keep firing while it is open. It copies its
+//! controls into a [`Form`] and back; the core decides the profile shown, what picking one fills
+//! in and whether a Save is valid. A valid Save closes the window and posts [`WM_SETTINGS_SAVED`]
+//! to the owner, which collects it with [`take_saved`] and applies it from its own window
+//! procedure. Cancel, Esc or X posts [`WM_SETTINGS_CANCELLED`] instead.
+//!
+//! The first-run wizard (SPEC §9.1) shows the lines the core writes and reads back the
+//! [`Picks`]. However it closes, it posts [`WM_WIZARD_DONE`], and the owner collects how with
+//! [`take_wizard`].
 
 use std::cell::{Cell, RefCell};
 
 use breakpoint::core::config::{Enforcement, Profile};
 use breakpoint::core::settings::{AwayRow, Field, Form, Settings};
 use breakpoint::core::time::{TimeOfDay, Weekday};
-use windows::Win32::Foundation::{HWND, LPARAM, SYSTEMTIME, WPARAM};
+use breakpoint::core::wizard::{self, Picks};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, SYSTEMTIME, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::Controls::{
-    BST_CHECKED, BST_UNCHECKED, CheckDlgButton, DTM_GETSYSTEMTIME, DTM_SETFORMATW,
-    DTM_SETSYSTEMTIME, EM_SETLIMITTEXT, GDT_VALID, ICC_DATE_CLASSES, ICC_STANDARD_CLASSES,
-    ICC_UPDOWN_CLASS, INITCOMMONCONTROLSEX, InitCommonControlsEx, IsDlgButtonChecked,
-    UDM_SETRANGE32,
+    BST_CHECKED, BST_UNCHECKED, CheckDlgButton, CheckRadioButton, DTM_GETSYSTEMTIME,
+    DTM_SETFORMATW, DTM_SETSYSTEMTIME, EM_SETLIMITTEXT, GDT_VALID, ICC_DATE_CLASSES,
+    ICC_STANDARD_CLASSES, ICC_UPDOWN_CLASS, INITCOMMONCONTROLSEX, InitCommonControlsEx,
+    IsDlgButtonChecked, UDM_SETRANGE32,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CB_ADDSTRING, CB_DELETESTRING, CB_GETCOUNT, CB_GETCURSEL, CB_SETCURSEL, CBN_SELCHANGE,
-    CreateDialogParamW, DestroyWindow, EN_CHANGE, GetDlgItem, GetDlgItemTextW, GetSystemMetrics,
-    ICON_BIG, ICON_SMALL, IDCANCEL, IDOK, IMAGE_ICON, IsDialogMessageW, IsIconic, LR_DEFAULTCOLOR,
-    LoadImageW, MB_ICONWARNING, MB_OK, MSG, MessageBoxW, PostMessageW, SM_CXICON, SM_CXSMICON,
-    SM_CYICON, SM_CYSMICON, SW_RESTORE, SW_SHOW, SendDlgItemMessageW, SendMessageW,
-    SetDlgItemTextW, SetForegroundWindow, ShowWindow, WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY,
+    CreateDialogParamW, DM_REPOSITION, DestroyWindow, EN_CHANGE, GetDlgItem, GetDlgItemTextW,
+    GetSystemMetrics, GetWindowRect, ICON_BIG, ICON_SMALL, IDCANCEL, IDOK, IMAGE_ICON,
+    IsDialogMessageW, IsIconic, LR_DEFAULTCOLOR, LoadImageW, MB_ICONWARNING, MB_OK, MSG,
+    MessageBoxW, PostMessageW, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, SW_RESTORE, SW_SHOW,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SendDlgItemMessageW, SendMessageW, SetDlgItemTextW,
+    SetForegroundWindow, SetWindowPos, ShowWindow, WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY,
     WM_INITDIALOG, WM_NEXTDLGCTL, WM_SETICON,
 };
 use windows::core::{HSTRING, PCWSTR, w};
@@ -41,6 +49,19 @@ use ids::*;
 pub const WM_OPEN_SETTINGS: u32 = WM_APP + 3;
 /// Posted to the owner when a valid Save closed the settings window; see [`take_saved`].
 pub const WM_SETTINGS_SAVED: u32 = WM_APP + 4;
+/// Posted to the owner when the settings window closed without a Save: Cancel, Esc or X.
+pub const WM_SETTINGS_CANCELLED: u32 = WM_APP + 5;
+/// Posted to the owner when the wizard closed; see [`take_wizard`].
+pub const WM_WIZARD_DONE: u32 = WM_APP + 6;
+
+/// How the wizard closed.
+pub enum WizardDone {
+    /// Start, X or Esc: accept the picks.
+    Start(Picks),
+    /// Change…: open the settings window with the picks, its top-left at this screen point,
+    /// where the wizard's was.
+    Change(Picks, POINT),
+}
 
 /// What a valid Save hands the app.
 pub struct Saved {
@@ -62,6 +83,9 @@ thread_local! {
     /// The dialog itself is writing its controls: their change notifications are not edits.
     static FILLING: Cell<bool> = const { Cell::new(false) };
     static SAVED: RefCell<Option<Saved>> = const { RefCell::new(None) };
+    /// The wizard while it is open.
+    static WIZARD: Cell<Option<HWND>> = const { Cell::new(None) };
+    static WIZARD_DONE: RefCell<Option<WizardDone>> = const { RefCell::new(None) };
 }
 
 /// The profile drop-down's items in order; Custom is added only while nothing matches.
@@ -103,8 +127,9 @@ struct Row {
 }
 
 /// Opens the settings window filled with `form`, or brings it to the front if it is open
-/// (SPEC §9.2). `owner` receives [`WM_SETTINGS_SAVED`].
-pub fn open_settings(owner: HWND, form: &Form, start_with_windows: bool) {
+/// (SPEC §9.2). `owner` receives [`WM_SETTINGS_SAVED`] or [`WM_SETTINGS_CANCELLED`]. With `at`,
+/// the window's top-left goes there, kept on screen; otherwise it is centred.
+pub fn open_settings(owner: HWND, form: &Form, start_with_windows: bool, at: Option<POINT>) {
     if let Some(dialog) = OPEN.get() {
         bring_to_front(dialog);
         return;
@@ -134,17 +159,81 @@ pub fn open_settings(owner: HWND, form: &Form, start_with_windows: bool) {
             return;
         };
         OPEN.set(Some(dialog));
+        if let Some(at) = at {
+            let _ = SetWindowPos(
+                dialog,
+                None,
+                at.x,
+                at.y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            SendMessageW(dialog, DM_REPOSITION, None, None);
+        }
         let _ = ShowWindow(dialog, SW_SHOW);
         let _ = SetForegroundWindow(dialog);
+    }
+}
+
+/// Opens the first-run wizard with `picks` preselected (SPEC §9.1). `owner` receives
+/// [`WM_WIZARD_DONE`] when it closes.
+pub fn open_wizard(owner: HWND, picks: Picks) {
+    if let Some(dialog) = WIZARD.get() {
+        bring_to_front(dialog);
+        return;
+    }
+    OWNER.set(Some(owner));
+    // SAFETY: the template is embedded by build.rs; `picks` outlives the call, during which
+    // WM_INITDIALOG reads it. No parent, so the window has its own taskbar button.
+    unsafe {
+        let _ = InitCommonControlsEx(&INITCOMMONCONTROLSEX {
+            dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
+            dwICC: ICC_STANDARD_CLASSES,
+        });
+        let Ok(instance) = GetModuleHandleW(None) else {
+            return;
+        };
+        let Ok(dialog) = CreateDialogParamW(
+            Some(instance.into()),
+            resource(IDD_WIZARD),
+            None,
+            Some(wizard_proc),
+            LPARAM(&picks as *const Picks as isize),
+        ) else {
+            return;
+        };
+        WIZARD.set(Some(dialog));
+        let _ = ShowWindow(dialog, SW_SHOW);
+        let _ = SetForegroundWindow(dialog);
+    }
+}
+
+/// How the wizard closed, once, after [`WM_WIZARD_DONE`].
+pub fn take_wizard() -> Option<WizardDone> {
+    WIZARD_DONE.take()
+}
+
+/// Brings the wizard, or else the settings window, to the front: a second launch during first
+/// run (SPEC §11). False if neither is open.
+pub fn to_front() -> bool {
+    match WIZARD.get().or(OPEN.get()) {
+        Some(dialog) => {
+            bring_to_front(dialog);
+            true
+        }
+        None => false,
     }
 }
 
 /// Lets an open dialog handle `msg` (Tab, Enter, Esc, arrows); true if it did, and then the
 /// message must not be translated or dispatched again.
 pub fn is_dialog_message(msg: &MSG) -> bool {
-    // SAFETY: `dialog` is the live settings window; `msg` is a valid MSG.
-    OPEN.get()
-        .is_some_and(|dialog| unsafe { IsDialogMessageW(dialog, msg) }.as_bool())
+    // SAFETY: `dialog` is a live dialog; `msg` is a valid MSG.
+    [WIZARD.get(), OPEN.get()]
+        .into_iter()
+        .flatten()
+        .any(|dialog| unsafe { IsDialogMessageW(dialog, msg) }.as_bool())
 }
 
 /// The Save that [`WM_SETTINGS_SAVED`] announced, once.
@@ -166,7 +255,7 @@ pub fn error(text: &str) {
 }
 
 fn bring_to_front(dialog: HWND) {
-    // SAFETY: `dialog` is the live settings window.
+    // SAFETY: `dialog` is a live dialog.
     unsafe {
         if IsIconic(dialog).as_bool() {
             let _ = ShowWindow(dialog, SW_RESTORE);
@@ -199,7 +288,7 @@ unsafe extern "system" fn settings_proc(
             let edited = OPEN.get() == Some(dialog) && !FILLING.get();
             match (id, code) {
                 (id, _) if id == IDOK.0 => save(dialog),
-                (id, _) if id == IDCANCEL.0 => close(dialog),
+                (id, _) if id == IDCANCEL.0 => cancel(dialog),
                 (IDC_PROFILE, CBN_SELCHANGE) if edited => pick_profile(dialog),
                 (_, EN_CHANGE | CBN_SELCHANGE) if edited => show_profile(dialog),
                 _ => return 0,
@@ -208,7 +297,7 @@ unsafe extern "system" fn settings_proc(
         }
         // X discards without asking, as Cancel does.
         WM_CLOSE => {
-            close(dialog);
+            cancel(dialog);
             1
         }
         WM_DESTROY => {
@@ -219,8 +308,117 @@ unsafe extern "system" fn settings_proc(
     }
 }
 
-fn init_controls(dialog: HWND) {
-    // SAFETY: `dialog` is the window being initialised; every string is static.
+unsafe extern "system" fn wizard_proc(
+    dialog: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> isize {
+    match msg {
+        WM_INITDIALOG => {
+            // SAFETY: `open_wizard` passes a pointer to `Picks` that outlive this call.
+            let picks = unsafe { *(lparam.0 as *const Picks) };
+            set_icons(dialog);
+            for (id, profile) in (IDC_WIZARD_PROFILE..).zip(Profile::ALL) {
+                set_text(dialog, id, &wizard::profile_line(profile));
+            }
+            let picked = profile_radio(picks.profile);
+            // SAFETY: the ids name the three radio buttons of `dialog`.
+            let _ = unsafe {
+                CheckRadioButton(dialog, IDC_WIZARD_PROFILE, IDC_WIZARD_PROFILE + 2, picked)
+            };
+            check(
+                dialog,
+                IDC_WIZARD_START_WITH_WINDOWS,
+                picks.start_with_windows,
+            );
+            set_text(
+                dialog,
+                IDC_WIZARD_WEEK,
+                &wizard::work_week_line(&picks.config()),
+            );
+            set_text(dialog, IDC_WIZARD_CHANGE, "Change\u{2026}");
+            // Focus on the picked profile, where the arrow keys change it. Set here rather than
+            // left to the dialog, which would focus the first radio button and so pick it.
+            // SAFETY: `dialog` is the window being initialised.
+            unsafe {
+                if let Ok(control) = GetDlgItem(Some(dialog), picked) {
+                    SendMessageW(
+                        dialog,
+                        WM_NEXTDLGCTL,
+                        Some(WPARAM(control.0 as usize)),
+                        Some(LPARAM(1)),
+                    );
+                }
+            }
+            0
+        }
+        WM_COMMAND => {
+            let id = (wparam.0 & 0xffff) as i32;
+            match id {
+                // Start, and Esc, which is closing: both accept what the page shows.
+                id if id == IDOK.0 || id == IDCANCEL.0 => wizard_done(dialog, false),
+                IDC_WIZARD_CHANGE => wizard_done(dialog, true),
+                _ => return 0,
+            }
+            1
+        }
+        // X is the same as Start.
+        WM_CLOSE => {
+            wizard_done(dialog, false);
+            1
+        }
+        WM_DESTROY => {
+            WIZARD.set(None);
+            0
+        }
+        _ => 0,
+    }
+}
+
+/// The radio button of `profile`.
+fn profile_radio(profile: Profile) -> i32 {
+    let index = Profile::ALL.iter().position(|&p| p == profile).unwrap_or(0);
+    IDC_WIZARD_PROFILE + index as i32
+}
+
+/// The wizard closes, by Start, X, Esc or Change…: hand the picks over and go.
+fn wizard_done(dialog: HWND, change: bool) {
+    let picks = Picks {
+        profile: Profile::ALL
+            .into_iter()
+            .find(|&p| checked(dialog, profile_radio(p)))
+            .unwrap_or(Picks::default().profile),
+        start_with_windows: checked(dialog, IDC_WIZARD_START_WITH_WINDOWS),
+    };
+    let done = if change {
+        let mut rect = RECT::default();
+        // SAFETY: `dialog` is the live wizard; `rect` is a valid out pointer.
+        let _ = unsafe { GetWindowRect(dialog, &mut rect) };
+        let at = POINT {
+            x: rect.left,
+            y: rect.top,
+        };
+        WizardDone::Change(picks, at)
+    } else {
+        WizardDone::Start(picks)
+    };
+    WIZARD_DONE.set(Some(done));
+    post(WM_WIZARD_DONE);
+    close(dialog);
+}
+
+/// Posts `msg` to the owner.
+fn post(msg: u32) {
+    if let Some(owner) = OWNER.get() {
+        // SAFETY: `owner` is the app's main window, alive as long as the app.
+        let _ = unsafe { PostMessageW(Some(owner), msg, WPARAM(0), LPARAM(0)) };
+    }
+}
+
+/// The app icon in the caption and on the taskbar.
+fn set_icons(dialog: HWND) {
+    // SAFETY: `dialog` is the window being initialised.
     unsafe {
         let instance = GetModuleHandleW(None).ok().map(Into::into);
         for (size, which) in [
@@ -243,16 +441,21 @@ fn init_controls(dialog: HWND) {
                 );
             }
         }
-        for id in [IDC_FROM, IDC_TO] {
-            send(dialog, id, DTM_SETFORMATW, 0, w!("HH:mm").as_ptr() as isize);
-        }
-        for (_, name) in PROFILES {
-            send(dialog, IDC_PROFILE, CB_ADDSTRING, 0, name.as_ptr() as isize);
-        }
-        for level in [STAND.level, PAUSE.level] {
-            for name in [w!("Soft"), w!("Firm")] {
-                send(dialog, level, CB_ADDSTRING, 0, name.as_ptr() as isize);
-            }
+    }
+}
+
+fn init_controls(dialog: HWND) {
+    set_icons(dialog);
+    // Every string sent is static.
+    for id in [IDC_FROM, IDC_TO] {
+        send(dialog, id, DTM_SETFORMATW, 0, w!("HH:mm").as_ptr() as isize);
+    }
+    for (_, name) in PROFILES {
+        send(dialog, IDC_PROFILE, CB_ADDSTRING, 0, name.as_ptr() as isize);
+    }
+    for level in [STAND.level, PAUSE.level] {
+        for name in [w!("Soft"), w!("Firm")] {
+            send(dialog, level, CB_ADDSTRING, 0, name.as_ptr() as isize);
         }
     }
     use breakpoint::core::config::{
@@ -395,11 +598,7 @@ fn save(dialog: HWND) {
                 settings,
                 start_with_windows: checked(dialog, IDC_START_WITH_WINDOWS),
             }));
-            if let Some(owner) = OWNER.get() {
-                // SAFETY: `owner` is the app's main window, alive as long as the app.
-                let _ =
-                    unsafe { PostMessageW(Some(owner), WM_SETTINGS_SAVED, WPARAM(0), LPARAM(0)) };
-            }
+            post(WM_SETTINGS_SAVED);
             close(dialog);
         }
     }
@@ -418,8 +617,14 @@ fn control_of(field: Field) -> i32 {
     }
 }
 
+/// Cancel, Esc or X: discard the edits, and tell the owner, for whom it may end first run.
+fn cancel(dialog: HWND) {
+    post(WM_SETTINGS_CANCELLED);
+    close(dialog);
+}
+
 fn close(dialog: HWND) {
-    // SAFETY: `dialog` is the live settings window; WM_DESTROY forgets it.
+    // SAFETY: `dialog` is a live dialog; WM_DESTROY forgets it.
     let _ = unsafe { DestroyWindow(dialog) };
 }
 

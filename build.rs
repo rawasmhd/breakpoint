@@ -20,7 +20,48 @@ fn main() {
     // The SDK headers give the template its style names.
     res.add_toolkit_include(true);
     res.append_rc_content(&settings_dialog());
+    res.append_rc_content(&wizard_dialog());
     res.compile().expect("failed to embed Windows resources");
+}
+
+/// The first-run wizard (SPEC §9.1): as wide as the settings window, which Change… opens at the
+/// same position. The profile lines, the work-week line and "Change…" are set at run time: the
+/// core writes the lines, and the resource compiler would mangle the ellipsis.
+fn wizard_dialog() -> String {
+    use ids::*;
+    let radios = (0..3)
+        .map(|i| {
+            // Only the first radio button starts the group and is a tab stop.
+            let first = if i == 0 {
+                " | WS_GROUP | WS_TABSTOP"
+            } else {
+                ""
+            };
+            format!(
+                "    AUTORADIOBUTTON \"\", {}, 14, {}, 272, 18, BS_MULTILINE | BS_TOP{first}
+",
+                IDC_WIZARD_PROFILE + i,
+                20 + 20 * i
+            )
+        })
+        .collect::<String>();
+    format!(
+        r#"
+{IDD_WIZARD} DIALOGEX 0, 0, 300, 163
+STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+EXSTYLE WS_EX_APPWINDOW
+CAPTION "breakpoint"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    GROUPBOX "Profile", -1, 7, 7, 286, 76
+{radios}    AUTOCHECKBOX "Start with Windows", {IDC_WIZARD_START_WITH_WINDOWS}, 14, 92, 120, 10, WS_GROUP | WS_TABSTOP
+    LTEXT "", {IDC_WIZARD_WEEK}, 14, 112, 214, 8
+    PUSHBUTTON "", {IDC_WIZARD_CHANGE}, 236, 109, 50, 14, WS_GROUP | WS_TABSTOP
+    LTEXT "breakpoint lives in the tray, under ^ if you don't see it.", -1, 14, 129, 272, 8
+    DEFPUSHBUTTON "Start", IDOK, 243, 142, 50, 14, WS_GROUP | WS_TABSTOP
+END
+"#
+    )
 }
 
 /// The settings window (SPEC §9.2): one fixed-size page, in dialog units. Tab order is the

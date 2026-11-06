@@ -2,7 +2,7 @@
 
 **Breakpoints for humans.** A tiny Windows tray app that nudges you to stand and move, drink water and pause between focus periods. It notices when you actually step away, so a nudge you already obeyed goes away by itself. One small exe, no installer, no telemetry.
 
-**Status:** spec locked, nothing to run yet. The [v1 spec](docs/SPEC.md) was settled on the [wayfinder map](https://github.com/rawasmhd/breakpoint/issues/23); build issues come next. The [research behind the defaults](docs/RESEARCH.md) and the [glossary](GLOSSARY.md) are current.
+**Status:** v1 is built. Every feature of the [v1 spec](docs/SPEC.md) works, from the first-run page to the event log. No release is published yet, so until the first one, build it from source (see [Contributing](#contributing)). The spec was settled on the [wayfinder map](https://github.com/rawasmhd/breakpoint/issues/23) and built through the [v1 build issues](https://github.com/rawasmhd/breakpoint/issues/37). The [research behind the defaults](docs/RESEARCH.md) and the [glossary](GLOSSARY.md) are current.
 
 ## Why
 
@@ -44,12 +44,16 @@ Settings live in `%APPDATA%\breakpoint\config.json` and a local event log in `%A
 
 ## Contributing
 
-Build issues will be created from the [spec](docs/SPEC.md). You need stable Rust and the MSVC build tools (Visual Studio Build Tools, "Desktop development with C++").
+The v1 build issues, made from the [spec](docs/SPEC.md), are all done; they are the sub-issues of the [v1 build issue](https://github.com/rawasmhd/breakpoint/issues/37). For a bug or an idea, open a new issue. Ideas beyond v1 are collected in [SPEC.md, Later](docs/SPEC.md#17-later).
+
+You need stable Rust and the MSVC build tools (Visual Studio Build Tools, "Desktop development with C++"). The exe is `target\release\breakpoint.exe`.
 
 ```
 cargo build --release
 cargo test
 ```
+
+The platform-free logic lives in `src/core/` and must never use the `windows` crate (CI checks this); the Win32 side lives in `src/platform/`. CI also runs `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`.
 
 ## License
 

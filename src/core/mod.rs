@@ -7,3 +7,4 @@ pub mod quiet;
 pub mod scheduler;
 pub mod settings;
 pub mod time;
+pub mod wizard;
