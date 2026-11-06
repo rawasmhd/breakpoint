@@ -1,9 +1,11 @@
-// The settings window's resource and control ids, in one place for both sides: `build.rs`
-// includes this file to write the DIALOGEX template, and `dialogs.rs` includes it to find the
-// controls. Plain constants only, so the file compiles in either crate.
+// The settings window's and the first-run wizard's resource and control ids, in one place for
+// both sides: `build.rs` includes this file to write the DIALOGEX templates, and `dialogs.rs`
+// includes it to find the controls. Plain constants only, so the file compiles in either crate.
 
-/// The DIALOGEX template.
+/// The settings window's DIALOGEX template.
 pub const IDD_SETTINGS: u16 = 101;
+/// The first-run wizard's DIALOGEX template.
+pub const IDD_WIZARD: u16 = 102;
 
 /// The seven work-day checkboxes, Sunday first: `IDC_DAY` to `IDC_DAY + 6`.
 pub const IDC_DAY: i32 = 1000;
@@ -30,3 +32,13 @@ pub const IDC_WATER_EVERY: i32 = 1051;
 pub const IDC_WATER_EVERY_SPIN: i32 = 1052;
 
 pub const IDC_START_WITH_WINDOWS: i32 = 1060;
+
+// The wizard's controls.
+
+/// The three profile radio buttons in `Profile::ALL` order: `IDC_WIZARD_PROFILE` to
+/// `IDC_WIZARD_PROFILE + 2`.
+pub const IDC_WIZARD_PROFILE: i32 = 1100;
+pub const IDC_WIZARD_START_WITH_WINDOWS: i32 = 1110;
+/// The read-only work-week line.
+pub const IDC_WIZARD_WEEK: i32 = 1111;
+pub const IDC_WIZARD_CHANGE: i32 = 1112;
