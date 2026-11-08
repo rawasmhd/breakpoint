@@ -22,6 +22,11 @@ pub const FIRM_REPEAT_MINUTES: u32 = 5;
 /// Pause falls due, the other fires with it if it is due within this. Fixed, not a setting.
 pub const COMBINE_MINUTES: u32 = 2;
 
+/// The shortest `Away` that restarts a clock with nothing pending, in minutes (SPEC §5.2).
+/// Reading or waiting without touching the mouse looks like being away, so a short gap is no
+/// sign of a break; a pending occurrence is still satisfied after its own length (§5.5).
+pub const RESET_AWAY_MINUTES: u32 = 5;
+
 /// The line a due Water adds to the next newly fired popup (SPEC §3, §5.4).
 pub const WATER_LINE: &str = "Drink some water.";
 
@@ -417,6 +422,7 @@ impl Scheduler {
 
         if let Presence::Away { since, reason } = presence {
             let away = now.saturating_sub(since);
+            let reset_floor = self.minute * RESET_AWAY_MINUTES;
             for clock in &mut self.clocks {
                 // Satisfaction (SPEC §5.5): a lock at once, otherwise away for the length the
                 // occurrence fired with, in one stretch from the last input.
@@ -441,9 +447,10 @@ impl Scheduler {
                         clock.elapsed = Duration::ZERO;
                     }
                 }
-                // Presence resets (SPEC §5.2): away for the length, or a lock for Stand/Move.
+                // Presence resets (SPEC §5.2): away for the length and at least 5 minutes, or a
+                // lock for Stand/Move.
                 let lock_resets = clock.nudge == Nudge::Stand && reason.is_lock();
-                if away >= clock.length || lock_resets {
+                if away >= clock.length.max(reset_floor) || lock_resets {
                     clock.elapsed = Duration::ZERO;
                 }
             }

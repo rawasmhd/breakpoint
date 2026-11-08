@@ -96,8 +96,9 @@ Decided in [How a nudge is satisfied](https://github.com/rawasmhd/breakpoint/iss
 
 ### 5.2 Presence resets clocks
 
-- Any `Away` lasting at least the **stand length**, or any lock, restarts the Stand/Move clock from zero, even with nothing pending.
-- Any `Away` lasting at least the **pause length** restarts the Pause clock: the focus period starts again from zero when the user comes back (lunch, a meeting).
+- Any `Away` lasting at least **5 minutes** (and at least the stand length), or any lock, restarts the Stand/Move clock from zero, even with nothing pending.
+- Any `Away` lasting at least the **pause length** (and at least 5 minutes) restarts the Pause clock: the focus period starts again from zero when the user comes back (lunch, a meeting).
+- The 5-minute floor is hard-coded. Reading or waiting without touching the mouse looks like `Away`, so a gap of 2 minutes is no sign of a break. Without the floor, a Stand/Move of 45 minutes almost never fired in real use (found in v0.1.0). A *pending* occurrence is still satisfied after its own length (§5.5).
 - A **satisfied** occurrence restarts its own nudge's clock, so a Pause satisfied by a short lock still starts a fresh focus period when the user comes back. (Clocks do not run while the user is away, so "at the return" and "at satisfaction" are the same moment.)
 - A Pause the user returns from early stays pending (§5.5); its clock is not restarted.
 - The Water clock is never reset by presence.

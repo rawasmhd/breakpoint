@@ -193,6 +193,20 @@ fn show(nudge: Nudge) -> Effect {
     Effect::Show(prompt(nudge, true))
 }
 
+/// The show of a Pause whose length is `minutes` instead of the default 5.
+fn show_long(nudge: Nudge, minutes: u32) -> Effect {
+    Effect::Show(long_prompt(nudge, minutes, true))
+}
+
+fn long_prompt(nudge: Nudge, minutes: u32, snooze: bool) -> Prompt {
+    assert_eq!(nudge, Nudge::Pause);
+    Prompt {
+        line: format!("Step away from the screen for {minutes} minutes."),
+        length: minutes * MIN,
+        ..prompt(nudge, snooze)
+    }
+}
+
 /// The show of a newly fired `nudge` with the Water line riding on it.
 fn show_with_water(nudge: Nudge) -> Effect {
     Effect::Show(Prompt {
@@ -400,13 +414,25 @@ fn away_shorter_than_the_stand_length_pauses_the_clock_without_restarting_it() {
 }
 
 #[test]
-fn away_for_the_stand_length_restarts_the_stand_clock_with_nothing_pending() {
+fn away_for_5_minutes_restarts_the_stand_clock_with_nothing_pending() {
     let mut sim = Sim::new();
     sim.work(20 * MIN);
-    sim.leave(2 * MIN);
+    sim.leave(5 * MIN);
     let back = sim.come_back();
     sim.work(30 * MIN);
     assert_eq!(sim.fired_at(Nudge::Stand), [back + 30 * MIN]);
+}
+
+#[test]
+fn a_short_input_gap_does_not_restart_a_clock_with_nothing_pending() {
+    // Reading for 4 minutes without touching the mouse is no break (SPEC §5.2): the 20 active
+    // minutes stay, plus the 90 s of silence before Away was declared.
+    let mut sim = Sim::new();
+    sim.work(20 * MIN);
+    sim.leave(4 * MIN);
+    let back = sim.come_back();
+    sim.work(30 * MIN);
+    assert_eq!(sim.fired_at(Nudge::Stand), [back + 8 * MIN + 30 * SEC]);
 }
 
 #[test]
@@ -828,19 +854,27 @@ fn a_nudge_due_more_than_2_active_minutes_later_waits_for_its_own_time() {
 
 #[test]
 fn a_drifted_pending_stand_joins_a_newly_fired_pause() {
-    let mut sim = Sim::with(no_water(), MIN);
+    let mut nudges = no_water();
+    nudges.pause.length_minutes = 10;
+    let mut sim = Sim::with(nudges, MIN);
     sim.work(20 * MIN);
-    // 3 min away restart the Stand/Move clock but not the Pause's: they drift apart.
-    sim.leave(3 * MIN);
+    // 6 min away restart the Stand/Move clock but not the 10-minute Pause's: they drift apart.
+    sim.leave(6 * MIN);
     sim.come_back();
     sim.work(30 * MIN);
     assert_eq!(sim.take(), [fired(Nudge::Stand, 1), show(Nudge::Stand)]);
 
     sim.work(10 * MIN);
     // The Pause takes the pending Stand/Move in, with no log line for it.
-    assert_eq!(sim.take(), [fired(Nudge::Pause, 2), show(Nudge::Pause)]);
+    assert_eq!(
+        sim.take(),
+        [fired(Nudge::Pause, 2), show_long(Nudge::Pause, 10)]
+    );
     assert_eq!(sim.pending_occ(Nudge::Stand), Some(1));
-    assert_eq!(sim.sched.prompt(), Some(prompt(Nudge::Pause, true)));
+    assert_eq!(
+        sim.sched.prompt(),
+        Some(long_prompt(Nudge::Pause, 10, true))
+    );
 }
 
 #[test]
@@ -1281,10 +1315,11 @@ fn a_combined_nudge_of_two_soft_parts_is_soft() {
 fn a_soft_pause_that_takes_in_a_firm_stand_is_firm() {
     let mut nudges = soft();
     nudges.stand.enforcement = Enforcement::Firm;
+    nudges.pause.length_minutes = 10;
     let mut sim = Sim::with(nudges, MIN);
     sim.work(20 * MIN);
-    // 3 min away restart the Stand/Move clock but not the Pause's: they drift apart.
-    sim.leave(3 * MIN);
+    // 6 min away restart the Stand/Move clock but not the 10-minute Pause's: they drift apart.
+    sim.leave(6 * MIN);
     sim.come_back();
     sim.work(30 * MIN);
     assert_eq!(sim.take(), [fired(Nudge::Stand, 1), show(Nudge::Stand)]);
@@ -1293,9 +1328,12 @@ fn a_soft_pause_that_takes_in_a_firm_stand_is_firm() {
 
     // The Pause fires 8.5 minutes after the Stand/Move and takes it in: still Firm.
     sim.work(5 * MIN);
-    assert_eq!(sim.take(), [fired(Nudge::Pause, 2), show(Nudge::Pause)]);
+    assert_eq!(
+        sim.take(),
+        [fired(Nudge::Pause, 2), show_long(Nudge::Pause, 10)]
+    );
     sim.work(5 * MIN);
-    assert_eq!(sim.take(), [show(Nudge::Pause)]);
+    assert_eq!(sim.take(), [show_long(Nudge::Pause, 10)]);
 }
 
 #[test]

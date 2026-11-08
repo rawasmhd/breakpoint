@@ -1,6 +1,6 @@
 [package]
 name = "breakpoint"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Breakpoints for humans: nudges to stand, drink water and pause"
 license = "MIT"
