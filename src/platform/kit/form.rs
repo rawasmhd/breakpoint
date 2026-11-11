@@ -1120,8 +1120,12 @@ pub fn parse_number(text: &str) -> Option<i32> {
 }
 
 /// A typed time as minutes after midnight: `8`, `08`, `830`, `0830`, `8:30` and `08:30` all
-/// work. `None` for anything that is not a time of day.
+/// work. `None` for anything that is not a time of day, such as text that is not ASCII: a
+/// screen reader can hand over any string, and the byte slices below need ASCII.
 pub fn parse_time(text: &str) -> Option<i32> {
+    if !text.is_ascii() {
+        return None;
+    }
     let num = |s: &str| {
         (!s.is_empty() && s.len() <= 2)
             .then(|| parse_number(s))
@@ -1492,6 +1496,26 @@ impl Scroll {
             (0, self.content())
         };
         r.bottom > top && r.top < bottom && r.bottom > r.top
+    }
+
+    /// The part of `laid` (form pixels) that shows, on the client area: cut at the top of the
+    /// client and at the footer band, as [`Scroll::shown`] sees it. `None` when none shows.
+    /// Screen readers take control bounds from it (#80).
+    pub fn visible(&self, laid: RECT) -> Option<RECT> {
+        if !self.shown(laid) {
+            return None;
+        }
+        let r = self.on_client(laid);
+        let (top, bottom) = if laid.top >= self.footer {
+            (self.content(), self.view)
+        } else {
+            (0, self.content())
+        };
+        Some(RECT {
+            top: r.top.max(top),
+            bottom: r.bottom.min(bottom),
+            ..r
+        })
     }
 
     /// Moves the content to `offset`, held in range. True when it moved.
@@ -2132,6 +2156,20 @@ mod tests {
         assert_eq!(f.key(Key::Up), [Event::Changed(EVERY, Value::Number(41))]);
     }
 
+    /// A screen reader can hand over any string; none may panic, as a byte slice through a
+    /// character would.
+    #[test]
+    fn any_text_parses_or_is_refused_without_a_panic() {
+        let long = "1".repeat(10_000);
+        for text in [
+            "é1", "1€", "ab€", "€", "1é3", "é:30", "8:€", "١٢", "", " ", ":", "::", "8:", ":30",
+            "12a", "-5", "+5", "1 2", "08:30:00", &long,
+        ] {
+            assert_eq!(parse_time(text), None, "{text:?} as a time");
+            assert_eq!(parse_number(text), None, "{text:?} as a number");
+        }
+    }
+
     #[test]
     fn typed_times_take_several_forms_and_bad_ones_revert() {
         for (typed, want) in [
@@ -2677,6 +2715,35 @@ ee"
         assert!(s.scroll_to(-5));
         assert_eq!(s.offset(), 0);
         assert_eq!(s.in_form(24, 519), (24, 519));
+    }
+
+    #[test]
+    fn the_visible_part_is_cut_at_the_client_top_and_at_the_band() {
+        let mut s = tall();
+        let save = rect(400, 936, 88, 32);
+        assert_eq!(
+            s.visible(rect(24, 100, 80, 32)),
+            Some(rect(24, 100, 80, 32))
+        );
+        assert_eq!(
+            s.visible(rect(24, 500, 80, 32)),
+            Some(rect(24, 500, 80, 20)),
+            "into the band"
+        );
+        assert_eq!(s.visible(rect(24, 700, 80, 32)), None, "under the band");
+        assert_eq!(s.visible(save), Some(rect(400, 536, 88, 32)));
+        s.scroll_to(110);
+        assert_eq!(
+            s.visible(rect(24, 100, 80, 32)),
+            Some(rect(24, 0, 80, 22)),
+            "past the top"
+        );
+        assert_eq!(s.visible(rect(24, 60, 80, 32)), None);
+        assert_eq!(
+            s.visible(save),
+            Some(rect(400, 536, 88, 32)),
+            "the band stays"
+        );
     }
 
     #[test]

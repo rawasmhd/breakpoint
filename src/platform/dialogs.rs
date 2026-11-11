@@ -198,7 +198,7 @@ fn card_note(profile: Profile) -> String {
 }
 
 /// The whole wizard as kit items, filled with `picks`, top to bottom in reading order.
-fn items(picks: &Picks) -> Vec<Item> {
+pub(super) fn items(picks: &Picks) -> Vec<Item> {
     let mut out = Vec::new();
     let mut add = |id, at, kind| out.push(Item::new(id, at, kind));
     let config = picks.config();

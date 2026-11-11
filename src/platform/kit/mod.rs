@@ -20,6 +20,7 @@ pub mod draw;
 pub mod form;
 #[cfg(test)]
 pub(crate) mod shots;
+pub mod uia;
 pub mod window;
 
 use std::fmt;

@@ -60,6 +60,7 @@ dependencies = [
  "serde_json",
  "tray-icon",
  "windows",
+ "windows-core",
  "winresource",
 ]
 
