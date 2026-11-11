@@ -10,12 +10,13 @@ use windows::Win32::Foundation::RECT;
 use windows::Win32::UI::WindowsAndMessaging::USER_DEFAULT_SCREEN_DPI as BASE_DPI;
 
 use super::{ButtonKind, Entry, Event, Id, Item, Kind, Value};
-use crate::platform::paint::{HOVER, PRESSED, REST, step_fill};
+use crate::platform::paint::{Box2, HOVER, PRESSED, REST, step_fill};
 use crate::platform::theme::{
     CHECKBOX, CHEVRON, CHEVRON_RIGHT, CHOICE_PAD_X, CHOICE_PAD_Y, HAIRLINE, KNOB_SLIDE, MENU_CHECK,
     MENU_ITEM_PAD_X, MENU_ITEM_PAD_Y, MENU_PAD, PAGE_STEPS, PILL_H, PILL_W, PRIMARY_MIN_WIDTH,
-    RADIO, SEGMENT_GAP, SEGMENT_H, SEGMENT_MIN_W, SEGMENT_PAD, SIZE_BUTTON, SIZE_FIELD, SIZE_GLYPH,
-    SPACE_2, SPACE_3, SPACE_4, STEPPER_VALUE, STEPPER_ZONE, SWITCH_H, SWITCH_W, Style, px,
+    RADIO, SCROLLBAR_HOT_W, SCROLLBAR_INSET, SCROLLBAR_MIN, SCROLLBAR_W, SEGMENT_GAP, SEGMENT_H,
+    SEGMENT_MIN_W, SEGMENT_PAD, SIZE_BUTTON, SIZE_FIELD, SIZE_GLYPH, SPACE_2, SPACE_3, SPACE_4,
+    STEPPER_VALUE, STEPPER_ZONE, SWITCH_H, SWITCH_W, Style, px,
 };
 
 /// Minutes in a day: time steppers wrap round it.
@@ -303,7 +304,25 @@ impl Form {
         }
     }
 
-    /// The item and part under (`x`, `y`) in client pixels. Later items win.
+    /// The top of the footer band in pixels: the last [`Kind::Band`]. It and the items under
+    /// its top stay in view while the rest of a form taller than its window scrolls. `None`
+    /// when the form has no band.
+    pub fn footer(&self) -> Option<i32> {
+        self.items
+            .iter()
+            .zip(&self.laid)
+            .rev()
+            .find(|(item, _)| matches!(item.kind, Kind::Band))
+            .map(|(_, laid)| laid.rect.top)
+    }
+
+    /// The focused item's laid-out rectangle.
+    pub fn focus_rect(&self) -> Option<RECT> {
+        self.focus.map(|i| self.laid[i].rect)
+    }
+
+    /// The item and part under (`x`, `y`) in form pixels (see [`Scroll::in_form`]). Later
+    /// items win.
     pub fn hit(&self, x: i32, y: i32) -> Option<(usize, Part)> {
         self.laid.iter().enumerate().rev().find_map(|(i, laid)| {
             if !self.items[i].kind.focusable() {
@@ -1048,7 +1067,7 @@ fn on_slide(kind: &Kind) -> f32 {
     }
 }
 
-fn inside(r: &RECT, x: i32, y: i32) -> bool {
+pub fn inside(r: &RECT, x: i32, y: i32) -> bool {
     x >= r.left && x < r.right && y >= r.top && y < r.bottom
 }
 
@@ -1366,6 +1385,250 @@ pub fn menu_place(field: RECT, w: i32, h: i32, gap: i32, edge: i32, work: RECT) 
     };
     let left = start.min(work.right - w).max(work.left);
     rect(left, top, w, h)
+}
+
+// ---- Scrolling (issue #84) ----
+
+/// How a form taller than its window scrolls. The form is laid out in full, in form pixels;
+/// the window shows it in client pixels. When the form fits, the two are the same. When it
+/// does not, the window is `view` tall: the content above the footer band moves up by
+/// `offset` under the caption, and the footer band stays at the bottom of the window, moved
+/// up by the whole [`Scroll::range`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Scroll {
+    /// The form's full height and the top of its footer band (`full` when it has none).
+    full: i32,
+    footer: i32,
+    /// The client height.
+    view: i32,
+    /// How far the content has moved up, from 0 to [`Scroll::range`].
+    offset: i32,
+    /// Wheel movement that is not a whole pixel yet, in 1/120 pixels.
+    rest: i32,
+}
+
+impl Scroll {
+    /// A form `full` tall with its footer band at `footer`, in a window whose client may be at
+    /// most `room` tall. The window takes the full height when it fits. Otherwise it takes
+    /// `room`, but never less than the footer band.
+    pub fn new(full: i32, footer: Option<i32>, room: i32) -> Scroll {
+        let full = full.max(0);
+        let footer = footer.unwrap_or(full).clamp(0, full);
+        Scroll {
+            full,
+            footer,
+            view: full.min(room).max(full - footer),
+            offset: 0,
+            rest: 0,
+        }
+    }
+
+    /// The client height: the form's full height, or less when it does not fit.
+    pub fn view(&self) -> i32 {
+        self.view
+    }
+
+    /// The form's full height.
+    pub fn full(&self) -> i32 {
+        self.full
+    }
+
+    /// How far the content has moved up.
+    pub fn offset(&self) -> i32 {
+        self.offset
+    }
+
+    /// The largest offset: how much of the form does not fit. 0 when it fits.
+    pub fn range(&self) -> i32 {
+        self.full - self.view
+    }
+
+    pub fn scrolls(&self) -> bool {
+        self.range() > 0
+    }
+
+    /// The client height of the part that scrolls: from the top to the footer band.
+    pub fn content(&self) -> i32 {
+        self.view - (self.full - self.footer)
+    }
+
+    /// How far a rectangle whose top is `top` in form pixels moves up on the client.
+    fn lift(&self, top: i32) -> i32 {
+        if top >= self.footer {
+            self.range()
+        } else {
+            self.offset
+        }
+    }
+
+    /// Where `laid`, a rectangle in form pixels such as an item's [`Laid::rect`], is on the
+    /// client area now. Part of it may be outside the client area or under the footer band.
+    pub fn on_client(&self, laid: RECT) -> RECT {
+        let lift = self.lift(laid.top);
+        RECT {
+            top: laid.top - lift,
+            bottom: laid.bottom - lift,
+            ..laid
+        }
+    }
+
+    /// The form pixel at client pixel (`x`, `y`): in the footer band at the bottom, or in the
+    /// content that has scrolled.
+    pub fn in_form(&self, x: i32, y: i32) -> (i32, i32) {
+        if y >= self.content() {
+            (x, y + self.range())
+        } else {
+            (x, y + self.offset)
+        }
+    }
+
+    /// Whether any of `laid` (form pixels) shows: in the footer band, or in the part of the
+    /// content that is scrolled into view.
+    pub fn shown(&self, laid: RECT) -> bool {
+        let r = self.on_client(laid);
+        let (top, bottom) = if laid.top >= self.footer {
+            (self.content(), self.view)
+        } else {
+            (0, self.content())
+        };
+        r.bottom > top && r.top < bottom && r.bottom > r.top
+    }
+
+    /// Moves the content to `offset`, held in range. True when it moved.
+    pub fn scroll_to(&mut self, offset: i32) -> bool {
+        let next = offset.clamp(0, self.range());
+        let moved = next != self.offset;
+        self.offset = next;
+        moved
+    }
+
+    pub fn scroll_by(&mut self, dy: i32) -> bool {
+        self.scroll_to(self.offset + dy)
+    }
+
+    /// Scrolls as little as needed to show `laid` (form pixels) with `room` above and below,
+    /// as when keyboard focus moves to it. A rectangle taller than the content's part of the
+    /// window shows its top. Nothing moves for a rectangle in the footer band.
+    pub fn reveal(&mut self, laid: RECT, room: i32) -> bool {
+        if laid.top >= self.footer {
+            return false;
+        }
+        let (top, bottom) = (laid.top - room, laid.bottom + room);
+        let shown = self.content();
+        let to = if top < self.offset || bottom - top > shown {
+            top
+        } else if bottom > self.offset + shown {
+            bottom - shown
+        } else {
+            self.offset
+        };
+        self.scroll_to(to)
+    }
+
+    /// A wheel turn of `delta` (`WHEEL_DELTA`, 120, a notch; more than 0 away from the user,
+    /// which scrolls up), at `lines` lines a notch of `line` pixels each, or a page a notch when
+    /// `lines` is `WHEEL_PAGESCROLL`. Touchpads send parts of a notch; the parts add up.
+    pub fn wheel(&mut self, delta: i32, lines: u32, line: i32) -> bool {
+        const NOTCH: i32 = 120;
+        let notch = if lines == u32::MAX {
+            self.content()
+        } else {
+            lines.min(100) as i32 * line
+        };
+        self.rest -= delta * notch;
+        let step = self.rest / NOTCH;
+        self.rest -= step * NOTCH;
+        let moved = step != 0 && self.scroll_by(step);
+        if !moved && step != 0 {
+            // At an end: what is left of the turn would only delay the way back.
+            self.rest = 0;
+        }
+        moved
+    }
+
+    /// Where the thumb can run, as (top, length) in client pixels at `dpi`: the content's part
+    /// of the window, `scrollbar-inset` in from its ends.
+    fn track(&self, dpi: u32) -> (i32, i32) {
+        let inset = px(SCROLLBAR_INSET, dpi);
+        (inset, (self.content() - 2 * inset).max(0))
+    }
+
+    /// The thumb as (top, length) in client pixels: as long against its track as the content
+    /// shown is against all of it, never shorter than `scrollbar-min`.
+    fn thumb_span(&self, dpi: u32) -> (i32, i32) {
+        let (top, len) = self.track(dpi);
+        let shown = self.content().max(0);
+        let long = if self.footer > 0 {
+            (len * shown / self.footer)
+                .max(px(SCROLLBAR_MIN, dpi))
+                .min(len)
+        } else {
+            len
+        };
+        let free = len - long;
+        let at = if self.range() > 0 {
+            free * self.offset / self.range()
+        } else {
+            0
+        };
+        (top + at, long)
+    }
+
+    /// The scrollbar's thumb on a client `w` wide at `dpi`, `hot` from 0 (at rest,
+    /// `scrollbar-w` wide) to 1 (under the pointer, `scrollbar-hot-w`). `None` when nothing
+    /// scrolls.
+    pub fn thumb(&self, w: i32, dpi: u32, hot: f32) -> Option<Box2> {
+        if !self.scrolls() {
+            return None;
+        }
+        let (rest, wide) = (px(SCROLLBAR_W, dpi) as f32, px(SCROLLBAR_HOT_W, dpi) as f32);
+        let thick = rest + (wide - rest) * hot.clamp(0.0, 1.0);
+        let (top, long) = self.thumb_span(dpi);
+        Some(Box2 {
+            x: (w - px(SCROLLBAR_INSET, dpi)) as f32 - thick,
+            y: top as f32,
+            w: thick,
+            h: long as f32,
+        })
+    }
+
+    /// The strip at the right of the content's part of a client `w` wide that answers the
+    /// pointer: the hot thumb's width and its inset each side. `None` when nothing scrolls.
+    pub fn bar(&self, w: i32, dpi: u32) -> Option<RECT> {
+        let wide = px(SCROLLBAR_HOT_W, dpi) + 2 * px(SCROLLBAR_INSET, dpi);
+        self.scrolls()
+            .then(|| rect(w - wide, 0, wide, self.content()))
+    }
+
+    /// Whether client `y` is on the thumb, across its track.
+    pub fn on_thumb(&self, y: i32, dpi: u32) -> bool {
+        let (top, long) = self.thumb_span(dpi);
+        y >= top && y < top + long
+    }
+
+    /// Drags the thumb: the offset when the drag began at `from`, the pointer since moved by
+    /// `dy` client pixels.
+    pub fn drag(&mut self, from: i32, dy: i32, dpi: u32) -> bool {
+        let (_, len) = self.track(dpi);
+        let free = len - self.thumb_span(dpi).1;
+        if free <= 0 {
+            return false;
+        }
+        let moved = (i64::from(dy) * i64::from(self.range()) / i64::from(free)) as i32;
+        self.scroll_to(from + moved)
+    }
+
+    /// A click on the track off the thumb at client `y`: a page toward it.
+    pub fn page_toward(&mut self, y: i32, dpi: u32) -> bool {
+        let (top, long) = self.thumb_span(dpi);
+        if y < top {
+            self.scroll_by(-self.content())
+        } else if y >= top + long {
+            self.scroll_by(self.content())
+        } else {
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2362,5 +2625,181 @@ ee"
         assert!(f.set_text(LABEL, "Work week"));
         assert!(!f.set_text(SWITCH, "x"));
         assert_eq!(f.value(LABEL), None);
+    }
+
+    // ---- Scrolling ----
+
+    /// A form 1000 tall with its footer band at 920, in a window of at most 600: the content's
+    /// part of the window is 520 tall and 400 of the form does not fit.
+    fn tall() -> Scroll {
+        Scroll::new(1000, Some(920), 600)
+    }
+
+    #[test]
+    fn a_form_that_fits_does_not_scroll() {
+        let mut s = Scroll::new(500, Some(440), 800);
+        assert_eq!((s.view(), s.range(), s.content()), (500, 0, 440));
+        assert!(!s.scrolls());
+        let item = rect(10, 300, 80, 32);
+        let save = rect(10, 456, 80, 32);
+        assert_eq!(s.on_client(item), item);
+        assert_eq!(s.on_client(save), save);
+        assert_eq!(s.in_form(10, 470), (10, 470));
+        assert!(!s.scroll_by(50));
+        assert!(!s.wheel(-120, 3, 20));
+        assert!(!s.reveal(item, 16));
+        assert_eq!(s.thumb(600, 96, 0.0), None);
+        assert_eq!(s.bar(600, 96), None);
+        // Exactly the room it needs: still no scroll.
+        assert!(!Scroll::new(500, Some(440), 500).scrolls());
+    }
+
+    #[test]
+    fn a_form_too_tall_scrolls_its_content_under_a_footer_that_stays() {
+        let mut s = tall();
+        assert_eq!((s.view(), s.range(), s.content()), (600, 400, 520));
+        let item = rect(24, 100, 80, 32);
+        let save = rect(400, 936, 88, 32);
+        // At the top the footer band sits at the bottom of the window.
+        assert_eq!(s.on_client(item), item);
+        assert_eq!(s.on_client(save), rect(400, 536, 88, 32));
+        assert!(s.shown(item) && s.shown(save));
+        assert!(!s.shown(rect(24, 700, 80, 32)), "under the band");
+        // Scrolled to the end, the content moves up and the band stays.
+        assert!(s.scroll_to(10_000));
+        assert_eq!(s.offset(), 400);
+        assert_eq!(s.on_client(item), rect(24, -300, 80, 32));
+        assert_eq!(s.on_client(save), rect(400, 536, 88, 32));
+        assert!(!s.shown(item) && s.shown(rect(24, 900, 80, 16)));
+        // Client points map back: the band at the bottom, the content above it.
+        assert_eq!(s.in_form(400, 540), (400, 940));
+        assert_eq!(s.in_form(24, 519), (24, 919));
+        assert!(s.scroll_to(-5));
+        assert_eq!(s.offset(), 0);
+        assert_eq!(s.in_form(24, 519), (24, 519));
+    }
+
+    #[test]
+    fn a_window_keeps_room_for_the_footer_and_a_form_with_no_band_scrolls_whole() {
+        let s = Scroll::new(1000, Some(920), 50);
+        assert_eq!((s.view(), s.content(), s.range()), (80, 0, 920));
+        let s = Scroll::new(1000, None, 600);
+        assert_eq!((s.view(), s.content(), s.range()), (600, 600, 400));
+        assert_eq!(s.on_client(rect(0, 990, 10, 10)), rect(0, 990, 10, 10));
+    }
+
+    #[test]
+    fn focus_scrolls_a_control_into_view_with_room_round_it() {
+        let mut s = tall();
+        // Below the window: it comes up until its bottom and the room show.
+        assert!(s.reveal(rect(24, 700, 80, 32), 16));
+        assert_eq!(s.offset(), 732 + 16 - 520);
+        let r = s.on_client(rect(24, 700, 80, 32));
+        assert_eq!(r.bottom + 16, s.content());
+        // Already in view: nothing moves.
+        assert!(!s.reveal(rect(24, 600, 80, 32), 16));
+        // Above the window: it comes down until its top and the room show.
+        assert!(s.reveal(rect(24, 100, 80, 32), 16));
+        assert_eq!(s.offset(), 84);
+        // The last control: as far as the range goes, no further.
+        s.reveal(rect(24, 880, 80, 32), 16);
+        assert_eq!(s.offset(), 400);
+        // A control in the footer band is always in view.
+        assert!(!s.reveal(rect(400, 936, 88, 32), 16));
+        assert_eq!(s.offset(), 400);
+        // Taller than the window's content part: its top shows.
+        assert!(s.reveal(rect(24, 200, 80, 600), 16));
+        assert_eq!(s.offset(), 184);
+    }
+
+    #[test]
+    fn the_wheel_scrolls_lines_a_notch_and_adds_up_touchpad_parts() {
+        let mut s = tall();
+        // A notch toward the user: three lines of 20 down.
+        assert!(s.wheel(-120, 3, 20));
+        assert_eq!(s.offset(), 60);
+        assert!(s.wheel(120, 3, 20));
+        assert_eq!(s.offset(), 0);
+        // Away from the user at the top: nothing, and nothing saved for later.
+        assert!(!s.wheel(120, 3, 20));
+        assert!(s.wheel(-120, 3, 20));
+        assert_eq!(s.offset(), 60);
+        // A touchpad sends parts of a notch: two of 1/120 at 60 a notch make a pixel.
+        let mut s = tall();
+        assert!(!s.wheel(-1, 3, 20));
+        assert!(s.wheel(-1, 3, 20));
+        assert_eq!(s.offset(), 1);
+        for _ in 0..4 {
+            s.wheel(-30, 3, 20);
+        }
+        assert_eq!(s.offset(), 61);
+        // A page a notch, as the user may set it, and no scroll at 0 lines.
+        let mut s = tall();
+        assert!(s.wheel(-120, u32::MAX, 20));
+        assert_eq!(s.offset(), 400, "a page of 520, held in the range");
+        assert!(!s.wheel(120, 0, 20));
+    }
+
+    #[test]
+    fn the_thumb_runs_down_its_track_as_the_content_scrolls() {
+        let mut s = tall();
+        // The track is the content's part, 2 in from its ends: 516 long. The thumb is as long
+        // against it as 520 shown is against 920.
+        let thumb = s.thumb(600, 96, 0.0).unwrap();
+        assert_eq!(
+            (thumb.x, thumb.y, thumb.w, thumb.h),
+            (594.0, 2.0, 4.0, 291.0)
+        );
+        let hot = s.thumb(600, 96, 1.0).unwrap();
+        assert_eq!((hot.x, hot.w), (590.0, 8.0));
+        assert_eq!(s.bar(600, 96), Some(rect(588, 0, 12, 520)));
+        s.scroll_to(400);
+        let end = s.thumb(600, 96, 0.0).unwrap();
+        assert_eq!(end.y + end.h, 518.0);
+        // At 200 %, every size doubles.
+        let big = Scroll::new(2000, Some(1840), 1200);
+        let b = big.thumb(1200, 192, 0.0).unwrap();
+        assert_eq!((b.x, b.y, b.w), (1188.0, 4.0, 8.0));
+        // A long form keeps the thumb at least 32.
+        let long = Scroll::new(20_000, Some(19_920), 600);
+        assert_eq!(long.thumb(600, 96, 0.0).unwrap().h, 32.0);
+    }
+
+    #[test]
+    fn dragging_the_thumb_and_clicking_the_track_scroll() {
+        let mut s = tall();
+        assert!(s.on_thumb(100, 96));
+        assert!(!s.on_thumb(400, 96));
+        // The thumb's free run is 516 - 291 = 225 for a range of 400.
+        assert!(s.drag(0, 225, 96));
+        assert_eq!(s.offset(), 400);
+        assert!(s.drag(400, -90, 96));
+        assert_eq!(s.offset(), 240);
+        // A click under the thumb pages down, above it pages up.
+        let mut s = tall();
+        assert!(s.page_toward(500, 96));
+        assert_eq!(s.offset(), 400);
+        assert!(s.page_toward(10, 96));
+        assert_eq!(s.offset(), 0);
+    }
+
+    #[test]
+    fn the_footer_is_the_last_band() {
+        let band = |y| Item::new(0, Place::new(0, y, 300, 64), Kind::Band);
+        let mut f = Form::new(vec![
+            band(0),
+            Item::new(
+                SAVE,
+                Place::at(10, 216),
+                Kind::button("Save", ButtonKind::Primary),
+            ),
+            band(200),
+        ]);
+        f.lay_out(144, &Fixed(144));
+        assert_eq!(f.footer(), Some(300));
+        assert_eq!(f.height(0), 396);
+        let s = Scroll::new(f.height(0), f.footer(), 200);
+        assert_eq!(s.on_client(f.laid()[1].rect).top, 324 - 196);
+        assert_eq!(sample().footer(), None);
     }
 }

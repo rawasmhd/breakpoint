@@ -25,11 +25,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{BOOL, w};
 
 use super::*;
-use crate::platform::kit::draw::{GdiMeasure, paint_form, paint_on};
-use crate::platform::kit::form::Form as Laid;
+use crate::platform::kit::draw::{GdiMeasure, buffered_scrolled, paint_form, paint_on};
+use crate::platform::kit::form::{Form as Laid, Key, Scroll, rect};
 use crate::platform::kit::shots::{capture, pump, render};
-use crate::platform::kit::window::menu_of;
-use crate::platform::theme::{self, Colours, Fonts, Theme, high_contrast_black, px};
+use crate::platform::kit::window::{menu_of, pretend_work_area, scroll_of, window_size};
+use crate::platform::theme::{
+    self, Colours, Fonts, SCROLL_LINE, SCROLL_ROOM, Theme, high_contrast_black, px,
+};
 
 const SCALES: [u32; 4] = [96, 120, 144, 192];
 
@@ -48,6 +50,20 @@ fn laid_out(dpi: u32) -> Laid {
     }
     form
 }
+
+/// The window's form at `dpi` and how it scrolls on a work area `work_h` tall: the client
+/// takes the whole form when it fits, else what the work area leaves under the caption.
+fn scroll_at(dpi: u32, work_h: i32) -> (Laid, Scroll) {
+    let form = laid_out(dpi);
+    let full = form.height(0);
+    let frame = window_size((px(WIDTH, dpi), full), dpi).1 - full;
+    let scroll = Scroll::new(full, form.footer(), work_h - frame);
+    (form, scroll)
+}
+
+/// 1366 x 768 at 100 % and 1920 x 1080 at 150 %, each under a 48-px taskbar: the DPI and the
+/// work area's height. The window fits neither (issue #84).
+const SMALL_SCREENS: [(u32, i32); 2] = [(96, 768 - 48), (144, 1080 - 72)];
 
 fn overlap(a: &RECT, b: &RECT) -> bool {
     a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
@@ -373,19 +389,12 @@ fn opened_at_a_point_its_top_left_is_there() {
     unsafe { GetClientRect(handle.hwnd(), &mut client).unwrap() };
     let dpi = unsafe { GetDpiForWindow(handle.hwnd()) };
     assert_eq!(client.right, px(WIDTH, dpi));
-    // Windows keeps a window no taller than the screen, so on a small screen (a CI runner's)
-    // the client is cut; the full height is checked only where it fits. #84 adds scrolling.
-    let full = laid_out(dpi).height(0);
-    let frame = h - client.bottom;
-    if full + frame <= work.bottom - work.top {
-        assert_eq!(client.bottom, full);
-    } else {
-        assert!(
-            client.bottom > 0 && client.bottom <= full,
-            "{} of {full}",
-            client.bottom
-        );
-    }
+    // The whole form where it fits; on a small screen (a CI runner's) the work area's height,
+    // with the content scrolling above Save.
+    let (form, scroll) = scroll_at(dpi, work.bottom - work.top);
+    assert_eq!(client.bottom, scroll.view());
+    assert_eq!(scroll.scrolls(), client.bottom < form.height(0));
+    assert!(h <= work.bottom - work.top);
     handle.close();
 }
 
@@ -510,7 +519,10 @@ fn moving_to_a_monitor_at_another_scale_lays_out_again() {
     unsafe { GetClientRect(handle.hwnd(), &mut client).unwrap() };
     assert_eq!(
         (client.right, client.bottom),
-        (px(WIDTH, dpi), laid_out(dpi).height(0)),
+        (
+            px(WIDTH, dpi),
+            scroll_at(dpi, work.bottom - work.top).1.view()
+        ),
         "from {first} to {dpi}"
     );
     if let Ok(folder) = std::env::var("BP_SHOTS") {
@@ -599,6 +611,220 @@ fn shots() {
             );
             ReleaseDC(None, screen);
         },
+    );
+    eprintln!(
+        "live: theme {:?}, high contrast {}, {} DPI",
+        theme::app_theme(),
+        theme::high_contrast(),
+        unsafe { GetDpiForWindow(handle.hwnd()) }
+    );
+    handle.close();
+}
+
+// ---- Too tall for the screen (issue #84) ----
+
+/// Whether `laid` shows whole: the footer band's items anywhere in the window, the rest in the
+/// part above the band.
+fn shows_whole(scroll: &Scroll, laid: RECT, w: i32) -> bool {
+    let r = scroll.on_client(laid);
+    let bottom = if r.top >= scroll.content() {
+        scroll.view()
+    } else {
+        scroll.content()
+    };
+    inside(&r, &rect(0, 0, w, bottom))
+}
+
+#[test]
+fn on_small_screens_save_shows_and_tab_and_the_wheel_reach_every_control() {
+    for (dpi, work_h) in SMALL_SCREENS {
+        let (mut form, mut scroll) = scroll_at(dpi, work_h);
+        let w = px(WIDTH, dpi);
+        let full = form.height(0);
+        let frame = window_size((w, full), dpi).1 - full;
+        assert!(scroll.scrolls(), "{dpi} DPI on {work_h}");
+        assert_eq!(
+            scroll.view() + frame,
+            work_h,
+            "it takes the work area's height"
+        );
+        let id_rect = |form: &Laid, id: Id| form.laid()[form.index(id).unwrap()].rect;
+        for id in [SAVE, CANCEL] {
+            assert!(shows_whole(&scroll, id_rect(&form, id), w), "{id} at {dpi}");
+        }
+        // Tab: each control scrolls whole into view, the ring's room included, as the window
+        // does it; then Tab wraps to the first and the top comes back.
+        let room = px(SCROLL_ROOM, dpi);
+        let stops = tab_order(&form);
+        for _ in 0..stops.len() {
+            form.key(Key::Tab);
+            let r = form.focus_rect().unwrap();
+            scroll.reveal(r, room);
+            let id = form.focused().unwrap();
+            assert!(shows_whole(&scroll, r, w), "{id} at {dpi} DPI");
+            let c = scroll.on_client(r);
+            if c.top < scroll.content() {
+                assert!(
+                    c.top >= room && c.bottom + room <= scroll.content(),
+                    "{id} room"
+                );
+            }
+        }
+        assert_eq!(form.focused(), Some(DAY));
+        // The wheel: from the top to the end, every control shows whole at some point.
+        scroll.scroll_to(0);
+        let line = px(SCROLL_LINE, dpi);
+        let mut seen = Vec::new();
+        loop {
+            for (item, laid) in form.items().iter().zip(form.laid()) {
+                if item.kind.focusable() && shows_whole(&scroll, laid.rect, w) {
+                    seen.push(item.id);
+                }
+            }
+            if !scroll.wheel(-120, 3, line) {
+                break;
+            }
+        }
+        assert_eq!(scroll.offset(), scroll.range());
+        for id in reading_order() {
+            assert!(
+                seen.contains(&id),
+                "the wheel never shows {id} at {dpi} DPI"
+            );
+        }
+    }
+}
+
+/// A work area 520 tall at the top-left of the real one: too small for the settings window
+/// at any scale, on any screen.
+fn small_work() -> RECT {
+    let at = POINT { x: 0, y: 0 };
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    let _ = unsafe { GetMonitorInfoW(MonitorFromPoint(at, MONITOR_DEFAULTTONEAREST), &mut info) };
+    let real = info.rcWork;
+    rect(real.left, real.top, real.right - real.left, 520)
+}
+
+#[test]
+fn on_a_small_work_area_the_window_scrolls_and_a_refused_save_shows_its_control() {
+    let work = small_work();
+    pretend_work_area(Some(work));
+    let handle = open_hidden(&defaults());
+    pretend_work_area(None);
+    let r = handle.window_rect();
+    assert_eq!((r.top, r.bottom - r.top), (work.top, 520));
+    let scroll = scroll_of(handle).unwrap();
+    assert!(scroll.scrolls());
+    let mut client = RECT::default();
+    unsafe { GetClientRect(handle.hwnd(), &mut client).unwrap() };
+    let mut corner = POINT::default();
+    unsafe {
+        let _ = windows::Win32::Graphics::Gdi::ClientToScreen(handle.hwnd(), &mut corner);
+    }
+    let on_screen = rect(corner.x, corner.y, client.right, client.bottom);
+    let save = handle.screen_rect(SAVE).unwrap();
+    assert!(inside(&save, &on_screen), "{save:?} in {on_screen:?}");
+    // The focus a refused Save gives the Water stepper scrolls it into view.
+    handle.focus(WATER_EVERY);
+    let water = handle.screen_rect(WATER_EVERY).unwrap();
+    assert!(inside(&water, &on_screen), "{water:?} in {on_screen:?}");
+    assert!(scroll_of(handle).unwrap().offset() > 0);
+    assert_eq!(handle.screen_rect(SAVE), Some(save));
+    handle.close();
+}
+
+/// For a look by eye: `BP_SHOTS=<folder> cargo test settings_window::tests::scroll_shots --
+/// --ignored` writes the settings window as 1366 x 768 at 100 % and 1920 x 1080 at 150 % show
+/// it, at the top (focus ring on Sunday) and scrolled to the end (thumb under the pointer),
+/// in light, dark and high contrast. Then it opens the window on a work area 520 tall at the
+/// monitor's scale and captures it with its frame, at the top and after the wheel, then with
+/// the profile menu open, and the menu window itself. It captures only its own windows.
+#[test]
+#[ignore = "writes BMPs and shows the window"]
+fn scroll_shots() {
+    let Ok(folder) = std::env::var("BP_SHOTS") else {
+        eprintln!("set BP_SHOTS to a folder for the shots");
+        return;
+    };
+    let folder = std::path::PathBuf::from(folder);
+    unsafe {
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+    crate::platform::paint::startup();
+    let schemes = [
+        ("light", Colours::of(Theme::Light)),
+        ("dark", Colours::of(Theme::Dark)),
+        ("contrast", Colours::high_contrast(high_contrast_black)),
+    ];
+    for (name, c) in schemes {
+        for (dpi, work_h) in SMALL_SCREENS {
+            let fonts = Fonts::new(dpi);
+            let (mut form, mut scroll) = scroll_at(dpi, work_h);
+            form.show_cues();
+            form.focus_in();
+            let w = px(WIDTH, dpi);
+            for (at, hot) in [("top", 0.0), ("end", 1.0)] {
+                if at == "end" {
+                    scroll.scroll_to(scroll.range());
+                }
+                let path = folder.join(format!("settings-scroll-{name}-{dpi}-{at}.bmp"));
+                let thumb = scroll.thumb(w, dpi, hot);
+                render(w, scroll.view(), &path, |dc| unsafe {
+                    let looks = form.looks();
+                    buffered_scrolled(dc, w, &scroll, &c, &fonts, dpi, thumb, |canvas, m, runs| {
+                        paint_form(canvas, &form, &looks, &c, m, runs);
+                    });
+                });
+            }
+        }
+    }
+
+    let at = small_work();
+    pretend_work_area(Some(at));
+    let handle = create(
+        &defaults(),
+        true,
+        Some(POINT {
+            x: at.left + 40,
+            y: at.top,
+        }),
+    )
+    .unwrap();
+    pretend_work_area(None);
+    activate(handle);
+    pump(300);
+    capture(handle.hwnd(), &folder.join("settings-scroll-live-top.bmp"));
+    for _ in 0..4 {
+        unsafe {
+            SendMessageW(
+                handle.hwnd(),
+                windows::Win32::UI::WindowsAndMessaging::WM_MOUSEWHEEL,
+                Some(WPARAM(usize::from(-120i16 as u16) << 16)),
+                Some(LPARAM(0)),
+            );
+        }
+    }
+    pump(300);
+    capture(
+        handle.hwnd(),
+        &folder.join("settings-scroll-live-wheel.bmp"),
+    );
+    handle.focus(PROFILE);
+    key(handle, VK_SPACE);
+    pump(300);
+    capture(handle.hwnd(), &folder.join("settings-scroll-live-open.bmp"));
+    // The menu's own window, which hangs from the scrolled field.
+    let menu = menu_of(handle).expect("the menu is open");
+    capture(menu, &folder.join("settings-scroll-live-menu.bmp"));
+    let mut m = RECT::default();
+    unsafe { GetWindowRect(menu, &mut m).unwrap() };
+    let field = handle.screen_rect(PROFILE).unwrap();
+    assert!(
+        m.top >= field.bottom || m.bottom <= field.top,
+        "{m:?} by {field:?}"
     );
     eprintln!(
         "live: theme {:?}, high contrast {}, {} DPI",
