@@ -209,15 +209,15 @@ Uses `tray-icon` on breakpoint's own Win32 message loop. Left or right click ope
 
 ## 9. First-run wizard and settings window
 
-Both are raw Win32 `DIALOGEX` templates (from [UI technology for Rust windows](https://github.com/rawasmhd/breakpoint/issues/26)), caption *breakpoint*, app icon, comctl32 v6 and PerMonitorV2 from the manifest. They keep native controls and stay light in every Windows theme (native controls have no supported dark mode). Their layout follows [DESIGN.md](DESIGN.md) §6: sections with headings instead of group boxes, fonts built from the type styles, and the buttons in a footer band with one owner-drawn primary button.
+Both are painted windows, not `DIALOGEX` templates: one raw Win32 top-level window each, with the system caption and frame, caption *breakpoint*, the app icon and PerMonitorV2 from the manifest. breakpoint paints the client area and every control with GDI+ ([UI technology for Rust windows](https://github.com/rawasmhd/breakpoint/issues/26), changed by [Restyle 2](https://github.com/rawasmhd/breakpoint/issues/75)). They follow the Windows app theme, light or dark, as the popup does, and repaint when it changes. Layout, controls and states follow [DESIGN.md](DESIGN.md) §6: sections as cards, our own switches, day buttons, steppers, toggle, drop-down and selectable cards, and the buttons in a footer band. Keyboard, focus and screen-reader support are breakpoint's own (DESIGN.md §9).
 
 ### 9.1 First-run wizard
 
 Decided in [First-run wizard questions and public defaults](https://github.com/rawasmhd/breakpoint/issues/32). Shown only when `config.json` does not exist.
 
 One page that **asks two things**:
-1. **Profile:** three radio buttons, **Balanced** preselected, each with one plain line of its numbers, e.g. *Balanced: stand every 30 min, pause every 60 (Pause insists). Water rides along hourly.*
-2. **Start with Windows:** checkbox, **on**.
+1. **Profile:** three selectable cards, **Balanced** preselected, each with its name, one plain line of its numbers, e.g. *Balanced: stand every 30 min, pause every 60 (Pause insists). Water rides along hourly.*, and a small day timeline.
+2. **Start with Windows:** a checkbox, **on**.
 
 And **shows two things**:
 3. A read-only line *Nudges Sunday to Thursday, 08:00 to 17:00* with a **Change…** button.
@@ -225,7 +225,7 @@ And **shows two things**:
 
 - **Start** (default button) writes the config and starts nudging.
 - Closing it (X or Esc) is the same as Start: accepting what the page shows. The wizard never appears again; there is no re-run (deleting `config.json` brings it back as a side effect).
-- **Change…** closes the wizard and opens the settings window at the same position, pre-filled with the wizard's picks and defaults for the rest, focus on the first work-day checkbox. **Save** there writes the config and finishes first run; **Cancel**, Esc or X finishes first run as closing the wizard would (wizard picks plus defaults written, settings edits discarded).
+- **Change…** closes the wizard and opens the settings window at the same position, pre-filled with the wizard's picks and defaults for the rest, focus on the first work-day button. **Save** there writes the config and finishes first run; **Cancel**, Esc or X finishes first run as closing the wizard would (wizard picks plus defaults written, settings edits discarded).
 - Enforcement is never asked; the profile sets it.
 
 ### 9.2 Settings window
@@ -233,13 +233,13 @@ And **shows two things**:
 Decided in [Settings window scope](https://github.com/rawasmhd/breakpoint/issues/33). One fixed-size page, no tabs, titled *breakpoint settings*, opened from **Settings…**. Only one instance; Settings… on an open window brings it to the front. Nudges keep firing while it is open.
 
 Top to bottom:
-- **Work week:** seven *Work days* checkboxes, Sunday first (Friday and Saturday unchecked by default); work hours **from** and **to** as stock date-time pickers in 24-hour `HH:mm`.
-- **Profile:** drop-down Gentle / Balanced / Strict; shows **Custom** when the cadences, lengths and enforcement levels match no preset exactly (display only, not choosable). Picking a profile fills cadences, lengths and levels in the form, leaves the on/off boxes alone, and saves nothing until Save. Editing any of those fields flips the drop-down to Custom live. There is no separate restore-defaults button.
-- **Nudges**, one row each (edit box with an up-down control, whole minutes):
-  - *Stand/Move* [on] every [30] min, stand length [2] min, [Soft / Firm]
-  - *Pause* [on] every [60] min, pause length [5] min, [Soft / Firm]
+- **Work week:** seven *Work days* buttons, Sunday first, each on or off (Friday and Saturday off by default); work hours **from** and **to** as two time steppers in 24-hour `HH:mm`. A stepper moves in 15-minute steps, and any minute can be typed.
+- **Profile:** a drop-down with Gentle / Balanced / Strict; shows **Custom** when the cadences, lengths and enforcement levels match no preset exactly (display only, not choosable). Picking a profile fills cadences, lengths and levels in the form, leaves the on/off switches alone, and saves nothing until Save. Editing any of those fields flips the drop-down to Custom live. There is no separate restore-defaults button.
+- **Nudges**, one row each. Each row has a switch for on or off and an *Every* stepper in whole minutes. Stand/Move and Pause also have an *Away for* stepper (the stand length or the pause length, whole minutes) and a **Soft / Firm** toggle:
+  - *Stand/Move* [on] every [30] min, away for [2] min, [Soft / Firm]
+  - *Pause* [on] every [60] min, away for [5] min, [Soft / Firm]
   - *Water* [on] every [60] min, static note *Always gentle; rides along with the next nudge.*
-- **Start with Windows** checkbox.
+- **Start with Windows** as a switch.
 - **Save** (default, Enter) and **Cancel** (Esc, and X). Cancel discards without asking.
 
 **Ranges:** Stand/Move cadence 10 to 240, Pause cadence 20 to 240, Water cadence 10 to 240, stand length 2 to 5, pause length 2 to 15. A Stand/Move cadence that does not divide the Pause cadence is allowed with no warning. All three nudges may be off.
@@ -330,10 +330,10 @@ Fields are written in that order; absent fields are omitted, never `null`. In a 
 
 | Concern | Crate | Notes |
 |---|---|---|
-| Win32 and WinRT calls, dialogs, popup | `windows` | Presence APIs, power and session notifications, `SHQueryUserNotificationState`, media controls (WinRT), Run key, named mutex, `PlaySound`, `DIALOGEX` dialogs, the popup window, GDI+ drawing and DWM round corners (features, not new crates) |
+| Win32 and WinRT calls, dialogs, popup | `windows` | Presence APIs, power and session notifications, `SHQueryUserNotificationState`, media controls (WinRT), Run key, named mutex, `PlaySound`, the popup window, the painted dialog windows, GDI+ drawing for the popup and the dialogs, DWM round corners and caption colours, UI Automation (features, not new crates) |
 | Tray icon and menu | `tray-icon` (with its `muda` menus) | Needs only a Win32 message loop on the thread; no `winit` |
 | Config and log | `serde` + `serde_json` | No file watcher, no date-time crate: the platform layer supplies local time and UTC offset |
-| Exe resources | `winresource` (build dependency) | Icon, version info, manifest (comctl32 v6 + PerMonitorV2), `DIALOGEX` templates via `append_rc_content` |
+| Exe resources | `winresource` (build dependency) | Icon, version info, manifest (PerMonitorV2) |
 | Tests | built-in `cargo test` | Core tested with an injected clock and presence feed |
 
 No other runtime crates without a decision. Notably not used: toast crates (`tauri-winrt-notification`), GUI toolkits (egui, Slint, iced, WebView2/wry, native-windows-gui), `jiff`/`chrono`.
@@ -342,7 +342,7 @@ No other runtime crates without a decision. Notably not used: toast crates (`tau
 
 ```
 src/
-  main.rs            single-instance guard, message loop (with IsDialogMessage), wiring
+  main.rs            single-instance guard, message loop, wiring
   core/              no `windows` dependency; compiles and tests on any OS
     scheduler.rs     clocks in active time, firing, combining, Water riding, snooze, Firm repeats, expiry
     presence.rs      Presence state machine fed by polls and events (inputs supplied by platform)
@@ -353,7 +353,8 @@ src/
     tray.rs          tray-icon menu and icon states
     presence.rs      GetLastInputInfo, vetoes, session and power notifications
     popup.rs         the nudge popup window
-    dialogs.rs       wizard and settings DIALOGEX procedures
+    kit.rs           the painted dialog window and its controls (switch, day pill, stepper, toggle, drop-down, cards), keyboard, focus, UI Automation
+    dialogs.rs       the wizard and the settings window, built from the kit
     startup.rs       Run key
     clock.rs         local time and UTC offset
 tests/
@@ -386,7 +387,6 @@ Terms used above are defined in [GLOSSARY.md](../GLOSSARY.md): nudge, occurrence
 - The popup shows over presentations, screen shares and full-screen apps when they fall inside work hours: it ignores Do not disturb, and automatic quiet contexts are not in v1.
 - Standing while typing at a sit-stand desk is not detected; the user presses Skip.
 - Water cannot be acknowledged; it is a heads-up only.
-- The wizard and the settings window are light only; the popup follows the Windows app theme.
 - Rawas's week is the hard-coded default for everyone; other users change it in Settings.
 
 ## 16. Filled in during the rewrite
@@ -407,7 +407,7 @@ The map left these small gaps; the rewrite closed them with the leanest option, 
 12. **The bad-config notice** sits in the popup's place, no buttons, until closed (§10.1).
 13. **Single instance**: a second launch opens Settings in the running instance (§11).
 14. **The wizard's button** is named Start (§9.1).
-15. **Light theme only** in v1; dark mode moves to the fog (§15, §17). Later overturned for the popup by the [restyle](https://github.com/rawasmhd/breakpoint/issues/63); the dialogs stay light.
+15. **Light theme only** in v1; dark mode moves to the fog (§15, §17). Later overturned for the popup by the [restyle](https://github.com/rawasmhd/breakpoint/issues/63) and for the wizard and the settings window by [painted dialogs](https://github.com/rawasmhd/breakpoint/issues/75): all three follow the Windows app theme.
 16. **Nudge copy** (§3).
 17. **Suspend and display-off satisfy a Pause** as they do a Stand/Move (the Pause ticket named only lock; the event log's `by` values already allowed both) (§3, §5.5).
 
@@ -421,7 +421,7 @@ Fog left on the map, revisited after living with v1:
 - Auto-detected work day; overnight work hours; a holiday calendar or "off until a date".
 - A Water acknowledgement; counting standing while typing; using a presence sensor where the machine has one.
 - Looking back at past days (a weekly view or export).
-- Sounds per nudge; dark mode for the dialogs.
+- Sounds per nudge.
 - Code signing.
 
 ## 18. Decision index
@@ -442,3 +442,4 @@ Fog left on the map, revisited after living with v1:
 | [Make the windows crate build locally (MSVC toolchain)](https://github.com/rawasmhd/breakpoint/issues/35) | 12.1 |
 | [Event log schema and the Today tray item](https://github.com/rawasmhd/breakpoint/issues/36) | 10.2, 10.3 |
 | [Restyle: the breakpoint design system](https://github.com/rawasmhd/breakpoint/issues/63) | 6, 7, 8, 9, 12.1, 15; [DESIGN.md](DESIGN.md) |
+| [Restyle 2: painted dialogs, card layout](https://github.com/rawasmhd/breakpoint/issues/75) | 9, 9.1, 9.2, 12.1, 12.2, 15, 16, 17; [DESIGN.md](DESIGN.md) §1, 3, 5, 6, 8, 9 |
