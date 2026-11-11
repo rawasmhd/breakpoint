@@ -1,0 +1,2042 @@
+//! The form's state machine, in plain Rust: layout at a DPI, hit-testing, focus order, keys,
+//! stepper math, the drop-down menu and the hover, press and knob timing.
+//!
+//! The window feeds it keys, pointer moves and frame ticks, and hands the [`Event`]s it returns
+//! to the caller. Nothing here touches a window, so unit tests drive all of it.
+
+use std::time::Duration;
+
+use windows::Win32::Foundation::RECT;
+use windows::Win32::UI::WindowsAndMessaging::USER_DEFAULT_SCREEN_DPI as BASE_DPI;
+
+use super::{ButtonKind, Entry, Event, Id, Item, Kind, Value};
+use crate::platform::paint::{HOVER, PRESSED, REST, step_fill};
+use crate::platform::theme::{
+    CHECKBOX, CHEVRON, CHEVRON_RIGHT, CHOICE_PAD_X, CHOICE_PAD_Y, HAIRLINE, KNOB_SLIDE, MENU_CHECK,
+    MENU_ITEM_PAD_X, MENU_ITEM_PAD_Y, MENU_PAD, PAGE_STEPS, PILL_H, PILL_W, PRIMARY_MIN_WIDTH,
+    RADIO, SEGMENT_GAP, SEGMENT_H, SEGMENT_MIN_W, SEGMENT_PAD, SIZE_BUTTON, SIZE_FIELD, SIZE_GLYPH,
+    SPACE_2, SPACE_3, SPACE_4, STEPPER_VALUE, STEPPER_ZONE, SWITCH_H, SWITCH_W, Style, px,
+};
+
+/// Minutes in a day: time steppers wrap round it.
+pub const DAY: i32 = 24 * 60;
+/// The longest number a stepper takes typed.
+const NUMBER_CHARS: usize = 4;
+/// The longest time a time stepper takes typed: `HH:mm`.
+const TIME_CHARS: usize = 5;
+
+/// Text widths in pixels, so the layout can size text, buttons and menus.
+pub trait Measure {
+    fn width(&self, style: Style, text: &str) -> i32;
+}
+
+/// The parts of a control that answer the pointer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Part {
+    /// The whole control.
+    Body,
+    /// A stepper's − zone, + zone and value between them.
+    Minus,
+    Plus,
+    Field,
+    /// One segment of a segmented toggle.
+    Segment(usize),
+}
+
+impl Part {
+    /// The index of this part's hover level in a [`Look`].
+    pub const fn slot(self) -> usize {
+        match self {
+            Part::Body | Part::Minus => 0,
+            Part::Plus => 1,
+            Part::Field => 2,
+            Part::Segment(i) => i,
+        }
+    }
+}
+
+/// An item laid out at the form's DPI, in client pixels.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Laid {
+    pub rect: RECT,
+    /// A text item's lines after wrapping.
+    pub lines: Vec<String>,
+    /// The parts that answer the pointer.
+    pub parts: Vec<(Part, RECT)>,
+}
+
+/// A key the form handles. The window turns Win32 key messages into these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Key {
+    Tab,
+    /// Shift+Tab.
+    BackTab,
+    Enter,
+    Esc,
+    Space,
+    Up,
+    Down,
+    Left,
+    Right,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    AltDown,
+    AltUp,
+    Back,
+    /// A typed character, such as a digit for a stepper.
+    Char(char),
+}
+
+/// The open drop-down menu: which item owns it and which entry is highlighted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Menu {
+    pub item: usize,
+    pub hot: Option<usize>,
+}
+
+/// How to paint one item now: its hover levels per part (0 rest, 1 hover, 2 press), the switch
+/// knob's place (0 off, 1 on), the focus ring, whether its menu is open, and typed text.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Look {
+    pub levels: Vec<f32>,
+    pub slide: f32,
+    pub ring: bool,
+    pub open: bool,
+    pub edit: Option<String>,
+}
+
+type Target = (usize, Part);
+
+/// Which part the pointer is over, and which part a press started on. A press acts only when
+/// it is released on the part it started on, as in a native button.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Pointer {
+    hot: Option<Target>,
+    pressed: Option<Target>,
+}
+
+impl Pointer {
+    fn moved(&mut self, hit: Option<Target>, down: bool) -> bool {
+        let before = *self;
+        if !down {
+            self.pressed = None;
+        }
+        self.hot = hit;
+        *self != before
+    }
+
+    fn left(&mut self, down: bool) {
+        self.hot = None;
+        if !down {
+            self.pressed = None;
+        }
+    }
+
+    fn down(&mut self, hit: Option<Target>) {
+        self.hot = hit;
+        self.pressed = hit;
+    }
+
+    fn up(&mut self, hit: Option<Target>) -> Option<Target> {
+        self.hot = hit;
+        self.pressed.take().filter(|&p| Some(p) == hit)
+    }
+
+    fn target(&self, t: Target) -> f32 {
+        match (self.hot == Some(t), self.pressed) {
+            (true, Some(p)) if p == t => PRESSED,
+            (true, None) => HOVER,
+            _ => REST,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Anim {
+    levels: Vec<f32>,
+    slide: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Edit {
+    item: usize,
+    text: String,
+}
+
+/// A form: its items and everything the user has done to them.
+#[derive(Debug)]
+pub struct Form {
+    items: Vec<Item>,
+    laid: Vec<Laid>,
+    dpi: u32,
+    focus: Option<usize>,
+    /// Whether the window has the keyboard focus.
+    active: bool,
+    /// Whether the focus ring shows: only after keyboard use, like `UISF_HIDEFOCUS`.
+    cues: bool,
+    pointer: Pointer,
+    anim: Vec<Anim>,
+    edit: Option<Edit>,
+    menu: Option<Menu>,
+}
+
+impl Form {
+    /// A form of `items`, focus on the first Tab stop. Lay it out before use.
+    pub fn new(items: Vec<Item>) -> Form {
+        let anim = items
+            .iter()
+            .map(|item| Anim {
+                levels: vec![REST; slots(&item.kind)],
+                slide: on_slide(&item.kind),
+            })
+            .collect();
+        let mut form = Form {
+            laid: vec![Laid::default(); items.len()],
+            items,
+            dpi: BASE_DPI,
+            focus: None,
+            active: false,
+            cues: false,
+            pointer: Pointer::default(),
+            anim,
+            edit: None,
+            menu: None,
+        };
+        form.focus = form.tab_stops().first().copied();
+        form
+    }
+
+    pub fn items(&self) -> &[Item] {
+        &self.items
+    }
+
+    pub fn laid(&self) -> &[Laid] {
+        &self.laid
+    }
+
+    pub fn dpi(&self) -> u32 {
+        self.dpi
+    }
+
+    pub fn index(&self, id: Id) -> Option<usize> {
+        self.items.iter().position(|item| item.id == id)
+    }
+
+    /// The focused item's id.
+    pub fn focused(&self) -> Option<Id> {
+        self.focus.map(|i| self.items[i].id)
+    }
+
+    pub fn menu(&self) -> Option<Menu> {
+        self.menu
+    }
+
+    // ---- Layout ----
+
+    /// Lays every item out at `dpi`: places scaled with [`px`], own sizes from the controls
+    /// table, text measured with `m`.
+    pub fn lay_out(&mut self, dpi: u32, m: &dyn Measure) {
+        self.dpi = dpi;
+        self.laid = self
+            .items
+            .iter()
+            .map(|item| lay_out(item, dpi, m))
+            .collect();
+    }
+
+    /// The item and part under (`x`, `y`) in client pixels. Later items win.
+    pub fn hit(&self, x: i32, y: i32) -> Option<(usize, Part)> {
+        self.laid.iter().enumerate().rev().find_map(|(i, laid)| {
+            if !self.items[i].kind.focusable() {
+                return None;
+            }
+            laid.parts
+                .iter()
+                .find(|(_, r)| inside(r, x, y))
+                .map(|&(part, _)| (i, part))
+        })
+    }
+
+    // ---- Values ----
+
+    pub fn value(&self, id: Id) -> Option<Value> {
+        Some(match &self.items[self.index(id)?].kind {
+            Kind::Switch { on } | Kind::Checkbox { on, .. } | Kind::Day { on, .. } => {
+                Value::On(*on)
+            }
+            Kind::Choice { selected, .. } => Value::On(*selected),
+            Kind::Stepper { value, .. } => Value::Number(*value),
+            Kind::Time { minutes, .. } => Value::Number(*minutes),
+            Kind::Segmented { selected, .. } => Value::Index(Some(*selected)),
+            Kind::DropDown { current, .. } => Value::Index(*current),
+            _ => return None,
+        })
+    }
+
+    /// Sets a control's value without an event. Returns false when the item takes no such value.
+    pub fn set(&mut self, id: Id, value: Value) -> bool {
+        let Some(i) = self.index(id) else {
+            return false;
+        };
+        if self.edit.as_ref().is_some_and(|e| e.item == i) {
+            self.edit = None;
+        }
+        match (&mut self.items[i].kind, value) {
+            (
+                Kind::Switch { on } | Kind::Checkbox { on, .. } | Kind::Day { on, .. },
+                Value::On(v),
+            ) => *on = v,
+            (Kind::Stepper { value, .. }, Value::Number(v)) => *value = v,
+            (Kind::Time { minutes, .. }, Value::Number(v)) => *minutes = v.rem_euclid(DAY),
+            (Kind::Segmented { options, selected }, Value::Index(Some(v))) if v < options.len() => {
+                *selected = v
+            }
+            (
+                Kind::DropDown {
+                    entries, current, ..
+                },
+                Value::Index(v),
+            ) if v.is_none_or(|v| v < entries.len()) => *current = v,
+            (Kind::Choice { .. }, Value::On(true)) => self.select_choice(i),
+            (Kind::Choice { selected, .. }, Value::On(false)) => *selected = false,
+            _ => return false,
+        }
+        true
+    }
+
+    /// Changes a text item's text, a button's label or a day pill's label. Lay out again after.
+    pub fn set_text(&mut self, id: Id, text: &str) -> bool {
+        let Some(i) = self.index(id) else {
+            return false;
+        };
+        match &mut self.items[i].kind {
+            Kind::Text { text: t, .. }
+            | Kind::Button { label: t, .. }
+            | Kind::Day { label: t, .. }
+            | Kind::Checkbox { label: t, .. } => *t = text.to_owned(),
+            Kind::DropDown { other, .. } => *other = text.to_owned(),
+            _ => return false,
+        }
+        true
+    }
+
+    // ---- Focus ----
+
+    fn is_tab_stop(&self, i: usize) -> bool {
+        match &self.items[i].kind {
+            Kind::Choice {
+                group, selected, ..
+            } => *selected || (!self.group_has_selection(*group) && self.group(*group)[0] == i),
+            kind => kind.focusable(),
+        }
+    }
+
+    /// The items Tab stops at, in list order. A selectable card group is one stop: its selected
+    /// card, or its first when none is selected.
+    pub fn tab_stops(&self) -> Vec<usize> {
+        (0..self.items.len())
+            .filter(|&i| self.is_tab_stop(i))
+            .collect()
+    }
+
+    fn group(&self, group: u16) -> Vec<usize> {
+        (0..self.items.len())
+            .filter(|&i| matches!(self.items[i].kind, Kind::Choice { group: g, .. } if g == group))
+            .collect()
+    }
+
+    fn group_has_selection(&self, group: u16) -> bool {
+        self.items.iter().any(
+            |item| matches!(item.kind, Kind::Choice { group: g, selected: true, .. } if g == group),
+        )
+    }
+
+    /// Moves the focus to item `i`, committing typed text and closing the menu on the way.
+    fn focus_on(&mut self, i: usize) -> Vec<Event> {
+        if self.focus == Some(i) {
+            return Vec::new();
+        }
+        let out = self.commit();
+        self.menu = None;
+        self.focus = Some(i);
+        out
+    }
+
+    /// Focuses the item `id`, as after a refused Save.
+    pub fn focus(&mut self, id: Id) -> Vec<Event> {
+        match self.index(id) {
+            Some(i) if self.items[i].kind.focusable() => self.focus_on(i),
+            _ => Vec::new(),
+        }
+    }
+
+    fn move_focus(&mut self, forward: bool) -> Vec<Event> {
+        let stops = self.tab_stops();
+        let cur = self.focus;
+        let next = if forward {
+            stops
+                .iter()
+                .find(|&&s| cur.is_none_or(|c| s > c))
+                .or(stops.first())
+        } else {
+            stops
+                .iter()
+                .rev()
+                .find(|&&s| cur.is_none_or(|c| s < c))
+                .or(stops.last())
+        };
+        match next {
+            Some(&i) => self.focus_on(i),
+            None => Vec::new(),
+        }
+    }
+
+    /// The window got the keyboard focus.
+    pub fn focus_in(&mut self) {
+        self.active = true;
+    }
+
+    /// The window lost the keyboard focus: typed text is committed and the menu closes.
+    pub fn focus_out(&mut self) -> Vec<Event> {
+        self.active = false;
+        self.menu = None;
+        self.commit()
+    }
+
+    /// Shows the focus ring from now on, as after keyboard use.
+    pub fn show_cues(&mut self) {
+        self.cues = true;
+    }
+
+    // ---- Keys ----
+
+    /// Handles `key`; returns what the user did.
+    pub fn key(&mut self, key: Key) -> Vec<Event> {
+        self.cues = true;
+        if let Some(menu) = self.menu {
+            return self.menu_key(menu, key);
+        }
+        match key {
+            Key::Tab => return self.move_focus(true),
+            Key::BackTab => return self.move_focus(false),
+            Key::Enter => {
+                if let Some(i) = self.focus
+                    && matches!(self.items[i].kind, Kind::DropDown { .. })
+                {
+                    self.open_menu(i);
+                    return Vec::new();
+                }
+                let mut out = self.commit();
+                out.extend(self.button(|default, _| default).map(Event::Pressed));
+                return out;
+            }
+            Key::Esc => {
+                if self.edit.take().is_some() {
+                    return Vec::new();
+                }
+                return vec![self.escape()];
+            }
+            _ => {}
+        }
+        let Some(i) = self.focus else {
+            return Vec::new();
+        };
+        match key {
+            Key::Space => self.activate(i),
+            Key::Up | Key::Left | Key::Down | Key::Right => {
+                let forward = matches!(key, Key::Down | Key::Right);
+                match &self.items[i].kind {
+                    Kind::Segmented { .. } => self.segment_by(i, forward),
+                    Kind::Choice { .. } => self.choice_by(i, forward),
+                    Kind::Stepper { .. } | Kind::Time { .. } if matches!(key, Key::Up) => {
+                        self.step(i, Step::By(1))
+                    }
+                    Kind::Stepper { .. } | Kind::Time { .. } if matches!(key, Key::Down) => {
+                        self.step(i, Step::By(-1))
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            Key::PageUp => self.step(i, Step::By(PAGE_STEPS)),
+            Key::PageDown => self.step(i, Step::By(-PAGE_STEPS)),
+            Key::Home => self.step(i, Step::Min),
+            Key::End => self.step(i, Step::Max),
+            Key::AltDown => {
+                if matches!(self.items[i].kind, Kind::DropDown { .. }) {
+                    self.open_menu(i);
+                }
+                Vec::new()
+            }
+            Key::Back => {
+                self.erase(i);
+                Vec::new()
+            }
+            Key::Char(c) => {
+                self.type_char(i, c);
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Esc or the caption ×: presses the cancel button, or asks to close.
+    pub fn escape(&self) -> Event {
+        self.button(|_, cancel| cancel)
+            .map_or(Event::Close, Event::Pressed)
+    }
+
+    /// The first button whose (default, cancel) flags pass `which`.
+    fn button(&self, which: impl Fn(bool, bool) -> bool) -> Option<Id> {
+        self.items.iter().find_map(|item| match item.kind {
+            Kind::Button {
+                default, cancel, ..
+            } if which(default, cancel) => Some(item.id),
+            _ => None,
+        })
+    }
+
+    /// Space on item `i`, or a click released on it.
+    fn activate(&mut self, i: usize) -> Vec<Event> {
+        let id = self.items[i].id;
+        match &mut self.items[i].kind {
+            Kind::Button { .. } => vec![Event::Pressed(id)],
+            Kind::Switch { on } | Kind::Checkbox { on, .. } | Kind::Day { on, .. } => {
+                *on = !*on;
+                vec![Event::Changed(id, Value::On(*on))]
+            }
+            Kind::DropDown { .. } => {
+                self.open_menu(i);
+                Vec::new()
+            }
+            Kind::Choice {
+                selected: false, ..
+            } => {
+                self.select_choice(i);
+                vec![Event::Changed(id, Value::On(true))]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn segment_by(&mut self, i: usize, forward: bool) -> Vec<Event> {
+        let id = self.items[i].id;
+        let Kind::Segmented { options, selected } = &mut self.items[i].kind else {
+            return Vec::new();
+        };
+        let n = options.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        *selected = if forward {
+            (*selected + 1) % n
+        } else {
+            (*selected + n - 1) % n
+        };
+        vec![Event::Changed(id, Value::Index(Some(*selected)))]
+    }
+
+    fn select_segment(&mut self, i: usize, k: usize) -> Vec<Event> {
+        let id = self.items[i].id;
+        match &mut self.items[i].kind {
+            Kind::Segmented { options, selected } if k < options.len() && *selected != k => {
+                *selected = k;
+                vec![Event::Changed(id, Value::Index(Some(k)))]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Makes card `i` the selected one of its group.
+    fn select_choice(&mut self, i: usize) {
+        let Kind::Choice { group, .. } = self.items[i].kind else {
+            return;
+        };
+        for j in self.group(group) {
+            if let Kind::Choice { selected, .. } = &mut self.items[j].kind {
+                *selected = i == j;
+            }
+        }
+    }
+
+    fn choice_by(&mut self, i: usize, forward: bool) -> Vec<Event> {
+        let Kind::Choice { group, .. } = self.items[i].kind else {
+            return Vec::new();
+        };
+        let members = self.group(group);
+        let at = members.iter().position(|&j| j == i).unwrap_or(0);
+        let n = members.len();
+        let next = members[if forward {
+            (at + 1) % n
+        } else {
+            (at + n - 1) % n
+        }];
+        self.select_choice(next);
+        self.focus = Some(next);
+        vec![Event::Changed(self.items[next].id, Value::On(true))]
+    }
+
+    // ---- Steppers ----
+
+    fn step(&mut self, i: usize, how: Step) -> Vec<Event> {
+        let mut out = self.commit();
+        let id = self.items[i].id;
+        let changed = match &mut self.items[i].kind {
+            Kind::Stepper {
+                value,
+                min,
+                max,
+                step,
+                ..
+            } => {
+                let next = match how {
+                    Step::By(n) => stepped(*value, *step, n, *min, *max),
+                    Step::Min => *min,
+                    Step::Max => *max,
+                };
+                (next != *value).then(|| {
+                    *value = next;
+                    next
+                })
+            }
+            Kind::Time { minutes, step } => {
+                let next = match how {
+                    Step::By(n) => stepped_time(*minutes, *step, n),
+                    Step::Min => 0,
+                    Step::Max => DAY - 1,
+                };
+                (next != *minutes).then(|| {
+                    *minutes = next;
+                    next
+                })
+            }
+            _ => None,
+        };
+        out.extend(changed.map(|v| Event::Changed(id, Value::Number(v))));
+        out
+    }
+
+    fn type_char(&mut self, i: usize, c: char) {
+        let (limit, allowed) = match self.items[i].kind {
+            Kind::Stepper { .. } => (NUMBER_CHARS, c.is_ascii_digit()),
+            Kind::Time { .. } => (TIME_CHARS, c.is_ascii_digit() || c == ':'),
+            _ => return,
+        };
+        if !allowed {
+            return;
+        }
+        let edit = self.edit.get_or_insert_with(|| Edit {
+            item: i,
+            text: String::new(),
+        });
+        if edit.text.len() < limit {
+            edit.text.push(c);
+        }
+    }
+
+    fn erase(&mut self, i: usize) {
+        let shown = match self.items[i].kind {
+            Kind::Stepper { value, .. } => value.to_string(),
+            Kind::Time { minutes, .. } => time_text(minutes),
+            _ => return,
+        };
+        let edit = self.edit.get_or_insert(Edit {
+            item: i,
+            text: shown,
+        });
+        edit.text.pop();
+    }
+
+    /// Ends typing in a stepper: a number keeps what was typed, even out of range; a time keeps
+    /// it if it is a real time. Anything else shows the value again.
+    fn commit(&mut self) -> Vec<Event> {
+        let Some(edit) = self.edit.take() else {
+            return Vec::new();
+        };
+        let id = self.items[edit.item].id;
+        let changed = match &mut self.items[edit.item].kind {
+            Kind::Stepper { value, .. } => parse_number(&edit.text)
+                .filter(|v| v != value)
+                .inspect(|&v| *value = v),
+            Kind::Time { minutes, .. } => parse_time(&edit.text)
+                .filter(|v| v != minutes)
+                .inspect(|&v| *minutes = v),
+            _ => None,
+        };
+        changed
+            .map(|v| vec![Event::Changed(id, Value::Number(v))])
+            .unwrap_or_default()
+    }
+
+    // ---- Drop-down menu ----
+
+    fn open_menu(&mut self, i: usize) {
+        if let Kind::DropDown {
+            entries, current, ..
+        } = &self.items[i].kind
+            && !entries.is_empty()
+        {
+            self.menu = Some(Menu {
+                item: i,
+                hot: Some(current.unwrap_or(0)),
+            });
+        }
+    }
+
+    pub fn close_menu(&mut self) {
+        self.menu = None;
+    }
+
+    /// The open menu's entries.
+    pub fn menu_entries(&self) -> Option<(&[Entry], Option<usize>)> {
+        let menu = self.menu?;
+        match &self.items[menu.item].kind {
+            Kind::DropDown {
+                entries, current, ..
+            } => Some((entries, *current)),
+            _ => None,
+        }
+    }
+
+    fn menu_key(&mut self, menu: Menu, key: Key) -> Vec<Event> {
+        let n = self.menu_entries().map_or(0, |(e, _)| e.len());
+        let hot = menu.hot;
+        let set_hot = |form: &mut Form, h: usize| {
+            form.menu = Some(Menu {
+                hot: Some(h.min(n.saturating_sub(1))),
+                ..menu
+            })
+        };
+        match key {
+            Key::Up => set_hot(self, hot.map_or(0, |h| h.saturating_sub(1))),
+            Key::Down => set_hot(self, hot.map_or(0, |h| h + 1)),
+            Key::Home | Key::PageUp => set_hot(self, 0),
+            Key::End | Key::PageDown => set_hot(self, n.saturating_sub(1)),
+            Key::Enter => {
+                return match hot {
+                    Some(h) => self.menu_pick(h),
+                    None => {
+                        self.menu = None;
+                        Vec::new()
+                    }
+                };
+            }
+            Key::Esc | Key::AltUp | Key::AltDown => self.menu = None,
+            Key::Tab | Key::BackTab => {
+                self.menu = None;
+                return self.key(key);
+            }
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    /// The pointer is over menu entry `hot`, or over none.
+    pub fn menu_hover(&mut self, hot: Option<usize>) -> bool {
+        match &mut self.menu {
+            Some(menu) if menu.hot != hot && hot.is_some() => {
+                menu.hot = hot;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Picks menu entry `k` and closes the menu.
+    pub fn menu_pick(&mut self, k: usize) -> Vec<Event> {
+        let Some(menu) = self.menu.take() else {
+            return Vec::new();
+        };
+        let id = self.items[menu.item].id;
+        match &mut self.items[menu.item].kind {
+            Kind::DropDown {
+                entries, current, ..
+            } if k < entries.len() && *current != Some(k) => {
+                *current = Some(k);
+                vec![Event::Changed(id, Value::Index(Some(k)))]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    // ---- Pointer ----
+
+    /// The pointer moved to (`x`, `y`) with the left button `down` or not. True if the look
+    /// changed.
+    pub fn pointer_move(&mut self, x: i32, y: i32, down: bool) -> bool {
+        let hit = self.hit(x, y);
+        self.pointer.moved(hit, down)
+    }
+
+    pub fn pointer_leave(&mut self, down: bool) {
+        self.pointer.left(down);
+    }
+
+    /// The left button went down at (`x`, `y`). Steppers step and drop-downs open here; the rest
+    /// act on release. With the menu open, the press only closes it.
+    pub fn pointer_down(&mut self, x: i32, y: i32) -> Vec<Event> {
+        if self.menu.take().is_some() {
+            self.pointer.down(None);
+            return Vec::new();
+        }
+        let hit = self.hit(x, y);
+        self.pointer.down(hit);
+        let Some((i, part)) = hit else {
+            return Vec::new();
+        };
+        let mut out = self.focus_on(i);
+        match (&self.items[i].kind, part) {
+            (Kind::Stepper { .. } | Kind::Time { .. }, Part::Minus) => {
+                out.extend(self.step(i, Step::By(-1)))
+            }
+            (Kind::Stepper { .. } | Kind::Time { .. }, Part::Plus) => {
+                out.extend(self.step(i, Step::By(1)))
+            }
+            (Kind::DropDown { .. }, _) => self.open_menu(i),
+            _ => {}
+        }
+        out
+    }
+
+    /// The left button came up at (`x`, `y`): acts when it is the part the press started on.
+    pub fn pointer_up(&mut self, x: i32, y: i32) -> Vec<Event> {
+        let hit = self.hit(x, y);
+        let Some((i, part)) = self.pointer.up(hit) else {
+            return Vec::new();
+        };
+        match (&self.items[i].kind, part) {
+            (Kind::Segmented { .. }, Part::Segment(k)) => self.select_segment(i, k),
+            (
+                Kind::Button { .. }
+                | Kind::Switch { .. }
+                | Kind::Checkbox { .. }
+                | Kind::Day { .. }
+                | Kind::Choice { .. },
+                _,
+            ) => self.activate(i),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The press ended without a release here, such as when capture was lost.
+    pub fn pointer_cancel(&mut self) {
+        self.pointer.pressed = None;
+    }
+
+    // ---- Motion ----
+
+    fn target(&self, i: usize, slot: usize) -> f32 {
+        let (hot, pressed) = (self.pointer.hot, self.pointer.pressed);
+        let part = [hot, pressed]
+            .into_iter()
+            .flatten()
+            .find(|&(j, p)| j == i && p.slot() == slot);
+        part.map_or(REST, |p| self.pointer.target(p))
+    }
+
+    /// Moves every hover level, press and knob `dt` toward where it is heading; at once when
+    /// `animate` is false. True while anything still moves.
+    pub fn tick(&mut self, dt: Duration, animate: bool) -> bool {
+        for i in 0..self.items.len() {
+            for slot in 0..self.anim[i].levels.len() {
+                let target = self.target(i, slot);
+                let level = &mut self.anim[i].levels[slot];
+                *level = step_fill(*level, target, dt, animate);
+            }
+            let to = on_slide(&self.items[i].kind);
+            let slide = &mut self.anim[i].slide;
+            *slide = if animate {
+                let step = dt.as_secs_f32() / KNOB_SLIDE.as_secs_f32();
+                if to > *slide {
+                    (*slide + step).min(to)
+                } else {
+                    (*slide - step).max(to)
+                }
+            } else {
+                to
+            };
+        }
+        self.moving()
+    }
+
+    pub fn moving(&self) -> bool {
+        (0..self.items.len()).any(|i| {
+            let a = &self.anim[i];
+            a.slide != on_slide(&self.items[i].kind)
+                || a.levels
+                    .iter()
+                    .enumerate()
+                    .any(|(slot, &level)| level != self.target(i, slot))
+        })
+    }
+
+    /// How to paint each item now.
+    pub fn looks(&self) -> Vec<Look> {
+        (0..self.items.len())
+            .map(|i| Look {
+                levels: self.anim[i].levels.clone(),
+                slide: self.anim[i].slide,
+                ring: self.cues && self.active && self.focus == Some(i),
+                open: self.menu.is_some_and(|m| m.item == i),
+                edit: self
+                    .edit
+                    .as_ref()
+                    .filter(|e| e.item == i)
+                    .map(|e| e.text.clone()),
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Step {
+    By(i32),
+    Min,
+    Max,
+}
+
+/// How many hover levels a control keeps.
+fn slots(kind: &Kind) -> usize {
+    match kind {
+        Kind::Stepper { .. } | Kind::Time { .. } => 3,
+        Kind::Segmented { options, .. } => options.len().max(1),
+        _ => 1,
+    }
+}
+
+/// Where a switch knob rests: 1 on, 0 off. Other controls keep 0.
+fn on_slide(kind: &Kind) -> f32 {
+    match kind {
+        Kind::Switch { on: true } => 1.0,
+        _ => 0.0,
+    }
+}
+
+fn inside(r: &RECT, x: i32, y: i32) -> bool {
+    x >= r.left && x < r.right && y >= r.top && y < r.bottom
+}
+
+pub fn rect(x: i32, y: i32, w: i32, h: i32) -> RECT {
+    RECT {
+        left: x,
+        top: y,
+        right: x + w,
+        bottom: y + h,
+    }
+}
+
+// ---- Stepper math ----
+
+/// `value` moved `count` steps of `step`, snapping to the step's multiples (from 07 by 15: up to
+/// 15, down to 00), then held in `min..=max`. A value typed out of range comes back into it.
+pub fn stepped(value: i32, step: i32, count: i32, min: i32, max: i32) -> i32 {
+    let mut v = value;
+    for _ in 0..count.unsigned_abs() {
+        v = snap(v, step, count > 0).clamp(min, max);
+    }
+    v
+}
+
+/// As [`stepped`] for minutes after midnight, wrapping round midnight.
+pub fn stepped_time(minutes: i32, step: i32, count: i32) -> i32 {
+    let mut v = minutes;
+    for _ in 0..count.unsigned_abs() {
+        v = snap(v, step, count > 0).rem_euclid(DAY);
+    }
+    v
+}
+
+/// The next multiple of `step` above `value`, or the one below.
+fn snap(value: i32, step: i32, up: bool) -> i32 {
+    let step = step.max(1);
+    if up {
+        value.div_euclid(step) * step + step
+    } else {
+        (value - 1).div_euclid(step) * step
+    }
+}
+
+/// A typed number, or `None` when nothing was typed.
+pub fn parse_number(text: &str) -> Option<i32> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// A typed time as minutes after midnight: `8`, `08`, `830`, `0830`, `8:30` and `08:30` all
+/// work. `None` for anything that is not a time of day.
+pub fn parse_time(text: &str) -> Option<i32> {
+    let num = |s: &str| {
+        (!s.is_empty() && s.len() <= 2)
+            .then(|| parse_number(s))
+            .flatten()
+    };
+    let (h, m) = match text.split_once(':') {
+        Some((h, m)) => (num(h)?, num(m)?),
+        None => match text.len() {
+            1 | 2 => (num(text)?, 0),
+            3 => (num(&text[..1])?, num(&text[1..])?),
+            4 => (num(&text[..2])?, num(&text[2..])?),
+            _ => return None,
+        },
+    };
+    (h < 24 && m < 60).then_some(h * 60 + m)
+}
+
+/// Minutes after midnight as `HH:mm`.
+pub fn time_text(minutes: i32) -> String {
+    let m = minutes.rem_euclid(DAY);
+    format!("{:02}:{:02}", m / 60, m % 60)
+}
+
+/// What a stepper shows: the number (or time) and the unit after it.
+pub fn stepper_text(kind: &Kind) -> Option<(String, &str)> {
+    match kind {
+        Kind::Stepper { value, unit, .. } => Some((value.to_string(), unit.as_str())),
+        Kind::Time { minutes, .. } => Some((time_text(*minutes), "")),
+        _ => None,
+    }
+}
+
+// ---- Layout ----
+
+/// `text` broken at spaces into lines no wider than `width`. A word wider than `width` gets a
+/// line of its own.
+pub fn wrap(text: &str, width: i32, fits: impl Fn(&str) -> i32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let longer = if line.is_empty() {
+            word.to_owned()
+        } else {
+            format!("{line} {word}")
+        };
+        if line.is_empty() || fits(&longer) <= width {
+            line = longer;
+        } else {
+            lines.push(std::mem::replace(&mut line, word.to_owned()));
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+fn lay_out(item: &Item, dpi: u32, m: &dyn Measure) -> Laid {
+    let s = |v: i32| px(v, dpi);
+    let at = item.at;
+    let (x, y) = (s(at.x), s(at.y));
+    let given_w = (at.w > 0).then(|| s(at.w));
+    let given_h = (at.h > 0).then(|| s(at.h));
+    let lh = |style: Style| s(style.line_height());
+    let sized = |w: i32, h: i32| rect(x, y, given_w.unwrap_or(w), given_h.unwrap_or(h));
+    let mut lines = Vec::new();
+    let mut parts = Vec::new();
+    let r = match &item.kind {
+        Kind::Card { .. } | Kind::Band => sized(0, 0),
+        Kind::Text { text, style, .. } => {
+            lines = match given_w {
+                Some(w) => wrap(text, w, |t| m.width(*style, t)),
+                None => vec![text.clone()],
+            };
+            let widest = lines.iter().map(|l| m.width(*style, l)).max().unwrap_or(0);
+            sized(widest, lines.len() as i32 * lh(*style))
+        }
+        Kind::Glyph(_) => sized(s(SIZE_GLYPH), s(SIZE_GLYPH)),
+        Kind::Button { label, kind, .. } => {
+            let w = m.width(Style::BodyStrong, label) + 2 * (s(SPACE_3) + s(HAIRLINE));
+            let least = if *kind == ButtonKind::Primary {
+                s(PRIMARY_MIN_WIDTH)
+            } else {
+                0
+            };
+            sized(w.max(least), s(SIZE_BUTTON))
+        }
+        Kind::Switch { .. } => sized(s(SWITCH_W), s(SWITCH_H)),
+        Kind::Checkbox { label, .. } => {
+            if label.is_empty() {
+                sized(s(CHECKBOX), s(CHECKBOX))
+            } else {
+                let w = s(CHECKBOX) + s(SPACE_2) + m.width(Style::Body, label);
+                sized(w, s(CHECKBOX).max(lh(Style::Body)))
+            }
+        }
+        Kind::Day { .. } => sized(s(PILL_W), s(PILL_H)),
+        Kind::Stepper { .. } | Kind::Time { .. } => {
+            let zone = s(STEPPER_ZONE);
+            let r = sized(2 * zone + s(STEPPER_VALUE), s(SIZE_FIELD));
+            let h = r.bottom - r.top;
+            parts.push((Part::Minus, rect(r.left, r.top, zone, h)));
+            parts.push((Part::Plus, rect(r.right - zone, r.top, zone, h)));
+            parts.push((
+                Part::Field,
+                rect(r.left + zone, r.top, r.right - r.left - 2 * zone, h),
+            ));
+            r
+        }
+        Kind::Segmented { options, .. } => {
+            let n = options.len().max(1) as i32;
+            let (pad, gap) = (s(SEGMENT_PAD), s(SEGMENT_GAP));
+            let seg = match given_w {
+                Some(w) => (w - 2 * pad - (n - 1) * gap) / n,
+                None => options
+                    .iter()
+                    .map(|o| m.width(Style::CaptionStrong, o) + 2 * s(SPACE_3))
+                    .fold(s(SEGMENT_MIN_W), i32::max),
+            };
+            let r = sized(2 * pad + n * seg + (n - 1) * gap, s(SIZE_FIELD));
+            let seg_h = s(SEGMENT_H);
+            let top = r.top + (r.bottom - r.top - seg_h) / 2;
+            for k in 0..options.len() {
+                let left = r.left + pad + k as i32 * (seg + gap);
+                parts.push((Part::Segment(k), rect(left, top, seg, seg_h)));
+            }
+            r
+        }
+        Kind::DropDown { entries, other, .. } => {
+            let widest = entries
+                .iter()
+                .map(|e| e.name.as_str())
+                .chain([other.as_str()])
+                .map(|t| m.width(Style::Body, t))
+                .max()
+                .unwrap_or(0);
+            let w = s(SPACE_3) + widest + s(SPACE_2) + s(CHEVRON) + s(CHEVRON_RIGHT);
+            sized(w, s(SIZE_FIELD))
+        }
+        Kind::Choice {
+            title, note, aside, ..
+        } => {
+            let text = m
+                .width(Style::BodyStrong, title)
+                .max(m.width(Style::Caption, note));
+            let (aside_w, aside_h) = aside
+                .as_ref()
+                .map_or((0, 0), |a| (s(SPACE_4) + s(a.w), s(a.h)));
+            let w = 2 * s(CHOICE_PAD_X) + s(RADIO) + s(SPACE_3) + text + aside_w;
+            let h = 2 * s(CHOICE_PAD_Y) + (lh(Style::BodyStrong) + lh(Style::Caption)).max(aside_h);
+            sized(w, h)
+        }
+    };
+    if parts.is_empty() {
+        parts.push((Part::Body, r));
+    }
+    Laid {
+        rect: r,
+        lines,
+        parts,
+    }
+}
+
+/// The open menu's size and rows, in the menu window's client pixels.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MenuLayout {
+    pub w: i32,
+    pub h: i32,
+    pub rows: Vec<RECT>,
+}
+
+impl MenuLayout {
+    pub fn hit(&self, x: i32, y: i32) -> Option<usize> {
+        self.rows.iter().position(|r| inside(r, x, y))
+    }
+}
+
+/// Lays out a menu of `entries` at `dpi`, at least `field_w` wide: `MENU_PAD` round the rows,
+/// each row padded, the check mark's column, the name and the optional note line.
+pub fn menu_layout(entries: &[Entry], field_w: i32, dpi: u32, m: &dyn Measure) -> MenuLayout {
+    let s = |v: i32| px(v, dpi);
+    let pad = s(MENU_PAD);
+    let text_x = s(MENU_ITEM_PAD_X) + s(MENU_CHECK) + s(SPACE_2);
+    let widest = entries
+        .iter()
+        .map(|e| {
+            let note = e.note.as_deref().map_or(0, |n| m.width(Style::Caption, n));
+            m.width(Style::BodyStrong, &e.name).max(note)
+        })
+        .max()
+        .unwrap_or(0);
+    let w = field_w.max(2 * pad + text_x + widest + s(MENU_ITEM_PAD_X));
+    let mut y = pad;
+    let mut rows = Vec::new();
+    for e in entries {
+        let note = if e.note.is_some() {
+            s(Style::Caption.line_height())
+        } else {
+            0
+        };
+        let h = 2 * s(MENU_ITEM_PAD_Y) + s(Style::BodyStrong.line_height()) + note;
+        rows.push(rect(pad, y, w - 2 * pad, h));
+        y += h;
+    }
+    MenuLayout {
+        w,
+        h: y + pad,
+        rows,
+    }
+}
+
+/// Where the menu window goes on screen: `gap` under the `field` (in screen pixels), or above
+/// it when there is no room below in the `work` area but there is above. Kept inside `work`
+/// across.
+pub fn menu_place(field: RECT, w: i32, h: i32, gap: i32, work: RECT) -> RECT {
+    let below = field.bottom + gap;
+    let above = field.top - gap - h;
+    let top = if below + h > work.bottom && above >= work.top {
+        above
+    } else {
+        below
+    };
+    let left = field.left.min(work.right - w).max(work.left);
+    rect(left, top, w, h)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{Aside, Entry, Ink, Place};
+    use super::*;
+    use std::rc::Rc;
+
+    /// Every character 7px wide at 96 DPI, scaled with the DPI, at any style.
+    struct Fixed(u32);
+    impl Measure for Fixed {
+        fn width(&self, _: Style, text: &str) -> i32 {
+            px(7 * text.chars().count() as i32, self.0)
+        }
+    }
+
+    const SAVE: Id = 1;
+    const CANCEL: Id = 2;
+    const SWITCH: Id = 3;
+    const CHECK: Id = 4;
+    const DAY_MON: Id = 5;
+    const EVERY: Id = 6;
+    const FROM: Id = 7;
+    const SOFT_FIRM: Id = 8;
+    const PROFILE: Id = 9;
+    const CARD_A: Id = 10;
+    const CARD_B: Id = 11;
+    const CARD_C: Id = 12;
+    const LABEL: Id = 13;
+    const CARD: Id = 14;
+
+    fn entries() -> Vec<Entry> {
+        vec![
+            Entry::new("Gentle", Some("Every 45 min")),
+            Entry::new("Balanced", Some("Every 30 min")),
+            Entry::new("Strict", None),
+        ]
+    }
+
+    fn choice(group: u16, title: &str, selected: bool) -> Kind {
+        Kind::Choice {
+            group,
+            title: title.to_owned(),
+            note: "numbers".to_owned(),
+            selected,
+            aside: None,
+        }
+    }
+
+    /// A small form with one of everything, in this list order.
+    fn sample() -> Form {
+        let items = vec![
+            Item::new(
+                CARD,
+                Place::new(0, 0, 400, 300),
+                Kind::Card { rows: vec![40] },
+            ),
+            Item::new(
+                LABEL,
+                Place::at(10, 10),
+                Kind::text("Work days", Style::Body, Ink::Main),
+            ),
+            Item::new(
+                CARD_A,
+                Place::new(10, 40, 300, 0),
+                choice(1, "Gentle", false),
+            ),
+            Item::new(
+                CARD_B,
+                Place::new(10, 110, 300, 0),
+                choice(1, "Balanced", true),
+            ),
+            Item::new(
+                CARD_C,
+                Place::new(10, 180, 300, 0),
+                choice(1, "Strict", false),
+            ),
+            Item::new(
+                DAY_MON,
+                Place::at(10, 260),
+                Kind::Day {
+                    label: "Mon".into(),
+                    on: false,
+                },
+            ),
+            Item::new(SWITCH, Place::at(80, 260), Kind::Switch { on: false }),
+            Item::new(
+                CHECK,
+                Place::at(140, 260),
+                Kind::Checkbox {
+                    on: true,
+                    label: "Start".into(),
+                },
+            ),
+            Item::new(
+                EVERY,
+                Place::at(10, 310),
+                Kind::Stepper {
+                    value: 30,
+                    min: 10,
+                    max: 240,
+                    step: 1,
+                    unit: "min".into(),
+                },
+            ),
+            Item::new(
+                FROM,
+                Place::at(140, 310),
+                Kind::Time {
+                    minutes: 8 * 60,
+                    step: 15,
+                },
+            ),
+            Item::new(
+                SOFT_FIRM,
+                Place::at(260, 310),
+                Kind::Segmented {
+                    options: vec!["Soft".into(), "Firm".into()],
+                    selected: 0,
+                },
+            ),
+            Item::new(
+                PROFILE,
+                Place::new(10, 360, 176, 0),
+                Kind::DropDown {
+                    entries: entries(),
+                    current: Some(1),
+                    other: "Custom".into(),
+                },
+            ),
+            Item::new(
+                SAVE,
+                Place::at(200, 420),
+                Kind::Button {
+                    label: "Save".into(),
+                    kind: ButtonKind::Primary,
+                    default: true,
+                    cancel: false,
+                },
+            ),
+            Item::new(
+                CANCEL,
+                Place::at(300, 420),
+                Kind::Button {
+                    label: "Cancel".into(),
+                    kind: ButtonKind::Secondary,
+                    default: false,
+                    cancel: true,
+                },
+            ),
+        ];
+        let mut form = Form::new(items);
+        form.lay_out(96, &Fixed(96));
+        form.focus_in();
+        form
+    }
+
+    fn focus_after(form: &mut Form, keys: &[Key]) -> Option<Id> {
+        for &k in keys {
+            form.key(k);
+        }
+        form.focused()
+    }
+
+    fn centre(form: &Form, id: Id, part: Part) -> (i32, i32) {
+        let laid = &form.laid()[form.index(id).unwrap()];
+        let r = laid.parts.iter().find(|(p, _)| *p == part).unwrap().1;
+        ((r.left + r.right) / 2, (r.top + r.bottom) / 2)
+    }
+
+    fn click(form: &mut Form, id: Id, part: Part) -> Vec<Event> {
+        let (x, y) = centre(form, id, part);
+        let mut out = form.pointer_down(x, y);
+        out.extend(form.pointer_up(x, y));
+        out
+    }
+
+    // ---- Focus order ----
+
+    #[test]
+    fn tab_visits_the_tab_stops_in_list_order_and_wraps() {
+        let mut f = sample();
+        // The card group is one stop, at its selected card; text and cards are skipped.
+        assert_eq!(f.focused(), Some(CARD_B));
+        let order: Vec<_> = (0..10)
+            .map(|_| focus_after(&mut f, &[Key::Tab]).unwrap())
+            .collect();
+        assert_eq!(
+            order,
+            [
+                DAY_MON, SWITCH, CHECK, EVERY, FROM, SOFT_FIRM, PROFILE, SAVE, CANCEL, CARD_B
+            ]
+        );
+    }
+
+    #[test]
+    fn shift_tab_goes_back_and_wraps() {
+        let mut f = sample();
+        assert_eq!(focus_after(&mut f, &[Key::BackTab]), Some(CANCEL));
+        assert_eq!(focus_after(&mut f, &[Key::BackTab]), Some(SAVE));
+        assert_eq!(focus_after(&mut f, &[Key::Tab, Key::Tab]), Some(CARD_B));
+    }
+
+    #[test]
+    fn a_group_with_no_selection_stops_at_its_first_card() {
+        let mut f = sample();
+        f.set(CARD_B, Value::On(false));
+        assert!(f.tab_stops().contains(&f.index(CARD_A).unwrap()));
+        assert!(!f.tab_stops().contains(&f.index(CARD_B).unwrap()));
+    }
+
+    #[test]
+    fn the_ring_shows_only_after_keyboard_use_and_while_focused() {
+        let mut f = sample();
+        let ringed = |f: &Form| f.looks().iter().filter(|l| l.ring).count();
+        assert_eq!(ringed(&f), 0);
+        click(&mut f, SWITCH, Part::Body);
+        assert_eq!(ringed(&f), 0, "a click does not show the ring");
+        f.key(Key::Tab);
+        assert_eq!(ringed(&f), 1);
+        assert!(f.looks()[f.index(CHECK).unwrap()].ring);
+        f.focus_out();
+        assert_eq!(ringed(&f), 0);
+        f.focus_in();
+        assert_eq!(ringed(&f), 1);
+    }
+
+    // ---- Enter, Esc, Space ----
+
+    #[test]
+    fn enter_presses_the_default_button_and_esc_the_cancel() {
+        let mut f = sample();
+        assert_eq!(f.key(Key::Enter), [Event::Pressed(SAVE)]);
+        assert_eq!(f.key(Key::Esc), [Event::Pressed(CANCEL)]);
+        assert_eq!(f.escape(), Event::Pressed(CANCEL));
+    }
+
+    #[test]
+    fn esc_without_a_cancel_button_asks_to_close() {
+        let mut f = Form::new(vec![Item::new(
+            1,
+            Place::at(0, 0),
+            Kind::Switch { on: false },
+        )]);
+        f.lay_out(96, &Fixed(96));
+        assert_eq!(f.key(Key::Esc), [Event::Close]);
+        assert_eq!(f.key(Key::Enter), []);
+    }
+
+    #[test]
+    fn one_button_can_be_default_and_cancel() {
+        let mut f = Form::new(vec![Item::new(
+            1,
+            Place::at(0, 0),
+            Kind::Button {
+                label: "Start".into(),
+                kind: ButtonKind::Primary,
+                default: true,
+                cancel: true,
+            },
+        )]);
+        assert_eq!(f.key(Key::Enter), [Event::Pressed(1)]);
+        assert_eq!(f.key(Key::Esc), [Event::Pressed(1)]);
+    }
+
+    #[test]
+    fn space_toggles_switches_checkboxes_and_days_and_presses_buttons() {
+        let mut f = sample();
+        f.focus(SWITCH);
+        assert_eq!(f.key(Key::Space), [Event::Changed(SWITCH, Value::On(true))]);
+        assert_eq!(
+            f.key(Key::Space),
+            [Event::Changed(SWITCH, Value::On(false))]
+        );
+        f.focus(CHECK);
+        assert_eq!(f.key(Key::Space), [Event::Changed(CHECK, Value::On(false))]);
+        f.focus(DAY_MON);
+        assert_eq!(
+            f.key(Key::Space),
+            [Event::Changed(DAY_MON, Value::On(true))]
+        );
+        assert_eq!(f.value(DAY_MON), Some(Value::On(true)));
+        f.focus(CANCEL);
+        assert_eq!(f.key(Key::Space), [Event::Pressed(CANCEL)]);
+    }
+
+    // ---- Segmented and selectable cards ----
+
+    #[test]
+    fn arrows_move_the_segmented_selection_and_wrap() {
+        let mut f = sample();
+        f.focus(SOFT_FIRM);
+        let firm = Event::Changed(SOFT_FIRM, Value::Index(Some(1)));
+        let soft = Event::Changed(SOFT_FIRM, Value::Index(Some(0)));
+        assert_eq!(f.key(Key::Right), [firm]);
+        assert_eq!(f.key(Key::Right), [soft]);
+        assert_eq!(f.key(Key::Left), [firm]);
+        assert_eq!(f.key(Key::Up), [soft]);
+        assert_eq!(f.key(Key::Down), [firm]);
+        assert_eq!(f.focused(), Some(SOFT_FIRM));
+    }
+
+    #[test]
+    fn arrows_move_the_card_selection_and_the_focus_with_it() {
+        let mut f = sample();
+        assert_eq!(f.key(Key::Down), [Event::Changed(CARD_C, Value::On(true))]);
+        assert_eq!(f.focused(), Some(CARD_C));
+        assert_eq!(f.value(CARD_B), Some(Value::On(false)));
+        assert_eq!(f.key(Key::Right), [Event::Changed(CARD_A, Value::On(true))]);
+        assert_eq!(f.key(Key::Up), [Event::Changed(CARD_C, Value::On(true))]);
+        assert_eq!(f.key(Key::Left), [Event::Changed(CARD_B, Value::On(true))]);
+        // Still one stop: Tab leaves the group.
+        assert_eq!(focus_after(&mut f, &[Key::Tab]), Some(DAY_MON));
+    }
+
+    // ---- Steppers ----
+
+    #[test]
+    fn stepper_keys_step_page_and_jump_to_the_ends() {
+        let mut f = sample();
+        f.focus(EVERY);
+        let n = |v| [Event::Changed(EVERY, Value::Number(v))];
+        assert_eq!(f.key(Key::Up), n(31));
+        assert_eq!(f.key(Key::Down), n(30));
+        assert_eq!(f.key(Key::PageUp), n(35));
+        assert_eq!(f.key(Key::PageDown), n(30));
+        assert_eq!(f.key(Key::End), n(240));
+        assert_eq!(f.key(Key::Up), [], "held at max");
+        assert_eq!(f.key(Key::Home), n(10));
+        assert_eq!(f.key(Key::Down), [], "held at min");
+        assert_eq!(f.key(Key::Left), []);
+    }
+
+    #[test]
+    fn stepping_snaps_to_the_step_and_clamps() {
+        assert_eq!(stepped(7, 15, 1, 0, 100), 15);
+        assert_eq!(stepped(7, 15, -1, 0, 100), 0);
+        assert_eq!(stepped(15, 15, 1, 0, 100), 30);
+        assert_eq!(stepped(15, 15, -1, 0, 100), 0);
+        assert_eq!(stepped(95, 15, 1, 0, 100), 100);
+        assert_eq!(stepped(30, 1, 5, 10, 240), 35);
+        // A value typed out of range comes back into it on the first step.
+        assert_eq!(stepped(999, 1, 1, 10, 240), 240);
+        assert_eq!(stepped(999, 1, -1, 10, 240), 240);
+        assert_eq!(stepped(0, 1, 1, 10, 240), 10);
+        assert_eq!(stepped(0, 1, -1, 10, 240), 10);
+    }
+
+    #[test]
+    fn time_steps_by_quarter_hours_and_wraps_round_midnight() {
+        assert_eq!(stepped_time(8 * 60, 15, 1), 8 * 60 + 15);
+        assert_eq!(stepped_time(8 * 60 + 7, 15, 1), 8 * 60 + 15);
+        assert_eq!(stepped_time(8 * 60 + 7, 15, -1), 8 * 60);
+        assert_eq!(stepped_time(23 * 60 + 45, 15, 1), 0);
+        assert_eq!(stepped_time(0, 15, -1), 23 * 60 + 45);
+        assert_eq!(stepped_time(0, 15, -5), 22 * 60 + 45);
+        let mut f = sample();
+        f.focus(FROM);
+        assert_eq!(f.key(Key::Home), [Event::Changed(FROM, Value::Number(0))]);
+        assert_eq!(
+            f.key(Key::End),
+            [Event::Changed(FROM, Value::Number(DAY - 1))]
+        );
+        assert_eq!(time_text(DAY - 1), "23:59");
+        assert_eq!(time_text(8 * 60 + 5), "08:05");
+    }
+
+    #[test]
+    fn typed_digits_commit_on_enter_then_enter_presses_the_default() {
+        let mut f = sample();
+        f.focus(EVERY);
+        for c in "45".chars() {
+            assert_eq!(f.key(Key::Char(c)), []);
+        }
+        assert_eq!(
+            f.looks()[f.index(EVERY).unwrap()].edit.as_deref(),
+            Some("45")
+        );
+        assert_eq!(
+            f.key(Key::Enter),
+            [
+                Event::Changed(EVERY, Value::Number(45)),
+                Event::Pressed(SAVE)
+            ]
+        );
+        assert_eq!(f.value(EVERY), Some(Value::Number(45)));
+    }
+
+    #[test]
+    fn typed_digits_commit_on_tab_and_on_focus_loss() {
+        let mut f = sample();
+        f.focus(EVERY);
+        f.key(Key::Char('5'));
+        f.key(Key::Char('0'));
+        assert_eq!(f.key(Key::Tab), [Event::Changed(EVERY, Value::Number(50))]);
+        assert_eq!(f.focused(), Some(FROM));
+        f.focus(EVERY);
+        f.key(Key::Char('6'));
+        assert_eq!(f.focus_out(), [Event::Changed(EVERY, Value::Number(6))]);
+        // And when a click moves the focus.
+        f.focus_in();
+        f.key(Key::Char('7'));
+        assert_eq!(
+            click(&mut f, SWITCH, Part::Body),
+            [
+                Event::Changed(EVERY, Value::Number(7)),
+                Event::Changed(SWITCH, Value::On(true))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_typed_value_out_of_range_stays_as_typed() {
+        let mut f = sample();
+        f.focus(EVERY);
+        for c in "999".chars() {
+            f.key(Key::Char(c));
+        }
+        f.key(Key::Tab);
+        assert_eq!(f.value(EVERY), Some(Value::Number(999)));
+        f.focus(EVERY);
+        f.key(Key::Char('0'));
+        f.key(Key::Tab);
+        assert_eq!(f.value(EVERY), Some(Value::Number(0)));
+        // The next step brings it back into range.
+        f.focus(EVERY);
+        assert_eq!(f.key(Key::Up), [Event::Changed(EVERY, Value::Number(10))]);
+    }
+
+    #[test]
+    fn typing_keeps_digits_only_up_to_the_limit_and_backspace_edits() {
+        let mut f = sample();
+        f.focus(EVERY);
+        for c in "12a:345".chars() {
+            f.key(Key::Char(c));
+        }
+        let edit = |f: &Form| f.looks()[f.index(EVERY).unwrap()].edit.clone();
+        assert_eq!(edit(&f).as_deref(), Some("1234"));
+        f.key(Key::Back);
+        assert_eq!(edit(&f).as_deref(), Some("123"));
+        // Esc drops the typing and does not cancel; the next Esc does.
+        assert_eq!(f.key(Key::Esc), []);
+        assert_eq!(edit(&f), None);
+        assert_eq!(f.value(EVERY), Some(Value::Number(30)));
+        assert_eq!(f.key(Key::Esc), [Event::Pressed(CANCEL)]);
+        // Backspace with nothing typed edits the value shown.
+        f.key(Key::Back);
+        assert_eq!(edit(&f).as_deref(), Some("3"));
+        // Nothing typed at all: the value stays.
+        f.key(Key::Back);
+        assert_eq!(f.key(Key::Tab), []);
+        assert_eq!(f.value(EVERY), Some(Value::Number(30)));
+    }
+
+    #[test]
+    fn up_while_typing_steps_from_the_typed_value() {
+        let mut f = sample();
+        f.focus(EVERY);
+        f.key(Key::Char('4'));
+        f.key(Key::Char('0'));
+        assert_eq!(
+            f.key(Key::Up),
+            [
+                Event::Changed(EVERY, Value::Number(40)),
+                Event::Changed(EVERY, Value::Number(41))
+            ]
+        );
+    }
+
+    #[test]
+    fn typed_times_take_several_forms_and_bad_ones_revert() {
+        for (typed, want) in [
+            ("8", Some(480)),
+            ("08", Some(480)),
+            ("830", Some(510)),
+            ("0830", Some(510)),
+            ("8:30", Some(510)),
+            ("17:05", Some(1025)),
+            ("2359", Some(1439)),
+            ("2400", None),
+            ("0860", None),
+            ("", None),
+            (":", None),
+            ("12345", None),
+        ] {
+            assert_eq!(parse_time(typed), want, "{typed:?}");
+        }
+        let mut f = sample();
+        f.focus(FROM);
+        for c in "9:15".chars() {
+            f.key(Key::Char(c));
+        }
+        assert_eq!(f.key(Key::Tab), [Event::Changed(FROM, Value::Number(555))]);
+        f.focus(FROM);
+        for c in "99".chars() {
+            f.key(Key::Char(c));
+        }
+        assert_eq!(f.key(Key::Tab), []);
+        assert_eq!(f.value(FROM), Some(Value::Number(555)));
+    }
+
+    // ---- Drop-down ----
+
+    #[test]
+    fn space_enter_and_alt_down_open_the_menu() {
+        for open in [Key::Space, Key::Enter, Key::AltDown] {
+            let mut f = sample();
+            f.focus(PROFILE);
+            assert_eq!(f.key(open), []);
+            let menu = f.menu().expect("open");
+            assert_eq!(menu.item, f.index(PROFILE).unwrap());
+            assert_eq!(menu.hot, Some(1), "starts on the current entry");
+            assert!(f.looks()[menu.item].open);
+        }
+    }
+
+    #[test]
+    fn arrows_move_in_the_menu_and_enter_picks() {
+        let mut f = sample();
+        f.focus(PROFILE);
+        f.key(Key::Space);
+        f.key(Key::Down);
+        f.key(Key::Down);
+        assert_eq!(f.menu().unwrap().hot, Some(2), "held at the last");
+        f.key(Key::Up);
+        f.key(Key::Up);
+        f.key(Key::Up);
+        assert_eq!(f.menu().unwrap().hot, Some(0), "held at the first");
+        assert_eq!(
+            f.key(Key::Enter),
+            [Event::Changed(PROFILE, Value::Index(Some(0)))]
+        );
+        assert_eq!(f.menu(), None);
+        assert_eq!(f.value(PROFILE), Some(Value::Index(Some(0))));
+        // Picking the current entry changes nothing.
+        f.key(Key::Enter);
+        assert_eq!(f.key(Key::Enter), []);
+    }
+
+    #[test]
+    fn esc_closes_the_menu_without_cancelling() {
+        let mut f = sample();
+        f.focus(PROFILE);
+        f.key(Key::AltDown);
+        f.key(Key::Down);
+        assert_eq!(f.key(Key::Esc), []);
+        assert_eq!(f.menu(), None);
+        assert_eq!(f.value(PROFILE), Some(Value::Index(Some(1))));
+        assert_eq!(f.key(Key::Esc), [Event::Pressed(CANCEL)]);
+    }
+
+    #[test]
+    fn a_click_outside_closes_the_menu_and_does_nothing_else() {
+        let mut f = sample();
+        click(&mut f, PROFILE, Part::Body);
+        assert!(f.menu().is_some(), "a click on the field opens it");
+        assert_eq!(click(&mut f, SWITCH, Part::Body), []);
+        assert_eq!(f.menu(), None);
+        assert_eq!(f.value(SWITCH), Some(Value::On(false)));
+        // A click on the field while open closes it too.
+        click(&mut f, PROFILE, Part::Body);
+        click(&mut f, PROFILE, Part::Body);
+        assert_eq!(f.menu(), None);
+    }
+
+    #[test]
+    fn the_menu_picks_by_pointer_and_shows_other_when_nothing_matches() {
+        let mut f = sample();
+        f.set(PROFILE, Value::Index(None));
+        click(&mut f, PROFILE, Part::Body);
+        assert_eq!(f.menu().unwrap().hot, Some(0));
+        assert!(f.menu_hover(Some(2)));
+        assert!(!f.menu_hover(None), "leaving keeps the last highlight");
+        assert_eq!(
+            f.menu_pick(2),
+            [Event::Changed(PROFILE, Value::Index(Some(2)))]
+        );
+        assert!(!f.set(PROFILE, Value::Index(Some(3))), "no such entry");
+    }
+
+    #[test]
+    fn focus_loss_and_tab_close_the_menu() {
+        let mut f = sample();
+        f.focus(PROFILE);
+        f.key(Key::Space);
+        f.focus_out();
+        assert_eq!(f.menu(), None);
+        f.focus_in();
+        f.key(Key::Space);
+        assert_eq!(f.key(Key::Tab), []);
+        assert_eq!(f.menu(), None);
+        assert_eq!(f.focused(), Some(SAVE));
+    }
+
+    #[test]
+    fn menu_layout_and_place() {
+        let m = menu_layout(&entries(), 176, 96, &Fixed(96));
+        // Rows: 8 + 20 + 18 + 8 with a note, 8 + 20 + 8 without; 4 round them.
+        assert_eq!(m.rows[0], rect(4, 4, 168, 54));
+        assert_eq!(m.rows[1], rect(4, 58, 168, 54));
+        assert_eq!(m.rows[2], rect(4, 112, 168, 36));
+        assert_eq!((m.w, m.h), (176, 152));
+        assert_eq!(m.hit(10, 60), Some(1));
+        assert_eq!(m.hit(1, 60), None);
+
+        let work = rect(0, 0, 1000, 800);
+        let field = rect(100, 300, 176, 32);
+        assert_eq!(
+            menu_place(field, 176, 152, 4, work),
+            rect(100, 336, 176, 152)
+        );
+        // No room below: above.
+        let low = rect(100, 700, 176, 32);
+        assert_eq!(menu_place(low, 176, 152, 4, work), rect(100, 544, 176, 152));
+        // Kept inside the work area across.
+        let right = rect(900, 300, 176, 32);
+        assert_eq!(menu_place(right, 176, 152, 4, work).left, 1000 - 176);
+    }
+
+    // ---- Pointer ----
+
+    #[test]
+    fn clicks_act_on_release_over_the_part_the_press_started_on() {
+        let mut f = sample();
+        assert_eq!(click(&mut f, SAVE, Part::Body), [Event::Pressed(SAVE)]);
+        assert_eq!(f.focused(), Some(SAVE));
+        // Pressed on Save, released on Cancel: nothing.
+        let (x, y) = centre(&f, SAVE, Part::Body);
+        f.pointer_down(x, y);
+        let (x, y) = centre(&f, CANCEL, Part::Body);
+        assert_eq!(f.pointer_up(x, y), []);
+        assert_eq!(
+            click(&mut f, CHECK, Part::Body),
+            [Event::Changed(CHECK, Value::On(false))]
+        );
+        assert_eq!(
+            click(&mut f, DAY_MON, Part::Body),
+            [Event::Changed(DAY_MON, Value::On(true))]
+        );
+        assert_eq!(
+            click(&mut f, SOFT_FIRM, Part::Segment(1)),
+            [Event::Changed(SOFT_FIRM, Value::Index(Some(1)))]
+        );
+        assert_eq!(click(&mut f, SOFT_FIRM, Part::Segment(1)), []);
+        assert_eq!(
+            click(&mut f, CARD_A, Part::Body),
+            [Event::Changed(CARD_A, Value::On(true))]
+        );
+        assert_eq!(f.focused(), Some(CARD_A));
+        assert_eq!(f.value(CARD_B), Some(Value::On(false)));
+    }
+
+    #[test]
+    fn stepper_zones_step_on_press() {
+        let mut f = sample();
+        let (x, y) = centre(&f, EVERY, Part::Plus);
+        assert_eq!(
+            f.pointer_down(x, y),
+            [Event::Changed(EVERY, Value::Number(31))]
+        );
+        assert_eq!(f.pointer_up(x, y), []);
+        assert_eq!(
+            click(&mut f, EVERY, Part::Minus),
+            [Event::Changed(EVERY, Value::Number(30))]
+        );
+        assert_eq!(click(&mut f, EVERY, Part::Field), []);
+        assert_eq!(f.focused(), Some(EVERY));
+    }
+
+    #[test]
+    fn text_and_cards_take_no_clicks() {
+        let f = sample();
+        let r = f.laid()[f.index(LABEL).unwrap()].rect;
+        assert_eq!(f.hit(r.left, r.top), None);
+        assert_eq!(f.hit(395, 5), None, "the card under everything");
+    }
+
+    // ---- Motion ----
+
+    #[test]
+    fn hover_and_press_follow_the_design_timings() {
+        let mut f = sample();
+        let i = f.index(CANCEL).unwrap();
+        let level = |f: &Form| f.looks()[i].levels[0];
+        let (x, y) = centre(&f, CANCEL, Part::Body);
+        assert!(f.pointer_move(x, y, false));
+        assert!(f.moving());
+        f.tick(Duration::from_millis(75), true);
+        assert!((level(&f) - 0.5).abs() < 1e-3);
+        f.tick(Duration::from_millis(75), true);
+        assert_eq!(level(&f), HOVER);
+        assert!(!f.moving());
+        f.pointer_down(x, y);
+        f.tick(Duration::from_millis(90), true);
+        assert_eq!(level(&f), PRESSED);
+        f.pointer_up(x, y);
+        f.pointer_leave(false);
+        f.tick(Duration::from_millis(90), true);
+        assert_eq!(level(&f), HOVER);
+        assert!(!f.tick(Duration::from_millis(120), true));
+        assert_eq!(level(&f), REST);
+    }
+
+    #[test]
+    fn nothing_moves_when_animation_is_off() {
+        let mut f = sample();
+        let (x, y) = centre(&f, SWITCH, Part::Body);
+        f.pointer_move(x, y, false);
+        f.pointer_down(x, y);
+        f.pointer_up(x, y);
+        assert!(!f.tick(Duration::from_millis(1), false));
+        let look = &f.looks()[f.index(SWITCH).unwrap()];
+        assert_eq!((look.levels[0], look.slide), (HOVER, 1.0));
+    }
+
+    #[test]
+    fn the_knob_slides_in_150_ms() {
+        let mut f = sample();
+        f.focus(SWITCH);
+        f.key(Key::Space);
+        let i = f.index(SWITCH).unwrap();
+        f.tick(Duration::from_millis(75), true);
+        assert!((f.looks()[i].slide - 0.5).abs() < 1e-3);
+        assert!(!f.tick(Duration::from_millis(75), true));
+        assert_eq!(f.looks()[i].slide, 1.0);
+    }
+
+    #[test]
+    fn stepper_zones_hover_on_their_own() {
+        let mut f = sample();
+        let i = f.index(EVERY).unwrap();
+        let (x, y) = centre(&f, EVERY, Part::Plus);
+        f.pointer_move(x, y, false);
+        f.tick(Duration::from_secs(1), true);
+        assert_eq!(f.looks()[i].levels, [REST, HOVER, REST]);
+    }
+
+    // ---- Layout ----
+
+    #[test]
+    fn controls_take_the_table_sizes() {
+        let f = sample();
+        let size = |id| {
+            let r = f.laid()[f.index(id).unwrap()].rect;
+            (r.right - r.left, r.bottom - r.top)
+        };
+        assert_eq!(size(SWITCH), (40, 22));
+        assert_eq!(size(DAY_MON), (52, 32));
+        assert_eq!(size(EVERY), (112, 32));
+        assert_eq!(size(FROM), (112, 32));
+        assert_eq!(size(PROFILE), (176, 32));
+        // Checkbox: 18 square, 8, the label; as tall as a body line.
+        assert_eq!(size(CHECK), (18 + 8 + 35, 20));
+        // Segmented: two equal segments, each the wider label and 12 each side (at least 50),
+        // padding 2, gap 2.
+        assert_eq!(size(SOFT_FIRM), (2 + 52 + 2 + 52 + 2, 32));
+        // Buttons: label, 12 + 1 each side; the primary at least 80.
+        assert_eq!(size(SAVE), (80, 32));
+        assert_eq!(size(CANCEL), (42 + 26, 32));
+        // Selectable card: 14 + 20 + 18 + 14.
+        assert_eq!(size(CARD_B), (300, 66));
+        let parts = &f.laid()[f.index(EVERY).unwrap()].parts;
+        assert_eq!(parts[0], (Part::Minus, rect(10, 310, 28, 32)));
+        assert_eq!(parts[1], (Part::Plus, rect(10 + 84, 310, 28, 32)));
+        assert_eq!(parts[2], (Part::Field, rect(38, 310, 56, 32)));
+        let seg = &f.laid()[f.index(SOFT_FIRM).unwrap()].parts;
+        assert_eq!(
+            seg[1],
+            (Part::Segment(1), rect(260 + 2 + 52 + 2, 312, 52, 28))
+        );
+    }
+
+    #[test]
+    fn layout_scales_with_the_dpi() {
+        let mut f = sample();
+        for dpi in [96, 120, 144, 192] {
+            f.lay_out(dpi, &Fixed(dpi));
+            let laid = |id| f.laid()[f.index(id).unwrap()].clone();
+            assert_eq!(
+                laid(SWITCH).rect,
+                rect(px(80, dpi), px(260, dpi), px(40, dpi), px(22, dpi))
+            );
+            assert_eq!(laid(CARD).rect, rect(0, 0, px(400, dpi), px(300, dpi)));
+            let every = laid(EVERY);
+            assert_eq!(every.parts[0].1.right - every.parts[0].1.left, px(28, dpi));
+            assert_eq!(every.rect.bottom - every.rect.top, px(32, dpi));
+            let card = laid(CARD_B).rect;
+            assert_eq!(
+                card.bottom - card.top,
+                2 * px(14, dpi) + px(20, dpi) + px(18, dpi)
+            );
+            // Hit-testing follows: the switch's centre at this DPI is the switch.
+            let (x, y) = centre(&f, SWITCH, Part::Body);
+            assert_eq!(f.hit(x, y), Some((f.index(SWITCH).unwrap(), Part::Body)));
+        }
+    }
+
+    #[test]
+    fn text_wraps_to_the_width_it_is_given() {
+        let mut f = Form::new(vec![Item::new(
+            1,
+            Place::new(0, 0, 60, 0),
+            Kind::text("aaaa bbbb cccc", Style::Caption, Ink::Muted),
+        )]);
+        f.lay_out(96, &Fixed(96));
+        assert_eq!(f.laid()[0].lines, ["aaaa", "bbbb", "cccc"]);
+        assert_eq!(f.laid()[0].rect, rect(0, 0, 60, 3 * 18));
+    }
+
+    #[test]
+    fn an_aside_widens_and_heightens_a_card() {
+        let aside = Aside {
+            w: 150,
+            h: 80,
+            paint: Rc::new(|_, _, _, _| {}),
+        };
+        let mut f = Form::new(vec![Item::new(
+            1,
+            Place::at(0, 0),
+            Kind::Choice {
+                group: 1,
+                title: "ab".into(),
+                note: "abcd".into(),
+                selected: true,
+                aside: Some(aside),
+            },
+        )]);
+        f.lay_out(96, &Fixed(96));
+        assert_eq!(
+            f.laid()[0].rect,
+            rect(0, 0, 16 + 18 + 12 + 28 + 16 + 150 + 16, 14 + 80 + 14)
+        );
+    }
+
+    #[test]
+    fn set_and_set_text_change_values_without_events() {
+        let mut f = sample();
+        assert!(f.set(SWITCH, Value::On(true)));
+        assert!(f.set(FROM, Value::Number(DAY + 30)));
+        assert_eq!(f.value(FROM), Some(Value::Number(30)));
+        assert!(f.set(CARD_A, Value::On(true)));
+        assert_eq!(f.value(CARD_B), Some(Value::On(false)));
+        assert!(!f.set(SWITCH, Value::Number(3)));
+        assert!(f.set_text(LABEL, "Work week"));
+        assert!(!f.set_text(SWITCH, "x"));
+        assert_eq!(f.value(LABEL), None);
+    }
+}

@@ -1,6 +1,6 @@
-//! GDI+ painting for the popup (DESIGN.md §7, §8, §9).
+//! GDI+ painting for the popup and the form kit (DESIGN.md §7, §8, §9).
 //!
-//! Antialiased shapes on a GDI device context, the nudge glyphs and the close × built from
+//! Antialiased shapes and strokes on a GDI device context, the nudge glyphs and the close × built from
 //! circles, rounded rectangles and one polygon, and the timed fill of painted buttons. Glyph
 //! geometry is copied from `assets/design/*.svg` on their 20-unit grid and scaled to the size
 //! asked for, so no image file ships. Colours and sizes come from the caller, which takes them
@@ -12,12 +12,14 @@ use std::time::Duration;
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::HDC;
 use windows::Win32::Graphics::GdiPlus::{
-    FillModeAlternate, GdipAddPathArc, GdipAddPathLine, GdipClosePathFigure, GdipCreateFromHDC,
-    GdipCreatePath, GdipCreatePen1, GdipCreateSolidFill, GdipDeleteBrush, GdipDeleteGraphics,
-    GdipDeletePath, GdipDeletePen, GdipDrawLine, GdipFillEllipse, GdipFillPath, GdipFillRectangle,
-    GdipSetPenEndCap, GdipSetPenStartCap, GdipSetPixelOffsetMode, GdipSetSmoothingMode,
-    GdiplusStartup, GdiplusStartupInput, GpBrush, GpGraphics, GpPath, LineCapRound,
-    PixelOffsetModeHalf, SmoothingModeAntiAlias, UnitPixel,
+    CombineModeReplace, FillModeAlternate, GdipAddPathArc, GdipAddPathLine, GdipClosePathFigure,
+    GdipCreateFromHDC, GdipCreatePath, GdipCreatePen1, GdipCreateSolidFill, GdipDeleteBrush,
+    GdipDeleteGraphics, GdipDeletePath, GdipDeletePen, GdipDrawEllipse, GdipDrawLine,
+    GdipDrawLines, GdipDrawPath, GdipFillEllipse, GdipFillPath, GdipFillRectangle, GdipResetClip,
+    GdipSetClipRect, GdipSetPenEndCap, GdipSetPenLineJoin, GdipSetPenStartCap,
+    GdipSetPixelOffsetMode, GdipSetSmoothingMode, GdiplusStartup, GdiplusStartupInput, GpBrush,
+    GpGraphics, GpPath, GpPen, LineCapRound, LineJoinRound, PixelOffsetModeHalf, PointF,
+    SmoothingModeAntiAlias, UnitPixel,
 };
 
 use super::theme::{CLOSE_INSET, CLOSE_MARK, CLOSE_STROKE, HOVER_IN, HOVER_OUT, PRESS, Palette};
@@ -47,6 +49,12 @@ pub fn startup() {
 pub const fn argb(colour: COLORREF) -> u32 {
     let c = colour.0;
     0xff00_0000 | (c & 0xff) << 16 | (c & 0xff00) | (c >> 16 & 0xff)
+}
+
+/// GDI+ ARGB from a `COLORREF` with `alpha` from 0 (clear) to 1 (opaque).
+pub fn argb_alpha(colour: COLORREF, alpha: f32) -> u32 {
+    let a = (alpha.clamp(0.0, 1.0) * 255.0).round() as u32;
+    a << 24 | (argb(colour) & 0x00ff_ffff)
 }
 
 /// `a` moved toward `b` by `t` (0 to 1), channel by channel.
@@ -113,10 +121,14 @@ impl Canvas {
     }
 
     fn with_brush(&self, colour: COLORREF, fill: impl FnOnce(*mut GpBrush)) {
+        self.with_argb_brush(argb(colour), fill);
+    }
+
+    fn with_argb_brush(&self, argb: u32, fill: impl FnOnce(*mut GpBrush)) {
         let mut brush = std::ptr::null_mut();
         // SAFETY: the brush is created, used and deleted here.
         unsafe {
-            if GdipCreateSolidFill(argb(colour), &mut brush).0 == 0 && !brush.is_null() {
+            if GdipCreateSolidFill(argb, &mut brush).0 == 0 && !brush.is_null() {
                 fill(brush.cast());
                 GdipDeleteBrush(brush.cast());
             }
@@ -124,6 +136,19 @@ impl Canvas {
     }
 
     fn fill_path(&self, colour: COLORREF, build: impl FnOnce(*mut GpPath)) {
+        self.fill_path_argb(argb(colour), build);
+    }
+
+    fn fill_path_argb(&self, argb: u32, build: impl FnOnce(*mut GpPath)) {
+        // SAFETY: `path` is live inside `with_path`; the brush is valid inside its closure.
+        self.with_path(build, |path| {
+            self.with_argb_brush(argb, |brush| unsafe {
+                GdipFillPath(self.g, brush, path);
+            })
+        });
+    }
+
+    fn with_path(&self, build: impl FnOnce(*mut GpPath), then: impl FnOnce(*mut GpPath)) {
         let mut path = std::ptr::null_mut();
         // SAFETY: the path is created, used and deleted here.
         unsafe {
@@ -131,10 +156,24 @@ impl Canvas {
                 return;
             }
             build(path);
-            self.with_brush(colour, |brush| {
-                GdipFillPath(self.g, brush, path);
-            });
+            then(path);
             GdipDeletePath(path);
+        }
+    }
+
+    /// A pen `width` thick with round caps and joins, for the length of `draw`.
+    fn with_pen(&self, colour: COLORREF, width: f32, draw: impl FnOnce(*mut GpPen)) {
+        let mut pen = std::ptr::null_mut();
+        // SAFETY: the pen is created, used and deleted here.
+        unsafe {
+            if GdipCreatePen1(argb(colour), width, UnitPixel, &mut pen).0 != 0 || pen.is_null() {
+                return;
+            }
+            GdipSetPenStartCap(pen, LineCapRound);
+            GdipSetPenEndCap(pen, LineCapRound);
+            GdipSetPenLineJoin(pen, LineJoinRound);
+            draw(pen);
+            GdipDeletePen(pen);
         }
     }
 
@@ -158,31 +197,67 @@ impl Canvas {
         if r <= 0.0 {
             return self.fill_rect(colour, b);
         }
-        let d = 2.0 * r;
-        let (right, bottom) = (b.x + b.w - d, b.y + b.h - d);
-        // SAFETY: `path` is the live path made by `fill_path`.
-        self.fill_path(colour, |path| unsafe {
-            GdipAddPathArc(path, b.x, b.y, d, d, 180.0, 90.0);
-            GdipAddPathArc(path, right, b.y, d, d, 270.0, 90.0);
-            GdipAddPathArc(path, right, bottom, d, d, 0.0, 90.0);
-            GdipAddPathArc(path, b.x, bottom, d, d, 90.0, 90.0);
-            GdipClosePathFigure(path);
+        self.fill_path(colour, |path| round_rect_path(path, b, r));
+    }
+
+    /// As [`Canvas::fill_round_rect`], `alpha` (0 to 1) opaque over what is painted already.
+    pub fn fill_round_rect_alpha(&self, colour: COLORREF, alpha: f32, b: Box2, r: f32) {
+        let r = r.min(b.w / 2.0).min(b.h / 2.0).max(0.0);
+        self.fill_path_argb(argb_alpha(colour, alpha), |path| {
+            round_rect_path(path, b, r)
+        });
+    }
+
+    /// The edge of the round rectangle `b`, `width` thick, all inside `b`, so a 1px edge on a
+    /// whole-pixel box covers whole pixels. The corners follow radius `r` on the outside.
+    pub fn stroke_round_rect(&self, colour: COLORREF, b: Box2, r: f32, width: f32) {
+        let half = width / 2.0;
+        let inner = b.inset(half);
+        let r = (r - half).min(inner.w / 2.0).min(inner.h / 2.0).max(0.0);
+        // SAFETY: `path` and `pen` are live inside their closures.
+        self.with_path(
+            |path| round_rect_path(path, inner, r),
+            |path| {
+                self.with_pen(colour, width, |pen| unsafe {
+                    GdipDrawPath(self.g, pen, path);
+                })
+            },
+        );
+    }
+
+    /// The edge of the circle round (`cx`, `cy`) with outer radius `r`, `width` thick, inside.
+    pub fn stroke_circle(&self, colour: COLORREF, cx: f32, cy: f32, r: f32, width: f32) {
+        let r = (r - width / 2.0).max(0.0);
+        // SAFETY: the pen is valid inside the closure.
+        self.with_pen(colour, width, |pen| unsafe {
+            GdipDrawEllipse(self.g, pen, cx - r, cy - r, 2.0 * r, 2.0 * r);
         });
     }
 
     /// A line `width` thick with round caps.
     pub fn line(&self, colour: COLORREF, width: f32, from: (f32, f32), to: (f32, f32)) {
-        let mut pen = std::ptr::null_mut();
-        // SAFETY: the pen is created, used and deleted here.
-        unsafe {
-            if GdipCreatePen1(argb(colour), width, UnitPixel, &mut pen).0 != 0 || pen.is_null() {
-                return;
-            }
-            GdipSetPenStartCap(pen, LineCapRound);
-            GdipSetPenEndCap(pen, LineCapRound);
+        // SAFETY: the pen is valid inside the closure.
+        self.with_pen(colour, width, |pen| unsafe {
             GdipDrawLine(self.g, pen, from.0, from.1, to.0, to.1);
-            GdipDeletePen(pen);
-        }
+        });
+    }
+
+    /// Joined lines through `points`, `width` thick, with round caps and joins.
+    pub fn polyline(&self, colour: COLORREF, width: f32, points: &[(f32, f32)]) {
+        let points: Vec<PointF> = points.iter().map(|&(x, y)| PointF { X: x, Y: y }).collect();
+        // SAFETY: the pen is valid inside the closure; `points` outlives the call.
+        self.with_pen(colour, width, |pen| unsafe {
+            GdipDrawLines(self.g, pen, points.as_ptr(), points.len() as i32);
+        });
+    }
+
+    /// Runs `draw` with painting cut to `b`.
+    pub fn clipped(&self, b: Box2, draw: impl FnOnce()) {
+        // SAFETY: `self.g` is live; the clip is reset before return.
+        unsafe { GdipSetClipRect(self.g, b.x, b.y, b.w, b.h, CombineModeReplace) };
+        draw();
+        // SAFETY: as above.
+        unsafe { GdipResetClip(self.g) };
     }
 
     /// `glyph` in `colour`, scaled from its 20-unit grid to fill the square `b`.
@@ -248,6 +323,26 @@ impl Drop for Canvas {
     fn drop(&mut self) {
         // SAFETY: made in `new`, deleted once here.
         unsafe { GdipDeleteGraphics(self.g) };
+    }
+}
+
+/// Adds the rectangle `b` with corner radius `r` (at most half a side) to `path`.
+fn round_rect_path(path: *mut GpPath, b: Box2, r: f32) {
+    let (right, bottom) = (b.x + b.w, b.y + b.h);
+    // SAFETY: `path` is a live path, per the callers.
+    unsafe {
+        if r <= 0.0 {
+            GdipAddPathLine(path, b.x, b.y, right, b.y);
+            GdipAddPathLine(path, right, b.y, right, bottom);
+            GdipAddPathLine(path, right, bottom, b.x, bottom);
+        } else {
+            let d = 2.0 * r;
+            GdipAddPathArc(path, b.x, b.y, d, d, 180.0, 90.0);
+            GdipAddPathArc(path, right - d, b.y, d, d, 270.0, 90.0);
+            GdipAddPathArc(path, right - d, bottom - d, d, d, 0.0, 90.0);
+            GdipAddPathArc(path, b.x, bottom - d, d, d, 90.0, 90.0);
+        }
+        GdipClosePathFigure(path);
     }
 }
 
@@ -368,6 +463,8 @@ mod tests {
     #[test]
     fn argb_is_opaque_rgb() {
         assert_eq!(argb(rgb(0xe5484d)), 0xffe5484d);
+        assert_eq!(argb_alpha(rgb(0xe5484d), 0.0), 0x00e5484d);
+        assert_eq!(argb_alpha(rgb(0xe5484d), 0.5), 0x80e5484d);
     }
 
     #[test]
