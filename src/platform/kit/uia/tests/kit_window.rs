@@ -145,6 +145,20 @@ fn a_ui_automation_client_reads_and_drives_a_scrolled_kit_window() {
         let sun = find(&seen, UIA_CheckBoxControlTypeId, "Sun");
         assert!(within(&bounds(&sun), &client));
 
+        // Text a stepper cannot take is refused, and the window lives on.
+        let every = find(&seen, UIA_SpinnerControlTypeId, "Every (minutes)");
+        let value: IUIAutomationValuePattern =
+            every.GetCurrentPatternAs(UIA_ValuePatternId).unwrap();
+        for text in ["é1", "1€", "ab€", "", "08:30"] {
+            assert!(
+                value.SetValue(&windows::core::BSTR::from(text)).is_err(),
+                "{text:?}"
+            );
+        }
+        assert_eq!(value.CurrentValue().unwrap(), "30");
+        value.SetValue(&windows::core::BSTR::from("45")).unwrap();
+        assert_eq!(value.CurrentValue().unwrap(), "45");
+
         // The patterns reach the real form.
         let fri = find(&seen, UIA_CheckBoxControlTypeId, "Fri");
         let toggle: IUIAutomationTogglePattern =

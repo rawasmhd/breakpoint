@@ -38,7 +38,7 @@ use std::mem::ManuallyDrop;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use windows::Win32::Foundation::{
-    E_INVALIDARG, HWND, LPARAM, LRESULT, RECT, VARIANT_FALSE, VARIANT_TRUE, WPARAM,
+    E_FAIL, E_INVALIDARG, HWND, LPARAM, LRESULT, RECT, VARIANT_FALSE, VARIANT_TRUE, WPARAM,
 };
 use windows::Win32::System::Com::SAFEARRAY;
 use windows::Win32::System::Ole::{SafeArrayCreateVector, SafeArrayPutElement};
@@ -127,6 +127,39 @@ pub fn wake_window(hwnd: HWND, wait: bool) {
             let _ = PostMessageW(Some(hwnd), WM_GETOBJECT, WPARAM(0), lparam);
         }
     }
+}
+
+/// The longest text a client may type into a stepper: a number or `HH:mm`, with room for
+/// spaces round it.
+const TYPED_CHARS: usize = 16;
+
+/// What a client typed into a stepper as a number, or as minutes after midnight for a time
+/// stepper; `None` for anything else, whatever its characters or length.
+fn typed_value(text: &str, time: bool) -> Option<i32> {
+    let typed = text.trim();
+    if typed.len() > TYPED_CHARS {
+        return None;
+    }
+    if time {
+        parse_time(typed)
+    } else {
+        parse_number(typed)
+    }
+}
+
+/// Runs a provider method's body. A panic must not cross into UI Automation: from an
+/// `extern "system"` method it would end the process. In a debug build it comes back as
+/// `E_FAIL`; the release build aborts on any panic (`panic = "abort"`), so there the bodies
+/// themselves must not panic.
+fn guard<R>(body: impl FnOnce() -> Result<R>) -> Result<R> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body))
+        .unwrap_or_else(|_| Err(E_FAIL.into()))
+}
+
+/// Runs one of the window's calls into this module, from its window procedure, so a panic in
+/// it ends there, as [`guard`] does for the providers; `None` when it panicked.
+fn quietly<R>(f: impl FnOnce() -> R) -> Option<R> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok()
 }
 
 fn hresult(code: u32) -> Error {
@@ -241,6 +274,10 @@ fn post(hwnd: HWND, source: &'static dyn Source, action: Action, wait: bool) {
 /// Runs the actions posted for `hwnd`, in order, then tells clients what changed. Called on the
 /// window's thread, by [`get_object`] or a test's own wake-up.
 pub fn run_posted(hwnd: HWND) {
+    quietly(|| run_posted_now(hwnd));
+}
+
+fn run_posted_now(hwnd: HWND) {
     let mut last = None;
     loop {
         let next = {
@@ -274,6 +311,15 @@ pub fn get_object(
     lparam: LPARAM,
     source: &'static dyn Source,
 ) -> Option<LRESULT> {
+    quietly(|| object(hwnd, wparam, lparam, source)).flatten()
+}
+
+fn object(
+    hwnd: HWND,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    source: &'static dyn Source,
+) -> Option<LRESULT> {
     match lparam.0 as i32 {
         UiaRootObjectId => {
             if let Some(now) = Snapshot::take(hwnd, source) {
@@ -297,6 +343,10 @@ pub fn get_object(
 /// tells listening clients what changed since the last call: names, toggles, values,
 /// selection, the menu, then the focus. Costs nothing until a client asks for the window.
 pub fn changed(hwnd: HWND, source: &'static dyn Source) {
+    quietly(|| tell(hwnd, source));
+}
+
+fn tell(hwnd: HWND, source: &'static dyn Source) {
     if kept(hwnd).is_none() {
         return;
     }
@@ -632,91 +682,103 @@ impl Element {
 
 impl IRawElementProviderSimple_Impl for Element_Impl {
     fn ProviderOptions(&self) -> Result<ProviderOptions> {
-        Ok(ProviderOptions_ServerSideProvider)
+        guard(|| Ok(ProviderOptions_ServerSideProvider))
     }
 
     fn GetPatternProvider(&self, pattern: UIA_PATTERN_ID) -> Result<IUnknown> {
-        let role = self.with(|_, node| Ok(node.role))?;
-        if Element::offers(role, pattern) {
-            Ok(self.other(self.key).into_interface())
-        } else {
-            none()
-        }
+        guard(|| {
+            let role = self.with(|_, node| Ok(node.role))?;
+            if Element::offers(role, pattern) {
+                Ok(self.other(self.key).into_interface())
+            } else {
+                none()
+            }
+        })
     }
 
     fn GetPropertyValue(&self, id: UIA_PROPERTY_ID) -> Result<VARIANT> {
-        if self.key == Key::Root {
-            // UI Automation asks the root from a thread of its own as it takes the provider
-            // over, so the root answers without the form. The window's frame provider answers
-            // the rest: name, place, focus.
-            return Ok(match id {
-                UIA_ControlTypePropertyId => Var::i32(UIA_WindowControlTypeId.0).give(),
-                _ => VARIANT::default(),
-            });
-        }
-        self.with(|snap, node| {
-            Ok(self
-                .property(snap, node, id)
-                .map_or_else(VARIANT::default, Var::give))
+        guard(|| {
+            if self.key == Key::Root {
+                // UI Automation asks the root from a thread of its own as it takes the provider
+                // over, so the root answers without the form. The window's frame provider answers
+                // the rest: name, place, focus.
+                return Ok(match id {
+                    UIA_ControlTypePropertyId => Var::i32(UIA_WindowControlTypeId.0).give(),
+                    _ => VARIANT::default(),
+                });
+            }
+            self.with(|snap, node| {
+                Ok(self
+                    .property(snap, node, id)
+                    .map_or_else(VARIANT::default, Var::give))
+            })
         })
     }
 
     fn HostRawElementProvider(&self) -> Result<IRawElementProviderSimple> {
-        if self.key == Key::Root {
-            // SAFETY: no pointers.
-            unsafe { UiaHostProviderFromHwnd(self.hwnd()) }
-        } else {
-            none()
-        }
+        guard(|| {
+            if self.key == Key::Root {
+                // SAFETY: no pointers.
+                unsafe { UiaHostProviderFromHwnd(self.hwnd()) }
+            } else {
+                none()
+            }
+        })
     }
 }
 
 impl IRawElementProviderFragment_Impl for Element_Impl {
     fn Navigate(&self, direction: NavigateDirection) -> Result<IRawElementProviderFragment> {
-        let nav = match direction {
-            NavigateDirection_Parent => Nav::Parent,
-            NavigateDirection_NextSibling => Nav::Next,
-            NavigateDirection_PreviousSibling => Nav::Previous,
-            NavigateDirection_FirstChild => Nav::First,
-            NavigateDirection_LastChild => Nav::Last,
-            _ => return none(),
-        };
-        match self.snapshot()?.tree.navigate(self.key, nav) {
-            Some(key) => Ok(self.other(key).into_interface()),
-            None => none(),
-        }
+        guard(|| {
+            let nav = match direction {
+                NavigateDirection_Parent => Nav::Parent,
+                NavigateDirection_NextSibling => Nav::Next,
+                NavigateDirection_PreviousSibling => Nav::Previous,
+                NavigateDirection_FirstChild => Nav::First,
+                NavigateDirection_LastChild => Nav::Last,
+                _ => return none(),
+            };
+            match self.snapshot()?.tree.navigate(self.key, nav) {
+                Some(key) => Ok(self.other(key).into_interface()),
+                None => none(),
+            }
+        })
     }
 
     fn GetRuntimeId(&self) -> Result<*mut SAFEARRAY> {
-        if self.key == Key::Root {
-            // The window's own runtime id serves the root.
-            return Ok(std::ptr::null_mut());
-        }
-        let mut id = vec![UiaAppendRuntimeId as i32];
-        id.extend(self.key.runtime_id());
-        Ok(int_array(&id))
+        guard(|| {
+            if self.key == Key::Root {
+                // The window's own runtime id serves the root.
+                return Ok(std::ptr::null_mut());
+            }
+            let mut id = vec![UiaAppendRuntimeId as i32];
+            id.extend(self.key.runtime_id());
+            Ok(int_array(&id))
+        })
     }
 
     fn BoundingRectangle(&self) -> Result<UiaRect> {
-        if self.key == Key::Root {
-            let mut r = RECT::default();
-            // SAFETY: `r` is a valid out-pointer; a stale window leaves it empty.
-            let _ = unsafe { GetWindowRect(self.hwnd(), &mut r) };
-            return Ok(uia_rect(r));
-        }
-        self.with(|snap, _| Ok(snap.rect(self.key).map(uia_rect).unwrap_or_default()))
+        guard(|| {
+            if self.key == Key::Root {
+                let mut r = RECT::default();
+                // SAFETY: `r` is a valid out-pointer; a stale window leaves it empty.
+                let _ = unsafe { GetWindowRect(self.hwnd(), &mut r) };
+                return Ok(uia_rect(r));
+            }
+            self.with(|snap, _| Ok(snap.rect(self.key).map(uia_rect).unwrap_or_default()))
+        })
     }
 
     fn GetEmbeddedFragmentRoots(&self) -> Result<*mut SAFEARRAY> {
-        Ok(std::ptr::null_mut())
+        guard(|| Ok(std::ptr::null_mut()))
     }
 
     fn SetFocus(&self) -> Result<()> {
-        self.act(Action::Focus(self.key), not_enabled)
+        guard(|| self.act(Action::Focus(self.key), not_enabled))
     }
 
     fn FragmentRoot(&self) -> Result<IRawElementProviderFragmentRoot> {
-        Ok(self.other(Key::Root).into_interface())
+        guard(|| Ok(self.other(Key::Root).into_interface()))
     }
 }
 
@@ -731,104 +793,116 @@ fn uia_rect(r: RECT) -> UiaRect {
 
 impl IRawElementProviderFragmentRoot_Impl for Element_Impl {
     fn ElementProviderFromPoint(&self, x: f64, y: f64) -> Result<IRawElementProviderFragment> {
-        let snap = self.snapshot()?;
-        let (x, y) = (x as i32, y as i32);
-        let hit = snap
-            .tree
-            .nodes()
-            .iter()
-            .filter(|n| n.role != Role::Root && !snap.offscreen(n.key))
-            .filter(|n| {
-                snap.rect(n.key)
-                    .is_some_and(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
-            })
-            .max_by_key(|n| snap.tree.depth(n.key))
-            .map_or(Key::Root, |n| n.key);
-        Ok(self.other(hit).into_interface())
+        guard(|| {
+            let snap = self.snapshot()?;
+            let (x, y) = (x as i32, y as i32);
+            let hit = snap
+                .tree
+                .nodes()
+                .iter()
+                .filter(|n| n.role != Role::Root && !snap.offscreen(n.key))
+                .filter(|n| {
+                    snap.rect(n.key)
+                        .is_some_and(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
+                })
+                .max_by_key(|n| snap.tree.depth(n.key))
+                .map_or(Key::Root, |n| n.key);
+            Ok(self.other(hit).into_interface())
+        })
     }
 
     fn GetFocus(&self) -> Result<IRawElementProviderFragment> {
-        match self.snapshot()?.tree.focus() {
+        guard(|| match self.snapshot()?.tree.focus() {
             Some(key) => Ok(self.other(key).into_interface()),
             None => none(),
-        }
+        })
     }
 }
 
 impl IInvokeProvider_Impl for Element_Impl {
     fn Invoke(&self) -> Result<()> {
-        let role = self.with(|_, node| Ok(node.role))?;
-        if role != Role::Button {
-            return Err(not_enabled());
-        }
-        // SAFETY: the provider lives through the call.
-        let _ = unsafe {
-            UiaRaiseAutomationEvent(
-                &self
-                    .other(self.key)
-                    .into_interface::<IRawElementProviderSimple>(),
-                UIA_Invoke_InvokedEventId,
-            )
-        };
-        // Always later: the press may show a message box, which must not hold the client.
-        post(self.hwnd(), self.source, Action::Invoke(self.key), false);
-        Ok(())
+        guard(|| {
+            let role = self.with(|_, node| Ok(node.role))?;
+            if role != Role::Button {
+                return Err(not_enabled());
+            }
+            // SAFETY: the provider lives through the call.
+            let _ = unsafe {
+                UiaRaiseAutomationEvent(
+                    &self
+                        .other(self.key)
+                        .into_interface::<IRawElementProviderSimple>(),
+                    UIA_Invoke_InvokedEventId,
+                )
+            };
+            // Always later: the press may show a message box, which must not hold the client.
+            post(self.hwnd(), self.source, Action::Invoke(self.key), false);
+            Ok(())
+        })
     }
 }
 
 impl IToggleProvider_Impl for Element_Impl {
     fn Toggle(&self) -> Result<()> {
-        self.act(Action::Toggle(self.key), not_enabled)
+        guard(|| self.act(Action::Toggle(self.key), not_enabled))
     }
 
     fn ToggleState(&self) -> Result<ToggleState> {
-        self.with(|_, node| node.toggle.map(toggle_state).ok_or_else(invalid_operation))
+        guard(|| self.with(|_, node| node.toggle.map(toggle_state).ok_or_else(invalid_operation)))
     }
 }
 
 impl ISelectionProvider_Impl for Element_Impl {
     fn GetSelection(&self) -> Result<*mut SAFEARRAY> {
-        let selected = self.snapshot()?.tree.selection(self.key);
-        Ok(self.array(&selected))
+        guard(|| {
+            let selected = self.snapshot()?.tree.selection(self.key);
+            Ok(self.array(&selected))
+        })
     }
 
     fn CanSelectMultiple(&self) -> Result<BOOL> {
-        Ok(false.into())
+        guard(|| Ok(false.into()))
     }
 
     fn IsSelectionRequired(&self) -> Result<BOOL> {
-        // A segmented toggle always has a segment; a drop-down may show Custom, which no entry is.
-        self.with(|_, node| Ok((node.role == Role::RadioGroup).into()))
+        guard(|| {
+            // A segmented toggle always has a segment; a drop-down may show Custom, which no entry is.
+            self.with(|_, node| Ok((node.role == Role::RadioGroup).into()))
+        })
     }
 }
 
 impl ISelectionItemProvider_Impl for Element_Impl {
     fn Select(&self) -> Result<()> {
-        self.act(Action::Select(self.key), not_enabled)
+        guard(|| self.act(Action::Select(self.key), not_enabled))
     }
 
     fn AddToSelection(&self) -> Result<()> {
-        // One selection only: adding is selecting, and only the selected one may be "added".
-        match self.with(|_, node| Ok(node.selected))? {
-            Some(true) => Ok(()),
-            _ => Err(invalid_operation()),
-        }
+        guard(|| {
+            // One selection only: adding is selecting, and only the selected one may be "added".
+            match self.with(|_, node| Ok(node.selected))? {
+                Some(true) => Ok(()),
+                _ => Err(invalid_operation()),
+            }
+        })
     }
 
     fn RemoveFromSelection(&self) -> Result<()> {
-        match self.with(|_, node| Ok(node.selected))? {
+        guard(|| match self.with(|_, node| Ok(node.selected))? {
             Some(false) => Ok(()),
             _ => Err(invalid_operation()),
-        }
+        })
     }
 
     fn IsSelected(&self) -> Result<BOOL> {
-        self.with(|_, node| Ok((node.selected == Some(true)).into()))
+        guard(|| self.with(|_, node| Ok((node.selected == Some(true)).into())))
     }
 
     fn SelectionContainer(&self) -> Result<IRawElementProviderSimple> {
-        let parent = self.with(|_, node| node.parent.ok_or_else(not_available))?;
-        Ok(self.other(parent).into_interface())
+        guard(|| {
+            let parent = self.with(|_, node| node.parent.ok_or_else(not_available))?;
+            Ok(self.other(parent).into_interface())
+        })
     }
 }
 
@@ -840,82 +914,89 @@ impl Element_Impl {
 
 impl IRangeValueProvider_Impl for Element_Impl {
     fn SetValue(&self, value: f64) -> Result<()> {
-        let range = self.range()?;
-        if !(range.min..=range.max).contains(&value) {
-            return Err(E_INVALIDARG.into());
-        }
-        self.act(Action::SetNumber(self.key, value.round() as i32), || {
-            E_INVALIDARG.into()
+        guard(|| {
+            let range = self.range()?;
+            if !(range.min..=range.max).contains(&value) {
+                return Err(E_INVALIDARG.into());
+            }
+            self.act(Action::SetNumber(self.key, value.round() as i32), || {
+                E_INVALIDARG.into()
+            })
         })
     }
 
     fn Value(&self) -> Result<f64> {
-        Ok(self.range()?.value)
+        guard(|| Ok(self.range()?.value))
     }
 
     fn IsReadOnly(&self) -> Result<BOOL> {
-        Ok(false.into())
+        guard(|| Ok(false.into()))
     }
 
     fn Maximum(&self) -> Result<f64> {
-        Ok(self.range()?.max)
+        guard(|| Ok(self.range()?.max))
     }
 
     fn Minimum(&self) -> Result<f64> {
-        Ok(self.range()?.min)
+        guard(|| Ok(self.range()?.min))
     }
 
     fn LargeChange(&self) -> Result<f64> {
-        Ok(self.range()?.large)
+        guard(|| Ok(self.range()?.large))
     }
 
     fn SmallChange(&self) -> Result<f64> {
-        Ok(self.range()?.small)
+        guard(|| Ok(self.range()?.small))
     }
 }
 
 impl IValueProvider_Impl for Element_Impl {
     fn SetValue(&self, value: &PCWSTR) -> Result<()> {
-        if self.with(|_, node| Ok(node.role))? != Role::Spinner {
-            return Err(not_enabled());
-        }
-        // SAFETY: UI Automation passes a valid string, or null.
-        let text = if value.is_null() {
-            String::new()
-        } else {
-            unsafe { value.to_string() }.map_err(|_| Error::from(E_INVALIDARG))?
-        };
-        // Checked here too, for a call that is posted and cannot fail later.
-        let typed = text.trim();
-        if parse_number(typed).is_none() && parse_time(typed).is_none() {
-            return Err(E_INVALIDARG.into());
-        }
-        self.act(Action::Type(self.key, text), || E_INVALIDARG.into())
+        guard(|| {
+            let (role, time) = self.with(|_, node| Ok((node.role, node.time)))?;
+            if role != Role::Spinner {
+                return Err(not_enabled());
+            }
+            // SAFETY: UI Automation passes a valid string, or null.
+            let text = if value.is_null() {
+                String::new()
+            } else {
+                unsafe { value.to_string() }.map_err(|_| Error::from(E_INVALIDARG))?
+            };
+            // Any string may come: check it here, also for a call that is sent to the window's
+            // thread and cannot fail later.
+            if typed_value(&text, time).is_none() {
+                return Err(E_INVALIDARG.into());
+            }
+            self.act(Action::Type(self.key, text), || E_INVALIDARG.into())
+        })
     }
 
     fn Value(&self) -> Result<BSTR> {
-        self.with(|_, node| Ok(BSTR::from(node.value.as_deref().unwrap_or_default())))
+        guard(|| self.with(|_, node| Ok(BSTR::from(node.value.as_deref().unwrap_or_default()))))
     }
 
     fn IsReadOnly(&self) -> Result<BOOL> {
-        self.with(|_, node| Ok((node.role != Role::Spinner).into()))
+        guard(|| self.with(|_, node| Ok((node.role != Role::Spinner).into())))
     }
 }
 
 impl IExpandCollapseProvider_Impl for Element_Impl {
     fn Expand(&self) -> Result<()> {
-        self.act(Action::Expand(self.key), not_enabled)
+        guard(|| self.act(Action::Expand(self.key), not_enabled))
     }
 
     fn Collapse(&self) -> Result<()> {
-        self.act(Action::Collapse(self.key), not_enabled)
+        guard(|| self.act(Action::Collapse(self.key), not_enabled))
     }
 
     fn ExpandCollapseState(&self) -> Result<ExpandCollapseState> {
-        self.with(|_, node| {
-            node.expanded
-                .map(expand_state)
-                .ok_or_else(invalid_operation)
+        guard(|| {
+            self.with(|_, node| {
+                node.expanded
+                    .map(expand_state)
+                    .ok_or_else(invalid_operation)
+            })
         })
     }
 }

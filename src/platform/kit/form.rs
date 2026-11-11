@@ -1120,8 +1120,12 @@ pub fn parse_number(text: &str) -> Option<i32> {
 }
 
 /// A typed time as minutes after midnight: `8`, `08`, `830`, `0830`, `8:30` and `08:30` all
-/// work. `None` for anything that is not a time of day.
+/// work. `None` for anything that is not a time of day, such as text that is not ASCII: a
+/// screen reader can hand over any string, and the byte slices below need ASCII.
 pub fn parse_time(text: &str) -> Option<i32> {
+    if !text.is_ascii() {
+        return None;
+    }
     let num = |s: &str| {
         (!s.is_empty() && s.len() <= 2)
             .then(|| parse_number(s))
@@ -2150,6 +2154,20 @@ mod tests {
         f.key(Key::Char('4'));
         f.key(Key::Char('0'));
         assert_eq!(f.key(Key::Up), [Event::Changed(EVERY, Value::Number(41))]);
+    }
+
+    /// A screen reader can hand over any string; none may panic, as a byte slice through a
+    /// character would.
+    #[test]
+    fn any_text_parses_or_is_refused_without_a_panic() {
+        let long = "1".repeat(10_000);
+        for text in [
+            "é1", "1€", "ab€", "€", "1é3", "é:30", "8:€", "١٢", "", " ", ":", "::", "8:", ":30",
+            "12a", "-5", "+5", "1 2", "08:30:00", &long,
+        ] {
+            assert_eq!(parse_time(text), None, "{text:?} as a time");
+            assert_eq!(parse_number(text), None, "{text:?} as a number");
+        }
     }
 
     #[test]

@@ -1277,10 +1277,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             WM_GETOBJECT => uia::get_object(hwnd, wparam, lparam, &KIT)
                 .unwrap_or_else(|| DefWindowProcW(hwnd, msg, wparam, lparam)),
             WM_NCDESTROY => {
-                uia::gone(hwnd);
                 let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut RefCell<Host>;
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                // With the state out of reach, no provider can take a snapshot again: a client
+                // that still holds one hears the element is gone.
+                uia::gone(hwnd);
                 if !p.is_null() {
-                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                     let host = Box::from_raw(p);
                     if let Some(menu) = host.borrow().menu {
                         let _ = DestroyWindow(menu);

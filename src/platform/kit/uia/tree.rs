@@ -177,6 +177,8 @@ pub struct Node {
     pub range: Option<Range>,
     pub value: Option<String>,
     pub expanded: Option<bool>,
+    /// A time stepper: its value is a time of day, typed as `8:30`.
+    pub time: bool,
     /// Place in its set, from 1, and the set's size: radio buttons and menu entries.
     pub set: Option<(usize, usize)>,
 }
@@ -200,6 +202,7 @@ impl Node {
             range: None,
             value: None,
             expanded: None,
+            time: false,
             set: None,
         }
     }
@@ -873,6 +876,7 @@ impl<'a> Builder<'a> {
                 });
             }
             Kind::Time { minutes, step } => {
+                node.time = true;
                 node.value = Some(look.edit.clone().unwrap_or_else(|| time_text(*minutes)));
                 node.range = Some(Range {
                     value: f64::from(*minutes),

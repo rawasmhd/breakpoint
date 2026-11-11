@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use breakpoint::core::config::Config;
 use breakpoint::core::settings::Form as Settings;
 use breakpoint::core::wizard::Picks;
-use windows::Win32::Foundation::{E_INVALIDARG, HWND, RECT};
+use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC};
 use windows::Win32::System::Ole::{SafeArrayDestroy, SafeArrayGetElement, SafeArrayGetUBound};
 use windows::Win32::System::Variant::{VARIANT, VT_ARRAY, VT_BOOL, VT_BSTR, VT_I4, VT_UNKNOWN};
@@ -960,3 +960,112 @@ fn a_gone_window_says_so() {
 
 mod client;
 mod kit_window;
+
+// ---- Text from anywhere, and panics ----
+
+/// Strings a client may hand to a stepper: none parses, none panics, the value stays.
+const BAD_TEXT: [&str; 12] = [
+    "é1", "1€", "ab€", "€", "١٢", "", "   ", "12a", "-5", "1 2", "08:30:00", "8:€",
+];
+
+#[test]
+fn set_value_refuses_any_text_that_is_not_a_number_or_time() {
+    let form = settings();
+    let t = tree(&form);
+    let _root = root(form);
+    let long: Vec<u16> = "1".repeat(10_000).encode_utf16().chain([0]).collect();
+    for (name, shown) in [("Every (minutes)", "30"), ("Work hours", "08:00")] {
+        let spinner = provider(find(&t, Role::Spinner, name));
+        let value: IValueProvider = pattern(&spinner, UIA_ValuePatternId).unwrap();
+        for text in BAD_TEXT
+            .iter()
+            .map(|s| s.encode_utf16().chain([0]).collect::<Vec<u16>>())
+            .chain([long.clone()])
+        {
+            // SAFETY: a live provider; a NUL-ended string that lives through the call.
+            let err = unsafe { value.SetValue(PCWSTR(text.as_ptr())) }.unwrap_err();
+            assert_eq!(
+                err.code(),
+                E_INVALIDARG,
+                "{name}: {}",
+                String::from_utf16_lossy(&text)
+            );
+            // SAFETY: as above.
+            assert_eq!(
+                unsafe { value.Value() }.unwrap(),
+                shown,
+                "{name} keeps its value"
+            );
+        }
+    }
+    // A time is no number, and a number past a day is no time.
+    let every = provider(find(&t, Role::Spinner, "Every (minutes)"));
+    let value: IValueProvider = pattern(&every, UIA_ValuePatternId).unwrap();
+    // SAFETY: a live provider and a static string.
+    let err = unsafe { value.SetValue(windows::core::w!("8:30")) }.unwrap_err();
+    assert_eq!(err.code(), E_INVALIDARG);
+}
+
+#[test]
+fn a_panic_in_a_provider_body_comes_back_as_an_error() {
+    let caught = guard(|| -> windows::core::Result<()> { panic!("a provider body") });
+    assert_eq!(caught.unwrap_err().code(), E_FAIL);
+    assert_eq!(quietly(|| -> i32 { panic!("a window call") }), None);
+    assert_eq!(quietly(|| 7), Some(7));
+}
+
+/// A window whose tree panics, for the guard round each provider method.
+struct Broken;
+
+impl Source for Broken {
+    fn tree(&self, _: HWND) -> Option<Tree> {
+        panic!("a tree that cannot be built")
+    }
+
+    fn act(&self, _: HWND, _: Action) -> bool {
+        panic!("an action that cannot be done")
+    }
+
+    fn on_screen(&self, _: HWND, r: RECT) -> Option<RECT> {
+        Some(r)
+    }
+
+    fn on_thread(&self, _: HWND) -> bool {
+        true
+    }
+}
+
+static BROKEN: Broken = Broken;
+
+#[test]
+fn a_panic_under_a_provider_call_does_not_reach_ui_automation() {
+    let p: IRawElementProviderSimple =
+        Element::new(HWND::default(), &BROKEN, Key::Item(3)).into_interface();
+    // SAFETY: a live provider over a broken window.
+    let err = unsafe { p.GetPropertyValue(UIA_NamePropertyId) }
+        .err()
+        .expect("an error");
+    assert_eq!(err.code(), E_FAIL);
+    let fragment: IRawElementProviderFragment = p.cast().unwrap();
+    // SAFETY: as above.
+    unsafe {
+        assert_eq!(fragment.SetFocus().unwrap_err().code(), E_FAIL);
+        assert_eq!(
+            fragment
+                .Navigate(NavigateDirection_Parent)
+                .unwrap_err()
+                .code(),
+            E_FAIL
+        );
+    }
+    assert_eq!(
+        get_object(
+            HWND::default(),
+            WPARAM(0),
+            LPARAM(UiaRootObjectId as isize),
+            &BROKEN
+        ),
+        None,
+        "the window procedure goes on"
+    );
+}
