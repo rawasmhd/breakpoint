@@ -4,9 +4,6 @@
 //! a colour or size literal. Sizes are at 96 DPI; [`px`] scales them for a monitor. The popup
 //! follows the Windows app theme ([`app_theme`]); the dialogs stay [`Theme::Light`].
 
-// The popup (#67) and the dialogs (#68) adopt this module; until then most of it is unused.
-#![allow(dead_code)]
-
 use std::time::Duration;
 
 use windows::Win32::Foundation::{COLORREF, ERROR_SUCCESS, LPARAM};
@@ -137,13 +134,8 @@ pub const SPACE_8: i32 = 32;
 
 /// Buttons and the profile options.
 pub const RADIUS_SM: i32 = 4;
-/// The popup window.
-pub const RADIUS_MD: i32 = 8;
-
-/// `radius-full`: the corner radius that makes a shape `height` tall fully round.
-pub const fn radius_full(height: i32) -> i32 {
-    height / 2
-}
+// `radius-md` (the popup) comes from DWM (`DWMWCP_ROUND`), and `radius-full` is half a
+// shape's height, so neither needs a const here.
 
 /// Popup width. Height follows the content.
 pub const SIZE_POPUP: i32 = 360;
@@ -397,10 +389,6 @@ impl Fonts {
         Fonts { dpi, fonts }
     }
 
-    pub fn dpi(&self) -> u32 {
-        self.dpi
-    }
-
     pub fn get(&self, style: Style) -> HFONT {
         self.fonts[style as usize]
     }
@@ -539,7 +527,7 @@ mod tests {
         assert_eq!(cache.at(96).get(Style::Body), first);
         let scaled = cache.at(144).get(Style::Body);
         assert_ne!(scaled, first);
-        assert_eq!(cache.retired.as_ref().map(Fonts::dpi), Some(96));
+        assert_eq!(cache.retired.as_ref().map(|f| f.dpi), Some(96));
     }
 
     #[test]
