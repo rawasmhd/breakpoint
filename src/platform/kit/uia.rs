@@ -74,8 +74,8 @@ pub trait Source: Sync {
     /// A rectangle in the form's pixels ([`Area::Form`]) on screen, scrolling included.
     fn to_screen(&self, hwnd: HWND, r: RECT) -> RECT;
 
-    /// The part of the screen where the form shows, to tell what is scrolled out of view.
-    fn view(&self, hwnd: HWND) -> RECT;
+    /// Whether a rectangle in the form's pixels shows, not scrolled out of view.
+    fn shown(&self, hwnd: HWND, r: RECT) -> bool;
 
     /// Whether the window has the keyboard focus.
     fn has_focus(&self, hwnd: HWND) -> bool {
@@ -155,12 +155,11 @@ fn none<T>() -> Result<T> {
 // ---- Snapshots ----
 
 /// The tree, with what else a provider reads that needs the window's thread: each element's
-/// rectangle on screen, where the form shows, and whether the window has the focus.
+/// rectangle on screen and whether it shows, and whether the window has the focus.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub tree: Tree,
-    screen: HashMap<Key, RECT>,
-    view: RECT,
+    screen: HashMap<Key, (RECT, bool)>,
     focused: bool,
 }
 
@@ -173,33 +172,25 @@ impl Snapshot {
             .iter()
             .filter_map(|n| match n.area {
                 Area::None => None,
-                Area::Form(r) => Some((n.key, source.to_screen(hwnd, r))),
-                Area::Screen(r) => Some((n.key, r)),
+                Area::Form(r) => Some((n.key, (source.to_screen(hwnd, r), source.shown(hwnd, r)))),
+                // The open menu's entries.
+                Area::Screen(r) => Some((n.key, (r, true))),
             })
             .collect();
         Some(Snapshot {
             tree,
             screen,
-            view: source.view(hwnd),
             focused: source.has_focus(hwnd),
         })
     }
 
     fn rect(&self, key: Key) -> Option<RECT> {
-        self.screen.get(&key).copied()
+        self.screen.get(&key).map(|&(r, _)| r)
     }
 
-    /// Off screen: nowhere, or outside the part of the screen where the form shows. A menu
-    /// entry is on screen while its menu is open.
+    /// Off screen: nowhere, such as a closed menu, or scrolled out of view.
     fn offscreen(&self, key: Key) -> bool {
-        let v = self.view;
-        match (self.tree.get(key).map(|n| n.area), self.rect(key)) {
-            (Some(Area::Screen(_)), _) => false,
-            (_, Some(r)) => {
-                r.right <= v.left || r.left >= v.right || r.bottom <= v.top || r.top >= v.bottom
-            }
-            _ => true,
-        }
+        self.screen.get(&key).is_none_or(|&(_, shown)| !shown)
     }
 }
 

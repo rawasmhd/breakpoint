@@ -525,8 +525,9 @@ impl Source for Fake {
         }
     }
 
-    fn view(&self, _: HWND) -> RECT {
-        rect(ORIGIN.0, ORIGIN.1, 2000, 2000)
+    fn shown(&self, _: HWND, r: RECT) -> bool {
+        // As if the window were 600 tall and scrolled to its top.
+        r.top < 600
     }
 
     fn has_focus(&self, _: HWND) -> bool {
@@ -726,7 +727,8 @@ fn the_providers_give_names_types_and_relations() {
         prop(&switch, UIA_HasKeyboardFocusPropertyId),
         Got::Bool(false)
     );
-    assert_eq!(prop(&switch, UIA_IsOffscreenPropertyId), Got::Bool(false));
+    // The fake shows the top 600 pixels; the General card is further down.
+    assert_eq!(prop(&switch, UIA_IsOffscreenPropertyId), Got::Bool(true));
     assert_eq!(
         prop(&switch, UIA_HelpTextPropertyId),
         Got::Str("breakpoint starts in the tray when you sign in.".into())
@@ -749,6 +751,7 @@ fn the_providers_give_names_types_and_relations() {
     let sun = provider(find(&t, Role::CheckBox, "Sun"));
     assert_eq!(prop(&sun, UIA_HasKeyboardFocusPropertyId), Got::Bool(true));
     assert_eq!(prop(&sun, UIA_LocalizedControlTypePropertyId), Got::Empty);
+    assert_eq!(prop(&sun, UIA_IsOffscreenPropertyId), Got::Bool(false));
     let heading = provider(find(&t, Role::Text, "Work week"));
     assert_eq!(
         prop(&heading, UIA_HeadingLevelPropertyId),
