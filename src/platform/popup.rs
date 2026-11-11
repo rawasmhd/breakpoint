@@ -1,117 +1,455 @@
-//! The nudge popup window.
+//! The nudge popup window (SPEC §6, DESIGN.md §6).
 //!
 //! One window for the life of the app, hidden between occurrences (SPEC §6: at most one popup on
 //! screen). It sits bottom-right of the primary monitor's work area, just above the tray, always
 //! on top, and never takes focus: `WS_EX_NOACTIVATE`, `SW_SHOWNOACTIVATE` and `MA_NOACTIVATE`.
-//! It carries the prompt's title and line, a riding Water line if any, a live away countdown the
-//! app refreshes every second, and the Snooze 5 min and Skip buttons (Skip only after the snooze).
+//!
+//! There is no caption and there are no child windows. The whole client area is painted in
+//! `WM_PAINT`, double-buffered: shapes with GDI+ ([`super::paint`]), text with GDI in the theme
+//! fonts. The header, the close ×, Snooze 5 min and Skip are painted too, with hover and press
+//! fills from mouse tracking. Every colour, size, font and timing comes from [`super::theme`].
+//!
 //! Button presses are posted to the owner window as messages, so the app reacts from its own
-//! window procedure rather than from inside this one. Water alone uses the same window: the title
-//! only, silent, hiding itself after a few seconds.
+//! window procedure rather than from inside this one. Water alone and the bad-config notice use
+//! the same window.
 
-use std::cell::Cell;
+use std::cell::RefCell;
+use std::time::{Duration, Instant};
 
-use breakpoint::core::scheduler::{Prompt, WATER_ALONE_FOR, WATER_LINE, WATER_TITLE};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use breakpoint::core::scheduler::{
+    Nudge, Prompt, WATER_ALONE_FOR, WATER_LINE, WATER_TITLE, countdown_text,
+};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
+};
 use windows::Win32::Graphics::Gdi::{
-    COLOR_WINDOW, CreateFontIndirectW, DeleteObject, FW_BOLD, GetMonitorInfoW, GetSysColor,
-    GetSysColorBrush, HDC, HFONT, HMONITOR, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
-    MonitorFromPoint, SetBkColor,
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
+    EndPaint, GetDC, GetMonitorInfoW, GetTextExtentPoint32W, GetTextMetricsW, HDC, HMONITOR,
+    InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, PAINTSTRUCT,
+    ReleaseDC, SRCCOPY, SelectObject, SetBkMode, SetTextAlign, SetTextColor, TA_BASELINE, TA_LEFT,
+    TEXTMETRICW, TRANSPARENT, TextOutW,
 };
 use windows::Win32::Media::Audio::{PlaySoundW, SND_ALIAS, SND_ASYNC};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::HiDpi::{
-    AdjustWindowRectExForDpi, GetDpiForMonitor, MDT_EFFECTIVE_DPI, SystemParametersInfoForDpi,
+use windows::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BN_CLICKED, BS_PUSHBUTTON, CreateWindowExW, DefWindowProcW, GWLP_USERDATA, GetDlgItem,
-    GetWindowLongPtrW, HMENU, HWND_TOPMOST, IDC_ARROW, IsWindowVisible, KillTimer, LoadCursorW,
-    MA_NOACTIVATE, NONCLIENTMETRICSW, PostMessageW, RegisterClassW, SPI_GETNONCLIENTMETRICS,
-    SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SWP_SHOWWINDOW, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
-    ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC,
-    WM_DPICHANGED, WM_GETFONT, WM_MOUSEACTIVATE, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_CAPTION,
-    WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_SYSMENU, WS_TABSTOP,
-    WS_VISIBLE,
+    CS_DROPSHADOW, CreateWindowExW, DefWindowProcW, HWND_TOPMOST, IDC_ARROW, IsWindowVisible,
+    KillTimer, LWA_ALPHA, LoadCursorW, MA_NOACTIVATE, PostMessageW, RegisterClassW, SW_HIDE,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    SetLayeredWindowAttributes, SetTimer, SetWindowPos, ShowWindow,
+    USER_DEFAULT_SCREEN_DPI as BASE_DPI, WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_CLOSE,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
+    WM_PAINT, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
-use windows::core::{HSTRING, Result, w};
+use windows::core::{Result, w};
+
+use super::paint::{
+    self, Box2, CLOSE_OVERHANG, Canvas, FRAME, Glyph, HAIRLINE, HOVER, PRESS_DROP, PRESSED, REST,
+};
+use super::theme::{
+    self, BAR_GAP, CLOSE_HIT, FADE_IN, FADE_OUT, FontCache, Fonts, POPUP_HEADER, Palette,
+    RADIUS_SM, SIZE_BAR, SIZE_BUTTON, SIZE_GLYPH, SIZE_GLYPH_INLINE, SIZE_MARK, SIZE_POPUP,
+    SPACE_1, SPACE_2, SPACE_3, SPACE_4, Style, Theme, WATER_ALONE_PAD_X, WATER_ALONE_PAD_Y, px,
+};
 
 /// Posted to the owner window when the user presses Skip.
 pub const WM_POPUP_SKIP: u32 = WM_APP + 1;
 /// Posted to the owner window when the user presses Snooze 5 min.
 pub const WM_POPUP_SNOOZE: u32 = WM_APP + 2;
 
-const ID_TITLE: i32 = 1;
-const ID_LINE: i32 = 2;
-const ID_SKIP: i32 = 3;
-const ID_COUNTDOWN: i32 = 4;
-const ID_SNOOZE: i32 = 5;
-const ID_NOTICE: i32 = 6;
-const ID_WATER: i32 = 7;
-
 /// Hides Water alone once it has been on screen for [`WATER_ALONE_FOR`].
 const WATER_TIMER: usize = 1;
+/// Runs the fade and the button fills, one repaint per [`FRAME`], while any of them moves.
+const FRAME_TIMER: usize = 2;
 
 /// The bad-config notice (SPEC §10.1).
 const NOTICE: &str = "breakpoint couldn't read config.json and is using the defaults. \
                       Saving from Settings will replace the file.";
+/// The app's name in the popup header, lowercase (DESIGN.md §2).
+const APP_NAME: &str = "breakpoint";
+const SNOOZE_LABEL: &str = "Snooze 5 min";
+const SKIP_LABEL: &str = "Skip";
 
-const STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_POPUP.0 | WS_CAPTION.0 | WS_SYSMENU.0);
 const EX_STYLE: WINDOW_EX_STYLE =
-    WINDOW_EX_STYLE(WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0);
+    WINDOW_EX_STYLE(WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0 | WS_EX_LAYERED.0);
 
-/// Layout at 96 DPI, scaled for the monitor: the client size, then each child's rectangle, as
-/// they sit without the riding Water line.
-const CLIENT: (i32, i32) = (320, 148);
-const CHILDREN: [(i32, [i32; 4]); 7] = [
-    (ID_TITLE, [14, 12, 292, 24]),
-    (ID_LINE, [14, 40, 292, 36]),
-    (ID_WATER, [14, 80, 292, 20]),
-    (ID_COUNTDOWN, [14, 80, 292, 20]),
-    (ID_SNOOZE, [134, 108, 90, 28]),
-    (ID_SKIP, [230, 108, 76, 28]),
-    (ID_NOTICE, [14, 12, 292, 124]),
-];
-/// The children that make up a nudge's popup, Water line aside; the notice hides them all.
-const PROMPT: [i32; 5] = [ID_TITLE, ID_LINE, ID_COUNTDOWN, ID_SNOOZE, ID_SKIP];
-/// How far the riding Water line pushes the children below it down, and the popup taller.
-const WATER_ROW: i32 = 24;
-const BELOW_WATER: [i32; 3] = [ID_COUNTDOWN, ID_SNOOZE, ID_SKIP];
-/// The client height of Water alone: its title and the margins around it.
-const WATER_ALONE_HEIGHT: i32 = 48;
-/// The gap between the popup and the work area's bottom-right corner, at 96 DPI.
-const MARGIN: i32 = 12;
+// ---- What the popup holds, and where it goes ----
 
-/// What the popup holds, which decides its height and where its children sit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Shape {
-    Prompt { water: bool },
+/// What the popup shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Content {
+    Prompt {
+        nudge: Nudge,
+        title: &'static str,
+        line: String,
+        water: bool,
+        snooze: bool,
+    },
     WaterAlone,
     Notice,
 }
 
-impl Shape {
-    fn height(self) -> i32 {
-        match self {
-            Shape::Prompt { water: true } => CLIENT.1 + WATER_ROW,
-            Shape::WaterAlone => WATER_ALONE_HEIGHT,
-            Shape::Prompt { water: false } | Shape::Notice => CLIENT.1,
-        }
-    }
+/// The parts that answer the pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Part {
+    Close,
+    Snooze,
+    Skip,
+}
 
-    /// How far child `id` moves down from its place in [`CHILDREN`].
-    fn shift(self, id: i32) -> i32 {
-        if self == (Shape::Prompt { water: true }) && BELOW_WATER.contains(&id) {
-            WATER_ROW
-        } else {
-            0
+impl Part {
+    const ALL: [Part; 3] = [Part::Close, Part::Snooze, Part::Skip];
+
+    fn label(self) -> Option<&'static str> {
+        match self {
+            Part::Close => None,
+            Part::Snooze => Some(SNOOZE_LABEL),
+            Part::Skip => Some(SKIP_LABEL),
         }
     }
 }
 
+/// Whose colour a text item takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ink {
+    Main,
+    Muted,
+}
+
+/// One thing to paint, in client pixels at the layout's DPI.
+#[derive(Debug, Clone, PartialEq)]
+enum Item {
+    /// The breakpoint dot in the header.
+    Dot(RECT),
+    Glyph(Glyph, RECT),
+    /// One line of text; `top` is the top of its line box, `Style::line_height` tall.
+    Text {
+        style: Style,
+        ink: Ink,
+        x: i32,
+        top: i32,
+        text: String,
+    },
+    /// The countdown bar's track; the fill follows the away time at paint.
+    Bar(RECT),
+    /// The countdown line's box; its text follows the away time at paint.
+    Countdown {
+        x: i32,
+        top: i32,
+    },
+    Button(Part, RECT),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Layout {
+    width: i32,
+    height: i32,
+    items: Vec<Item>,
+}
+
+impl Layout {
+    fn hit(&self, x: i32, y: i32) -> Option<Part> {
+        self.items.iter().find_map(|item| match item {
+            Item::Button(part, r) if x >= r.left && x < r.right && y >= r.top && y < r.bottom => {
+                Some(*part)
+            }
+            _ => None,
+        })
+    }
+}
+
+/// Text widths, so the layout can wrap lines and size buttons.
+trait Measure {
+    fn width(&self, style: Style, text: &str) -> i32;
+}
+
+fn rect(x: i32, y: i32, w: i32, h: i32) -> RECT {
+    RECT {
+        left: x,
+        top: y,
+        right: x + w,
+        bottom: y + h,
+    }
+}
+
+/// `text` broken at spaces into lines no wider than `width`. A word wider than `width` gets a
+/// line of its own.
+fn wrap(text: &str, width: i32, fits: impl Fn(&str) -> i32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let longer = if line.is_empty() {
+            word.to_owned()
+        } else {
+            format!("{line} {word}")
+        };
+        if line.is_empty() || fits(&longer) <= width {
+            line = longer;
+        } else {
+            lines.push(std::mem::replace(&mut line, word.to_owned()));
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// Lays out `content` at `dpi` (DESIGN.md §6, Popup).
+fn layout(content: &Content, dpi: u32, m: &impl Measure) -> Layout {
+    let s = |v: i32| px(v, dpi);
+    let lh = |style: Style| s(style.line_height());
+    let width = s(SIZE_POPUP);
+    let pad = s(SPACE_4);
+    let mut items = Vec::new();
+
+    let text = |items: &mut Vec<Item>, style, ink, x, top, text: &str| {
+        items.push(Item::Text {
+            style,
+            ink,
+            x,
+            top,
+            text: text.to_owned(),
+        })
+    };
+    // Lines of `body` from `top`, wrapped to the space right of `x`; returns the height used.
+    let paragraph = |items: &mut Vec<Item>, ink, x: i32, top: i32, words: &str| {
+        let lines = wrap(words, width - pad - x, |t| m.width(Style::Body, t));
+        for (i, line) in lines.iter().enumerate() {
+            text(
+                items,
+                Style::Body,
+                ink,
+                x,
+                top + i as i32 * lh(Style::Body),
+                line,
+            );
+        }
+        lines.len() as i32 * lh(Style::Body)
+    };
+    // The header row at `top`: dot, "breakpoint", close ×.
+    let header = |items: &mut Vec<Item>, top: i32| {
+        let row = s(POPUP_HEADER);
+        let mark = s(SIZE_MARK);
+        items.push(Item::Dot(rect(pad, top + (row - mark) / 2, mark, mark)));
+        let x = pad + mark + s(SPACE_2);
+        text(
+            items,
+            Style::Caption,
+            Ink::Muted,
+            x,
+            top + (row - lh(Style::Caption)) / 2,
+            APP_NAME,
+        );
+        let hit = s(CLOSE_HIT);
+        let right = width - pad + s(CLOSE_OVERHANG);
+        items.push(Item::Button(
+            Part::Close,
+            rect(right - hit, top + (row - hit) / 2, hit, hit),
+        ));
+        top + row
+    };
+
+    let height = match content {
+        Content::WaterAlone => {
+            let (pad_x, pad_y) = (s(WATER_ALONE_PAD_X), s(WATER_ALONE_PAD_Y));
+            let glyph = s(SIZE_GLYPH);
+            let row = glyph.max(lh(Style::BodyStrong));
+            items.push(Item::Glyph(
+                Glyph::Water,
+                rect(pad_x, pad_y + (row - glyph) / 2, glyph, glyph),
+            ));
+            text(
+                &mut items,
+                Style::BodyStrong,
+                Ink::Main,
+                pad_x + glyph + s(SPACE_2),
+                pad_y + (row - lh(Style::BodyStrong)) / 2,
+                WATER_TITLE,
+            );
+            pad_y + row + pad_y
+        }
+        Content::Notice => {
+            let top = header(&mut items, pad) + s(SPACE_3);
+            top + paragraph(&mut items, Ink::Main, pad, top, NOTICE) + pad
+        }
+        Content::Prompt {
+            nudge,
+            title,
+            line,
+            water,
+            snooze,
+        } => {
+            let mut y = header(&mut items, pad) + s(SPACE_3);
+
+            // Glyph and title, the glyph centred on the title's line.
+            let glyph = s(SIZE_GLYPH);
+            let row = glyph.max(lh(Style::Title));
+            let kind = match nudge {
+                Nudge::Stand => Glyph::Stand,
+                Nudge::Pause => Glyph::Pause,
+            };
+            items.push(Item::Glyph(
+                kind,
+                rect(pad, y + (row - glyph) / 2, glyph, glyph),
+            ));
+            let text_x = pad + glyph + s(SPACE_2);
+            let title_top = y + (row - lh(Style::Title)) / 2;
+            text(
+                &mut items,
+                Style::Title,
+                Ink::Main,
+                text_x,
+                title_top,
+                title,
+            );
+            y += row + s(SPACE_1);
+
+            y += paragraph(&mut items, Ink::Muted, text_x, y, line);
+
+            if *water {
+                y += s(SPACE_2);
+                let glyph = s(SIZE_GLYPH_INLINE);
+                let row = glyph.max(lh(Style::Body));
+                items.push(Item::Glyph(
+                    Glyph::Water,
+                    rect(text_x, y + (row - glyph) / 2, glyph, glyph),
+                ));
+                text(
+                    &mut items,
+                    Style::Body,
+                    Ink::Main,
+                    text_x + glyph + s(SPACE_2),
+                    y + (row - lh(Style::Body)) / 2,
+                    WATER_LINE,
+                );
+                y += row;
+            }
+
+            y += s(SPACE_4);
+            items.push(Item::Bar(rect(pad, y, width - 2 * pad, s(SIZE_BAR))));
+            y += s(SIZE_BAR) + s(BAR_GAP);
+            items.push(Item::Countdown { x: pad, top: y });
+            y += lh(Style::Caption) + s(SPACE_4);
+
+            // Buttons right-aligned, Skip last: [Snooze 5 min] [Skip].
+            let mut right = width - pad;
+            let shown: &[Part] = if *snooze {
+                &[Part::Skip, Part::Snooze]
+            } else {
+                &[Part::Skip]
+            };
+            let mut buttons = Vec::new();
+            for &part in shown {
+                let label = part.label().unwrap_or_default();
+                let w = m.width(Style::BodyStrong, label) + 2 * (s(SPACE_3) + s(HAIRLINE));
+                buttons.push(Item::Button(part, rect(right - w, y, w, s(SIZE_BUTTON))));
+                right -= w + s(SPACE_2);
+            }
+            items.extend(buttons.into_iter().rev());
+            y + s(SIZE_BUTTON) + pad
+        }
+    };
+    Layout {
+        width,
+        height,
+        items,
+    }
+}
+
+/// The countdown line cut round its `m:ss`: the words before, the digits, the words after.
+fn split_digits(text: &str) -> (&str, &str, &str) {
+    let start = text
+        .find(|c: char| c.is_ascii_digit())
+        .unwrap_or(text.len());
+    let len = text[start..]
+        .find(|c: char| !(c.is_ascii_digit() || c == ':'))
+        .unwrap_or(text.len() - start);
+    (
+        &text[..start],
+        &text[start..start + len],
+        &text[start + len..],
+    )
+}
+
+/// How full the countdown bar is: the away time so far over the length.
+fn bar_fraction(left: Duration, length: Duration) -> f32 {
+    if length.is_zero() {
+        return 1.0;
+    }
+    (1.0 - left.as_secs_f32() / length.as_secs_f32()).clamp(0.0, 1.0)
+}
+
+// ---- Window state ----
+
+struct State {
+    owner: HWND,
+    content: Content,
+    /// The full away length of the prompt on screen, and how much of it is left.
+    length: Duration,
+    left: Duration,
+    dpi: u32,
+    layout: Layout,
+    theme: Theme,
+    fonts: FontCache,
+    /// No DWM round corners (Windows 10): paint a hairline outline instead.
+    outline: bool,
+    hot: Option<Part>,
+    pressed: Option<Part>,
+    tracking: bool,
+    /// Fill level per part, in [`Part::ALL`] order: 0 rest, 1 hover, 2 press.
+    fills: [f32; 3],
+    /// Window opacity, 0 to 1, and where the fade is heading.
+    alpha: f32,
+    fade_to: f32,
+    last_frame: Instant,
+}
+
 thread_local! {
-    /// The shape on screen, which a DPI change lays out again.
-    static SHAPE: Cell<Shape> = const { Cell::new(Shape::Prompt { water: false }) };
+    static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+}
+
+/// Runs `f` on the state, unless there is none or it is already in use (a message sent while
+/// another handler runs). Never call into Win32 from `f` in a way that sends this window a
+/// message.
+fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
+    STATE.with(|cell| cell.try_borrow_mut().ok()?.as_mut().map(f))
+}
+
+impl State {
+    fn target(&self, part: Part) -> f32 {
+        match (self.hot == Some(part), self.pressed) {
+            (true, Some(p)) if p == part => PRESSED,
+            (true, None) => HOVER,
+            _ => REST,
+        }
+    }
+
+    fn moving(&self) -> bool {
+        self.alpha != self.fade_to
+            || Part::ALL
+                .iter()
+                .zip(self.fills)
+                .any(|(&p, level)| level != self.target(p))
+    }
+
+    /// Lays out again for `dpi` and returns the window's place: bottom-right of the primary
+    /// monitor's work area, `space-4` in from its corner.
+    fn relayout(&mut self, dpi: u32) -> RECT {
+        self.dpi = dpi;
+        let fonts = self.fonts.at(dpi);
+        self.layout = with_screen_measure(fonts, |m| layout(&self.content, dpi, m));
+        let work = work_area();
+        let gap = px(SPACE_4, dpi);
+        let (w, h) = (self.layout.width, self.layout.height);
+        rect(work.right - w - gap, work.bottom - h - gap, w, h)
+    }
 }
 
 pub struct Popup {
@@ -121,16 +459,17 @@ pub struct Popup {
 impl Popup {
     /// Creates the popup hidden; `owner` receives its button presses as `WM_POPUP_*` messages.
     pub fn new(owner: HWND) -> Result<Self> {
+        paint::startup();
         // SAFETY: plain Win32 window creation; every handle passed is one created just before.
         unsafe {
             let instance = GetModuleHandleW(None)?.into();
             let class = w!("breakpoint.popup");
             RegisterClassW(&WNDCLASSW {
+                style: CS_DROPSHADOW,
                 lpfnWndProc: Some(wndproc),
                 hInstance: instance,
                 lpszClassName: class,
                 hCursor: LoadCursorW(None, IDC_ARROW)?,
-                hbrBackground: GetSysColorBrush(COLOR_WINDOW),
                 ..Default::default()
             });
             // Created at the primary monitor's origin so it starts with that monitor's DPI.
@@ -138,7 +477,7 @@ impl Popup {
                 EX_STYLE,
                 class,
                 w!("breakpoint"),
-                STYLE,
+                WS_POPUP,
                 0,
                 0,
                 0,
@@ -148,66 +487,65 @@ impl Popup {
                 Some(instance),
                 None,
             )?;
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, owner.0 as isize);
-
-            let button = WINDOW_STYLE(BS_PUSHBUTTON as u32 | WS_TABSTOP.0);
-            for (id, class, text, style) in [
-                (ID_TITLE, w!("STATIC"), w!(""), WINDOW_STYLE(0)),
-                (ID_LINE, w!("STATIC"), w!(""), WINDOW_STYLE(0)),
-                (ID_COUNTDOWN, w!("STATIC"), w!(""), WINDOW_STYLE(0)),
-                (ID_SNOOZE, w!("BUTTON"), w!("Snooze 5 min"), button),
-                (ID_SKIP, w!("BUTTON"), w!("Skip"), button),
-                (ID_NOTICE, w!("STATIC"), w!(""), WINDOW_STYLE(0)),
-                (ID_WATER, w!("STATIC"), w!(""), WINDOW_STYLE(0)),
-            ] {
-                CreateWindowExW(
-                    WINDOW_EX_STYLE(0),
-                    class,
-                    text,
-                    WS_CHILD | WS_VISIBLE | style,
-                    0,
-                    0,
-                    0,
-                    0,
-                    Some(hwnd),
-                    Some(HMENU(id as isize as _)),
-                    Some(instance),
-                    None,
-                )?;
-            }
+            // A layered window shows nothing until its alpha is set.
+            let _ = SetLayeredWindowAttributes(hwnd, COLORREF::default(), 0, LWA_ALPHA);
+            // Round corners on Windows 11. Windows 10 does not know the attribute and says no.
+            let round = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                &DWMWCP_ROUND as *const _ as _,
+                size_of_val(&DWMWCP_ROUND) as u32,
+            );
+            let content = Content::Notice;
+            let mut fonts = FontCache::new();
+            let dpi = primary_dpi();
+            let layout = with_screen_measure(fonts.at(dpi), |m| layout(&content, dpi, m));
+            STATE.set(Some(State {
+                owner,
+                content,
+                length: Duration::ZERO,
+                left: Duration::ZERO,
+                dpi,
+                layout,
+                theme: theme::app_theme(),
+                fonts,
+                outline: round.is_err(),
+                hot: None,
+                pressed: None,
+                tracking: false,
+                fills: [REST; 3],
+                alpha: 0.0,
+                fade_to: 0.0,
+                last_frame: Instant::now(),
+            }));
             Ok(Self { hwnd })
         }
     }
 
-    /// Shows `prompt` on top without taking focus, with the default notification sound.
-    pub fn show(&self, prompt: &Prompt, countdown: &str) {
-        // SAFETY: `self.hwnd` is the live popup window; the strings outlive the calls.
-        unsafe {
-            set_text(self.hwnd, ID_TITLE, prompt.title);
-            set_text(self.hwnd, ID_LINE, &prompt.line);
-            set_text(self.hwnd, ID_WATER, WATER_LINE);
-            set_text(self.hwnd, ID_COUNTDOWN, countdown);
-            show_only(self.hwnd, &PROMPT);
-            for (id, shown) in [(ID_SNOOZE, prompt.snooze), (ID_WATER, prompt.water)] {
-                if let Ok(child) = GetDlgItem(Some(self.hwnd), id) {
-                    let _ = ShowWindow(child, if shown { SW_SHOW } else { SW_HIDE });
-                }
-            }
-            self.raise(Shape::Prompt {
+    /// Shows `prompt` on top without taking focus, with the default notification sound. `left`
+    /// is the away time still needed (SPEC §6).
+    pub fn show(&self, prompt: &Prompt, left: Duration) {
+        self.raise(
+            Content::Prompt {
+                nudge: prompt.nudge,
+                title: prompt.title,
+                line: prompt.line.clone(),
                 water: prompt.water,
-            });
-            let _ = PlaySoundW(w!("Notification.Default"), None, SND_ALIAS | SND_ASYNC);
-        }
+                snooze: prompt.snooze,
+            },
+            prompt.length,
+            left,
+        );
+        // SAFETY: a static alias name; no other pointers.
+        let _ = unsafe { PlaySoundW(w!("Notification.Default"), None, SND_ALIAS | SND_ASYNC) };
     }
 
-    /// Shows Water alone (SPEC §5.4): its title only, no buttons, silent, hiding itself after
+    /// Shows Water alone (SPEC §5.4): one row, no buttons, silent, hiding itself after
     /// [`WATER_ALONE_FOR`].
     pub fn water(&self) {
-        // SAFETY: `self.hwnd` is the live popup window; the string outlives the call.
+        self.raise(Content::WaterAlone, Duration::ZERO, Duration::ZERO);
+        // SAFETY: `self.hwnd` is the live popup window.
         unsafe {
-            set_text(self.hwnd, ID_TITLE, WATER_TITLE);
-            show_only(self.hwnd, &[ID_TITLE]);
-            self.raise(Shape::WaterAlone);
             SetTimer(
                 Some(self.hwnd),
                 WATER_TIMER,
@@ -218,24 +556,46 @@ impl Popup {
     }
 
     /// Shows the bad-config notice in the popup's place: no buttons, silent, until closed with
-    /// X. A nudge shown later replaces it.
+    /// ×. A nudge shown later replaces it.
     pub fn notice(&self) {
-        // SAFETY: `self.hwnd` is the live popup window; the string outlives the call.
-        unsafe {
-            set_text(self.hwnd, ID_NOTICE, NOTICE);
-            show_only(self.hwnd, &[ID_NOTICE]);
-            self.raise(Shape::Notice);
-        }
+        self.raise(Content::Notice, Duration::ZERO, Duration::ZERO);
     }
 
-    /// Lays the popup out afresh as `shape` and puts it on top without activating it.
-    unsafe fn raise(&self, shape: Shape) {
+    /// Lays the popup out afresh for `content` and puts it on top without activating it,
+    /// fading in when it was hidden or fading out.
+    fn raise(&self, content: Content, length: Duration, left: Duration) {
+        let dpi = primary_dpi();
+        let animate = theme::animations_on();
+        let visible = self.is_visible();
+        let Some((place, alpha)) = with_state(|s| {
+            s.content = content;
+            s.length = length;
+            s.left = left;
+            // The theme may have changed while hidden.
+            s.theme = theme::app_theme();
+            if !visible {
+                s.alpha = if animate { 0.0 } else { 1.0 };
+                s.hot = None;
+                s.pressed = None;
+                s.fills = [REST; 3];
+            }
+            s.fade_to = 1.0;
+            if !animate {
+                s.alpha = 1.0;
+            }
+            s.last_frame = Instant::now();
+            // The work area or the scale may have changed while hidden.
+            (s.relayout(dpi), s.alpha)
+        }) else {
+            return;
+        };
+        // SAFETY: `self.hwnd` is the live popup window; no state borrow is held.
         unsafe {
             // Whatever comes next replaces Water alone, so its timer must not hide it.
             let _ = KillTimer(Some(self.hwnd), WATER_TIMER);
-            SHAPE.set(shape);
-            // The work area or the scale may have changed while hidden.
-            layout(self.hwnd, primary_dpi());
+            set_alpha(self.hwnd, alpha);
+            move_to(self.hwnd, place);
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
             let _ = SetWindowPos(
                 self.hwnd,
@@ -246,13 +606,15 @@ impl Popup {
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
+            start_frames(self.hwnd);
         }
     }
 
-    /// Replaces the countdown line, e.g. "Away 1:59 more and it counts".
-    pub fn set_countdown(&self, text: &str) {
-        // SAFETY: `self.hwnd` is the live popup window; the string outlives the call.
-        unsafe { set_text(self.hwnd, ID_COUNTDOWN, text) }
+    /// Updates the away time still needed; the countdown and its bar repaint.
+    pub fn set_countdown(&self, left: Duration) {
+        with_state(|s| s.left = left);
+        // SAFETY: `self.hwnd` is the live popup window.
+        let _ = unsafe { InvalidateRect(Some(self.hwnd), None, false) };
     }
 
     pub fn is_visible(&self) -> bool {
@@ -260,33 +622,13 @@ impl Popup {
         unsafe { IsWindowVisible(self.hwnd).as_bool() }
     }
 
+    /// Fades the popup out and hides it.
     pub fn hide(&self) {
-        // SAFETY: `self.hwnd` is the live popup window.
-        unsafe {
-            let _ = KillTimer(Some(self.hwnd), WATER_TIMER);
-            let _ = ShowWindow(self.hwnd, SW_HIDE);
-        }
+        hide(self.hwnd);
     }
 }
 
-unsafe fn set_text(hwnd: HWND, id: i32, text: &str) {
-    unsafe {
-        if let Ok(child) = GetDlgItem(Some(hwnd), id) {
-            let _ = SetWindowTextW(child, &HSTRING::from(text));
-        }
-    }
-}
-
-/// Shows the children in `ids` and hides the rest.
-unsafe fn show_only(hwnd: HWND, ids: &[i32]) {
-    unsafe {
-        for (id, _) in CHILDREN {
-            if let Ok(child) = GetDlgItem(Some(hwnd), id) {
-                let _ = ShowWindow(child, if ids.contains(&id) { SW_SHOW } else { SW_HIDE });
-            }
-        }
-    }
-}
+// ---- Win32 helpers ----
 
 fn primary() -> HMONITOR {
     // SAFETY: no pointers; the primary monitor always contains the origin.
@@ -294,132 +636,664 @@ fn primary() -> HMONITOR {
 }
 
 fn primary_dpi() -> u32 {
-    let (mut x, mut y) = (96, 96);
+    let (mut x, mut y) = (0, 0);
     // SAFETY: `x` and `y` are valid out-pointers for the call.
-    let _ = unsafe { GetDpiForMonitor(primary(), MDT_EFFECTIVE_DPI, &mut x, &mut y) };
-    x
+    match unsafe { GetDpiForMonitor(primary(), MDT_EFFECTIVE_DPI, &mut x, &mut y) } {
+        Ok(()) if x > 0 => x,
+        _ => BASE_DPI,
+    }
 }
 
-/// Sizes the fonts, the children and the window for `dpi` and the shape on screen, and moves it
-/// bottom-right of the primary monitor's work area.
-unsafe fn layout(hwnd: HWND, dpi: u32) {
-    let px = |v: i32| v * dpi as i32 / 96;
-    let shape = SHAPE.get();
+fn work_area() -> RECT {
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `info` is a valid MONITORINFO with its size set.
+    let _ = unsafe { GetMonitorInfoW(primary(), &mut info) };
+    info.rcWork
+}
+
+/// Measures text with `fonts` on a screen device context.
+struct GdiMeasure<'a> {
+    dc: HDC,
+    fonts: &'a Fonts,
+}
+
+impl Measure for GdiMeasure<'_> {
+    fn width(&self, style: Style, text: &str) -> i32 {
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        let mut size = SIZE::default();
+        // SAFETY: `self.dc` is live for the measure's life; `wide` and `size` outlive the call.
+        unsafe {
+            let old = SelectObject(self.dc, self.fonts.get(style).into());
+            let _ = GetTextExtentPoint32W(self.dc, &wide, &mut size);
+            SelectObject(self.dc, old);
+        }
+        size.cx
+    }
+}
+
+fn with_screen_measure<R>(fonts: &Fonts, f: impl FnOnce(&GdiMeasure) -> R) -> R {
+    // SAFETY: the screen DC is released before return.
     unsafe {
-        // The system message font at this DPI, and a larger bold copy for the title.
-        let mut metrics = NONCLIENTMETRICSW {
-            cbSize: size_of::<NONCLIENTMETRICSW>() as u32,
-            ..Default::default()
-        };
-        let _ = SystemParametersInfoForDpi(
-            SPI_GETNONCLIENTMETRICS.0,
-            metrics.cbSize,
-            Some(&mut metrics as *mut _ as _),
-            0,
-            dpi,
-        );
-        let body = CreateFontIndirectW(&metrics.lfMessageFont);
-        let mut bold = metrics.lfMessageFont;
-        bold.lfWeight = FW_BOLD.0 as i32;
-        bold.lfHeight = bold.lfHeight * 6 / 5;
-        let title = CreateFontIndirectW(&bold);
+        let dc = GetDC(None);
+        let out = f(&GdiMeasure { dc, fonts });
+        ReleaseDC(None, dc);
+        out
+    }
+}
 
-        // Fonts from the last layout, freed once nothing uses them.
-        let mut old = Vec::new();
-        for (id, [x, y, w, h]) in CHILDREN {
-            let Ok(child) = GetDlgItem(Some(hwnd), id) else {
-                continue;
-            };
-            let font = if id == ID_TITLE { title } else { body };
-            let previous = HFONT(SendMessageW(child, WM_GETFONT, None, None).0 as _);
-            if !previous.is_invalid() && !old.contains(&previous) {
-                old.push(previous);
-            }
-            SendMessageW(
-                child,
-                WM_SETFONT,
-                Some(WPARAM(font.0 as usize)),
-                Some(LPARAM(1)),
-            );
-            let _ = SetWindowPos(
-                child,
-                None,
-                px(x),
-                px(y + shape.shift(id)),
-                px(w),
-                px(h),
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-        }
-        for font in old {
-            let _ = DeleteObject(font.into());
-        }
+unsafe fn set_alpha(hwnd: HWND, alpha: f32) {
+    let byte = (alpha.clamp(0.0, 1.0) * f32::from(u8::MAX)).round() as u8;
+    // SAFETY: per the caller, `hwnd` is the live popup window.
+    let _ = unsafe { SetLayeredWindowAttributes(hwnd, COLORREF::default(), byte, LWA_ALPHA) };
+}
 
-        let mut rect = RECT {
-            left: 0,
-            top: 0,
-            right: px(CLIENT.0),
-            bottom: px(shape.height()),
-        };
-        let _ = AdjustWindowRectExForDpi(&mut rect, STYLE, false, EX_STYLE, dpi);
-        let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
-        let mut info = MONITORINFO {
-            cbSize: size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        let _ = GetMonitorInfoW(primary(), &mut info);
-        let work = info.rcWork;
-        let _ = SetWindowPos(
+unsafe fn move_to(hwnd: HWND, place: RECT) {
+    // SAFETY: per the caller, `hwnd` is live and no state borrow is held: this may send
+    // WM_DPICHANGED, which lays out again.
+    let _ = unsafe {
+        SetWindowPos(
             hwnd,
             None,
-            work.right - width - px(MARGIN),
-            work.bottom - height - px(MARGIN),
-            width,
-            height,
+            place.left,
+            place.top,
+            place.right - place.left,
+            place.bottom - place.top,
             SWP_NOZORDER | SWP_NOACTIVATE,
-        );
+        )
+    };
+}
+
+unsafe fn start_frames(hwnd: HWND) {
+    // SAFETY: per the caller, `hwnd` is the live popup window.
+    unsafe { SetTimer(Some(hwnd), FRAME_TIMER, FRAME.as_millis() as u32, None) };
+}
+
+/// Fades out, or hides at once when Windows animation is off. The occurrence is untouched.
+fn hide(hwnd: HWND) {
+    // SAFETY: `hwnd` is the live popup window.
+    unsafe {
+        let _ = KillTimer(Some(hwnd), WATER_TIMER);
+        if !IsWindowVisible(hwnd).as_bool() {
+            return;
+        }
+        if theme::animations_on() {
+            with_state(|s| {
+                s.fade_to = 0.0;
+                s.pressed = None;
+                s.last_frame = Instant::now();
+            });
+            start_frames(hwnd);
+        } else {
+            finish_hide(hwnd);
+        }
+    }
+}
+
+unsafe fn finish_hide(hwnd: HWND) {
+    with_state(|s| {
+        s.alpha = 0.0;
+        s.fade_to = 0.0;
+        s.hot = None;
+        s.pressed = None;
+        s.tracking = false;
+        s.fills = [REST; 3];
+    });
+    // SAFETY: per the caller, `hwnd` is the live popup window; no state borrow is held.
+    unsafe {
+        let _ = KillTimer(Some(hwnd), FRAME_TIMER);
+        let _ = ShowWindow(hwnd, SW_HIDE);
+        set_alpha(hwnd, 0.0);
+    }
+}
+
+/// One frame of the fade and the button fills.
+unsafe fn frame(hwnd: HWND) {
+    let animate = theme::animations_on();
+    let Some((alpha, done, gone)) = with_state(|s| {
+        let now = Instant::now();
+        let dt = now - s.last_frame;
+        s.last_frame = now;
+        for (i, &part) in Part::ALL.iter().enumerate() {
+            s.fills[i] = paint::step_fill(s.fills[i], s.target(part), dt, animate);
+        }
+        let span = if s.fade_to > s.alpha {
+            FADE_IN
+        } else {
+            FADE_OUT
+        };
+        let step = if animate {
+            dt.as_secs_f32() / span.as_secs_f32()
+        } else {
+            1.0
+        };
+        s.alpha = if s.fade_to > s.alpha {
+            (s.alpha + step).min(s.fade_to)
+        } else {
+            (s.alpha - step).max(s.fade_to)
+        };
+        (s.alpha, !s.moving(), s.fade_to == 0.0 && s.alpha == 0.0)
+    }) else {
+        return;
+    };
+    // SAFETY: per the caller, `hwnd` is the live popup window; no state borrow is held.
+    unsafe {
+        if gone {
+            finish_hide(hwnd);
+            return;
+        }
+        set_alpha(hwnd, alpha);
+        let _ = InvalidateRect(Some(hwnd), None, false);
+        if done {
+            let _ = KillTimer(Some(hwnd), FRAME_TIMER);
+        }
+    }
+}
+
+// ---- Paint ----
+
+unsafe fn paint(hwnd: HWND) {
+    let mut ps = PAINTSTRUCT::default();
+    // SAFETY: Begin/EndPaint pair on the live window; every GDI object made here is freed here.
+    unsafe {
+        let dc = BeginPaint(hwnd, &mut ps);
+        with_state(|s| {
+            let (w, h) = (s.layout.width, s.layout.height);
+            let mem = CreateCompatibleDC(Some(dc));
+            let bitmap = CreateCompatibleBitmap(dc, w, h);
+            let old = SelectObject(mem, bitmap.into());
+            paint_shapes(s, mem);
+            paint_text(s, mem);
+            let _ = BitBlt(dc, 0, 0, w, h, Some(mem), 0, 0, SRCCOPY);
+            SelectObject(mem, old);
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(mem);
+        });
+        let _ = EndPaint(hwnd, &ps);
+    }
+}
+
+fn fill_index(part: Part) -> usize {
+    Part::ALL
+        .iter()
+        .position(|&p| p == part)
+        .unwrap_or_default()
+}
+
+fn glyph_colour(p: &Palette, glyph: Glyph) -> COLORREF {
+    match glyph {
+        Glyph::Stand => p.stand,
+        Glyph::Pause => p.pause,
+        Glyph::Water => p.water,
+    }
+}
+
+/// The ground, the outline on Windows 10, the dot, glyphs, the bar and the button fills.
+unsafe fn paint_shapes(s: &State, dc: HDC) {
+    let p = s.theme.palette();
+    let scale = |v: i32| px(v, s.dpi) as f32;
+    // SAFETY: per the caller, `dc` is a live memory DC; nothing else draws on it meanwhile.
+    let Some(canvas) = (unsafe { Canvas::new(dc) }) else {
+        return;
+    };
+    let all = Box2::from(rect(0, 0, s.layout.width, s.layout.height));
+    if s.outline {
+        canvas.fill_rect(p.line, all);
+        canvas.fill_rect(p.surface_raised, all.inset(scale(HAIRLINE)));
+    } else {
+        canvas.fill_rect(p.surface_raised, all);
+    }
+    let bar_colour = match &s.content {
+        Content::Prompt {
+            nudge: Nudge::Stand,
+            ..
+        } => p.stand,
+        _ => p.pause,
+    };
+    for item in &s.layout.items {
+        match item {
+            Item::Dot(r) => {
+                let b = Box2::from(*r);
+                canvas.fill_circle(p.dot, b.x + b.w / 2.0, b.y + b.h / 2.0, b.w / 2.0);
+            }
+            Item::Glyph(glyph, r) => canvas.glyph(*glyph, glyph_colour(p, *glyph), (*r).into()),
+            Item::Bar(r) => {
+                let track = Box2::from(*r);
+                let round = track.h / 2.0;
+                canvas.fill_round_rect(p.surface_sunken, track, round);
+                let filled = Box2 {
+                    w: track.w * bar_fraction(s.left, s.length),
+                    ..track
+                };
+                if filled.w > 0.0 {
+                    canvas.fill_round_rect(bar_colour, filled, round);
+                }
+            }
+            Item::Button(part, r) => {
+                let b = Box2::from(*r);
+                let level = s.fills[fill_index(*part)];
+                let fill = paint::fill_colour(p, level);
+                let radius = scale(RADIUS_SM);
+                match part {
+                    Part::Snooze => {
+                        let border = scale(HAIRLINE);
+                        canvas.fill_round_rect(p.line_strong, b, radius);
+                        canvas.fill_round_rect(fill, b.inset(border), radius - border);
+                    }
+                    Part::Skip | Part::Close => {
+                        if level > REST {
+                            canvas.fill_round_rect(fill, b, radius);
+                        }
+                    }
+                }
+                if *part == Part::Close {
+                    let ink = paint::mix(p.ink_muted, p.ink, level.min(HOVER));
+                    canvas.close_mark(ink, b, s.dpi as f32 / BASE_DPI as f32);
+                }
+            }
+            Item::Text { .. } | Item::Countdown { .. } => {}
+        }
+    }
+}
+
+/// Every line of text, in the theme fonts, on the line boxes the layout gave.
+unsafe fn paint_text(s: &mut State, dc: HDC) {
+    let p = *s.theme.palette();
+    let dpi = s.dpi;
+    let fonts = s.fonts.at(dpi);
+    // SAFETY: per the caller, `dc` is a live memory DC; fonts outlive the calls.
+    unsafe {
+        SetBkMode(dc, TRANSPARENT);
+        SetTextAlign(dc, TA_LEFT | TA_BASELINE);
+        // Draws `text` on the line box at `top`; returns the x after it.
+        let draw = |style: Style, colour: COLORREF, x: i32, top: i32, text: &str| -> i32 {
+            let wide: Vec<u16> = text.encode_utf16().collect();
+            let old = SelectObject(dc, fonts.get(style).into());
+            let mut tm = TEXTMETRICW::default();
+            let _ = GetTextMetricsW(dc, &mut tm);
+            let baseline = top + (px(style.line_height(), dpi) - tm.tmHeight) / 2 + tm.tmAscent;
+            SetTextColor(dc, colour);
+            let _ = TextOutW(dc, x, baseline, &wide);
+            let mut size = SIZE::default();
+            let _ = GetTextExtentPoint32W(dc, &wide, &mut size);
+            SelectObject(dc, old);
+            x + size.cx
+        };
+        let ink = |i: Ink| match i {
+            Ink::Main => p.ink,
+            Ink::Muted => p.ink_muted,
+        };
+        for item in &s.layout.items {
+            match item {
+                Item::Text {
+                    style,
+                    ink: i,
+                    x,
+                    top,
+                    text,
+                } => {
+                    draw(*style, ink(*i), *x, *top, text);
+                }
+                Item::Countdown { x, top } => {
+                    let line = countdown_text(s.left);
+                    let (before, digits, after) = split_digits(&line);
+                    let x = draw(Style::Caption, p.ink_muted, *x, *top, before);
+                    let x = draw(Style::CaptionStrong, p.ink, x, *top, digits);
+                    draw(Style::Caption, p.ink_muted, x, *top, after);
+                }
+                Item::Button(part, r) => {
+                    let Some(label) = part.label() else { continue };
+                    let pressed = s.pressed == Some(*part) && s.hot == Some(*part);
+                    let drop = if pressed { px(PRESS_DROP, dpi) } else { 0 };
+                    let wide: Vec<u16> = label.encode_utf16().collect();
+                    let old = SelectObject(dc, fonts.get(Style::BodyStrong).into());
+                    let mut size = SIZE::default();
+                    let _ = GetTextExtentPoint32W(dc, &wide, &mut size);
+                    SelectObject(dc, old);
+                    let line = px(Style::BodyStrong.line_height(), dpi);
+                    let x = r.left + (r.right - r.left - size.cx) / 2;
+                    let top = r.top + (r.bottom - r.top - line) / 2 + drop;
+                    draw(Style::BodyStrong, p.ink, x, top, label);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+// ---- Window procedure ----
+
+fn point(lparam: LPARAM) -> (i32, i32) {
+    let x = (lparam.0 & 0xffff) as u16 as i16;
+    let y = ((lparam.0 >> 16) & 0xffff) as u16 as i16;
+    (x.into(), y.into())
+}
+
+/// Repaints and runs frames until the fills settle.
+unsafe fn refresh(hwnd: HWND) {
+    // SAFETY: per the caller, `hwnd` is the live popup window.
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, false);
+        with_state(|s| s.last_frame = Instant::now());
+        start_frames(hwnd);
     }
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // SAFETY: Win32 calls on the live popup window; no state borrow is held across a call that
+    // sends this window a message.
     unsafe {
         match msg {
-            // Clicks land on the buttons without activating the window, so focus stays put.
+            // Clicks land without activating the window, so focus stays put.
             WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
-            WM_CTLCOLORSTATIC => {
-                SetBkColor(HDC(wparam.0 as _), COLORREF(GetSysColor(COLOR_WINDOW)));
-                LRESULT(GetSysColorBrush(COLOR_WINDOW).0 as isize)
+            WM_ERASEBKGND => LRESULT(1),
+            WM_PAINT => {
+                paint(hwnd);
+                LRESULT(0)
             }
-            WM_COMMAND => {
-                let (id, code) = ((wparam.0 & 0xFFFF) as i32, (wparam.0 >> 16) as u32);
-                let press = match id {
-                    ID_SKIP => Some(WM_POPUP_SKIP),
-                    ID_SNOOZE => Some(WM_POPUP_SNOOZE),
-                    _ => None,
-                };
-                if let Some(press) = press
-                    && code == BN_CLICKED
-                {
-                    let owner = HWND(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as _);
-                    let _ = PostMessageW(Some(owner), press, WPARAM(0), LPARAM(0));
+            WM_MOUSEMOVE => {
+                let (x, y) = point(lparam);
+                let track = with_state(|s| {
+                    let hot = if s.fade_to > 0.0 {
+                        s.layout.hit(x, y)
+                    } else {
+                        None
+                    };
+                    let changed = hot != s.hot;
+                    s.hot = hot;
+                    let track = !s.tracking;
+                    s.tracking = true;
+                    (changed, track)
+                });
+                if let Some((changed, track)) = track {
+                    if track {
+                        let mut event = TRACKMOUSEEVENT {
+                            cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                            dwFlags: TME_LEAVE,
+                            hwndTrack: hwnd,
+                            dwHoverTime: 0,
+                        };
+                        let _ = TrackMouseEvent(&mut event);
+                    }
+                    if changed {
+                        refresh(hwnd);
+                    }
                 }
                 LRESULT(0)
             }
-            // X hides the popup; the occurrence stays pending (SPEC §6).
+            WM_MOUSELEAVE => {
+                with_state(|s| {
+                    s.tracking = false;
+                    s.hot = None;
+                });
+                refresh(hwnd);
+                LRESULT(0)
+            }
+            WM_LBUTTONDOWN => {
+                let (x, y) = point(lparam);
+                let hit = with_state(|s| {
+                    let hit = (s.fade_to > 0.0).then(|| s.layout.hit(x, y)).flatten();
+                    s.hot = hit;
+                    s.pressed = hit;
+                    hit
+                })
+                .flatten();
+                if hit.is_some() {
+                    SetCapture(hwnd);
+                    refresh(hwnd);
+                }
+                LRESULT(0)
+            }
+            WM_LBUTTONUP => {
+                let (x, y) = point(lparam);
+                let done = with_state(|s| {
+                    let over = s.layout.hit(x, y);
+                    let pressed = s.pressed.take();
+                    s.hot = over;
+                    pressed.filter(|&p| Some(p) == over).map(|p| (p, s.owner))
+                })
+                .flatten();
+                let _ = ReleaseCapture();
+                refresh(hwnd);
+                match done {
+                    // × hides the popup; the occurrence stays pending (SPEC §6).
+                    Some((Part::Close, _)) => hide(hwnd),
+                    Some((Part::Snooze, owner)) => {
+                        let _ = PostMessageW(Some(owner), WM_POPUP_SNOOZE, WPARAM(0), LPARAM(0));
+                    }
+                    Some((Part::Skip, owner)) => {
+                        let _ = PostMessageW(Some(owner), WM_POPUP_SKIP, WPARAM(0), LPARAM(0));
+                    }
+                    None => {}
+                }
+                LRESULT(0)
+            }
+            WM_CAPTURECHANGED => {
+                with_state(|s| s.pressed = None);
+                refresh(hwnd);
+                LRESULT(0)
+            }
             WM_CLOSE => {
-                let _ = ShowWindow(hwnd, SW_HIDE);
+                hide(hwnd);
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 == WATER_TIMER => {
-                let _ = KillTimer(Some(hwnd), WATER_TIMER);
-                let _ = ShowWindow(hwnd, SW_HIDE);
+                hide(hwnd);
                 LRESULT(0)
             }
+            WM_TIMER if wparam.0 == FRAME_TIMER => {
+                frame(hwnd);
+                LRESULT(0)
+            }
+            WM_SETTINGCHANGE => {
+                if let Some(theme) = theme::theme_on_setting_change(lparam) {
+                    with_state(|s| s.theme = theme);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_DPICHANGED => {
-                layout(hwnd, (wparam.0 & 0xFFFF) as u32);
+                let dpi = (wparam.0 & 0xffff) as u32;
+                if let Some(place) = with_state(|s| s.relayout(dpi)) {
+                    move_to(hwnd, place);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every character 7px wide, at any style.
+    struct Fixed;
+    impl Measure for Fixed {
+        fn width(&self, _: Style, text: &str) -> i32 {
+            7 * text.chars().count() as i32
+        }
+    }
+
+    fn prompt(water: bool, snooze: bool) -> Content {
+        Content::Prompt {
+            nudge: Nudge::Stand,
+            title: Nudge::Stand.title(),
+            line: Nudge::Stand.line(2),
+            water,
+            snooze,
+        }
+    }
+
+    fn buttons(l: &Layout) -> Vec<(Part, RECT)> {
+        l.items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Button(p, r) => Some((*p, *r)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wrap_breaks_at_spaces_within_the_width() {
+        let w = |t: &str| t.len() as i32;
+        assert_eq!(wrap("aa bb cc", 5, w), ["aa bb", "cc"]);
+        assert_eq!(wrap("aa bb cc", 100, w), ["aa bb cc"]);
+        assert_eq!(wrap("toolongword x", 4, w), ["toolongword", "x"]);
+        assert!(wrap("", 4, w).is_empty());
+    }
+
+    #[test]
+    fn prompt_layout_follows_the_design_at_100_percent() {
+        let l = layout(&prompt(false, true), 96, &Fixed);
+        assert_eq!(l.width, SIZE_POPUP);
+        // Header: dot 8 centred in 18 at the padding.
+        assert!(l.items.contains(&Item::Dot(rect(16, 21, 8, 8))));
+        // Close ×: 24 square, 4 past the right padding edge, centred on the header.
+        assert_eq!(
+            buttons(&l)[0],
+            (Part::Close, rect(360 - 16 + 4 - 24, 13, 24, 24))
+        );
+        // Glyph 12 under the header, title text 8 right of it.
+        assert!(
+            l.items
+                .contains(&Item::Glyph(Glyph::Stand, rect(16, 50, 20, 20)))
+        );
+        let title = l.items.iter().find_map(|i| match i {
+            Item::Text {
+                style: Style::Title,
+                x,
+                top,
+                ..
+            } => Some((*x, *top)),
+            _ => None,
+        });
+        assert_eq!(title, Some((44, 46)));
+        // The line, aligned with the title text, 4 under the title row, wrapped to two lines of
+        // 20 (55 chars × 7 = 385 > 300).
+        let lines: Vec<_> = l
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Text {
+                    style: Style::Body,
+                    ink: Ink::Muted,
+                    x,
+                    top,
+                    ..
+                } => Some((*x, *top)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines, [(44, 78), (44, 98)]);
+        // Bar 16 under the line, full width inside the padding, 4 tall; countdown 6 under it.
+        assert!(l.items.contains(&Item::Bar(rect(16, 134, 328, 4))));
+        assert!(l.items.contains(&Item::Countdown { x: 16, top: 144 }));
+        // Buttons 16 under the countdown, right-aligned, 8 apart, Skip last.
+        let b = buttons(&l);
+        let snooze_w = 7 * 12 + 2 * (12 + 1);
+        let skip_w = 7 * 4 + 2 * (12 + 1);
+        assert_eq!(
+            b[1],
+            (
+                Part::Snooze,
+                rect(344 - skip_w - 8 - snooze_w, 178, snooze_w, 32)
+            )
+        );
+        assert_eq!(b[2], (Part::Skip, rect(344 - skip_w, 178, skip_w, 32)));
+        assert_eq!(l.height, 178 + 32 + 16);
+    }
+
+    #[test]
+    fn riding_water_adds_its_row_and_after_the_snooze_skip_stands_alone() {
+        let plain = layout(&prompt(false, false), 96, &Fixed);
+        let water = layout(&prompt(true, false), 96, &Fixed);
+        assert_eq!(water.height, plain.height + 8 + 20);
+        assert!(
+            water
+                .items
+                .contains(&Item::Glyph(Glyph::Water, rect(44, 128, 16, 16)))
+        );
+        assert_eq!(
+            buttons(&plain).iter().map(|b| b.0).collect::<Vec<_>>(),
+            [Part::Close, Part::Skip]
+        );
+    }
+
+    #[test]
+    fn water_alone_is_one_row_without_header_or_buttons() {
+        let l = layout(&Content::WaterAlone, 96, &Fixed);
+        assert_eq!(l.height, 12 + 20 + 12);
+        assert!(buttons(&l).is_empty());
+        assert!(!l.items.iter().any(|i| matches!(i, Item::Dot(_))));
+        assert!(
+            l.items
+                .contains(&Item::Glyph(Glyph::Water, rect(16, 12, 20, 20)))
+        );
+    }
+
+    #[test]
+    fn notice_has_the_header_and_no_buttons_but_the_close() {
+        let l = layout(&Content::Notice, 96, &Fixed);
+        assert_eq!(
+            buttons(&l).iter().map(|b| b.0).collect::<Vec<_>>(),
+            [Part::Close]
+        );
+    }
+
+    #[test]
+    fn layout_scales_with_the_monitor() {
+        for dpi in [144, 192] {
+            let l = layout(&prompt(true, true), dpi, &Fixed);
+            assert_eq!(l.width, px(SIZE_POPUP, dpi));
+            assert!(
+                l.items.contains(&Item::Bar(rect(
+                    px(16, dpi),
+                    l.items
+                        .iter()
+                        .find_map(|i| match i {
+                            Item::Bar(r) => Some(r.top),
+                            _ => None,
+                        })
+                        .unwrap(),
+                    px(328, dpi),
+                    px(4, dpi)
+                )))
+            );
+            assert_eq!(buttons(&l)[2].1.bottom, l.height - px(16, dpi));
+        }
+    }
+
+    #[test]
+    fn hit_finds_the_part_under_the_pointer() {
+        let l = layout(&prompt(false, true), 96, &Fixed);
+        let skip = buttons(&l)[2].1;
+        assert_eq!(l.hit(skip.left, skip.top), Some(Part::Skip));
+        assert_eq!(l.hit(skip.right, skip.top), None);
+        assert_eq!(l.hit(330, 20), Some(Part::Close));
+        assert_eq!(l.hit(100, 100), None);
+    }
+
+    #[test]
+    fn countdown_digits_are_split_out() {
+        let line = countdown_text(Duration::from_secs(119));
+        assert_eq!(
+            split_digits(&line),
+            ("Away ", "1:59", " more and it counts")
+        );
+        assert_eq!(split_digits("none"), ("none", "", ""));
+    }
+
+    #[test]
+    fn bar_fills_with_away_time() {
+        let five = Duration::from_secs(300);
+        assert_eq!(bar_fraction(five, five), 0.0);
+        assert_eq!(bar_fraction(Duration::ZERO, five), 1.0);
+        assert_eq!(bar_fraction(Duration::from_secs(150), five), 0.5);
     }
 }
