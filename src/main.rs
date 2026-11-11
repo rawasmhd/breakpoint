@@ -13,7 +13,7 @@ use breakpoint::core::config::{self, Config};
 use breakpoint::core::log::Today;
 use breakpoint::core::presence::{POLL_EVERY, Presence, Tracker};
 use breakpoint::core::quiet::Quiet;
-use breakpoint::core::scheduler::{Effect, Scheduler, away_left, countdown_text};
+use breakpoint::core::scheduler::{Effect, Scheduler, away_left};
 use breakpoint::core::settings::{self, Form};
 use breakpoint::core::wizard::Picks;
 use platform::dialogs::{
@@ -242,7 +242,7 @@ impl App {
                     self.log.append(wall, &event);
                     self.today.record(wall, &event);
                 }
-                Effect::Show(prompt) => self.popup.show(&prompt, &self.countdown(prompt.length)),
+                Effect::Show(prompt) => self.popup.show(&prompt, self.countdown(prompt.length)),
                 Effect::Close => self.popup.hide(),
                 Effect::ShowWater => self.popup.water(),
             }
@@ -251,23 +251,18 @@ impl App {
         self.tray.set_today(&self.today.text(wall));
     }
 
-    /// The countdown line for an occurrence of `length` as of now (SPEC §6).
-    fn countdown(&self, length: Duration) -> String {
+    /// The away time an occurrence of `length` still needs as of now (SPEC §6).
+    fn countdown(&self, length: Duration) -> Duration {
         let now = self.now();
         let held = self.last_presence == Presence::AtDesk;
-        countdown_text(away_left(
-            length,
-            now,
-            platform::presence::last_input(now),
-            held,
-        ))
+        away_left(length, now, platform::presence::last_input(now), held)
     }
 
     fn tick_countdown(&mut self) {
         if self.popup.is_visible()
             && let Some(prompt) = self.scheduler.prompt()
         {
-            self.popup.set_countdown(&self.countdown(prompt.length));
+            self.popup.set_countdown(self.countdown(prompt.length));
         }
     }
 

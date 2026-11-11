@@ -3,6 +3,7 @@
 pub mod clock;
 pub mod dialogs;
 pub mod log;
+pub mod paint;
 pub mod popup;
 pub mod presence;
 pub mod startup;
