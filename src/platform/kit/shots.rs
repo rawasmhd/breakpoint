@@ -520,7 +520,7 @@ unsafe fn save_bmp(dc: HDC, bitmap: HBITMAP, w: i32, h: i32, path: &Path) {
 }
 
 /// A memory bitmap `w` by `h` to draw on, saved to `path` when `draw` returns.
-fn render(w: i32, h: i32, path: &Path, draw: impl FnOnce(HDC)) {
+pub(crate) fn render(w: i32, h: i32, path: &Path, draw: impl FnOnce(HDC)) {
     unsafe {
         let screen = GetDC(None);
         let dc = CreateCompatibleDC(Some(screen));
@@ -535,7 +535,7 @@ fn render(w: i32, h: i32, path: &Path, draw: impl FnOnce(HDC)) {
     }
 }
 
-fn pump(for_ms: u64) {
+pub(crate) fn pump(for_ms: u64) {
     let end = Instant::now() + Duration::from_millis(for_ms);
     let mut msg = MSG::default();
     while Instant::now() < end {
@@ -550,7 +550,7 @@ fn pump(for_ms: u64) {
 }
 
 /// Captures `hwnd` with its frame, as DWM shows it.
-fn capture(hwnd: HWND, path: &Path) {
+pub(crate) fn capture(hwnd: HWND, path: &Path) {
     let mut r = RECT::default();
     unsafe { GetWindowRect(hwnd, &mut r).unwrap() };
     let (w, h) = (r.right - r.left, r.bottom - r.top);

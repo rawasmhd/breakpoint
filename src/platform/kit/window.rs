@@ -217,6 +217,11 @@ impl Handle {
         with_host(self.0, |h| h.form.value(id)).flatten()
     }
 
+    /// The item that has the focus inside the form.
+    pub fn focused(self) -> Option<Id> {
+        with_host(self.0, |h| h.form.focused()).flatten()
+    }
+
     /// Sets a control's value without an event, as when a profile fills the numbers.
     pub fn set(self, id: Id, value: Value) -> bool {
         let done = with_host(self.0, |h| h.form.set(id, value)).unwrap_or(false);
@@ -264,7 +269,7 @@ impl Handle {
 
 /// The open menu's window, for the shots.
 #[cfg(test)]
-pub(super) fn menu_of(handle: Handle) -> Option<HWND> {
+pub(crate) fn menu_of(handle: Handle) -> Option<HWND> {
     with_host(handle.0, |h| h.menu).flatten()
 }
 
@@ -508,6 +513,7 @@ fn sync_menu(hwnd: HWND) {
         (Some(menu), existing) => {
             let dpi = h.form.dpi();
             let field = h.form.laid()[menu.item].rect;
+            let client_w = h.client.0;
             let entries = h
                 .form
                 .menu_entries()
@@ -523,6 +529,8 @@ fn sync_menu(hwnd: HWND) {
             };
             // SAFETY: `corner` is a valid in-out pointer; this sends no message.
             let _ = unsafe { ClientToScreen(hwnd, &mut corner) };
+            // The client area's right edge on screen.
+            let edge = corner.x - field.left + client_w;
             let field = rect(
                 corner.x,
                 corner.y,
@@ -534,6 +542,7 @@ fn sync_menu(hwnd: HWND) {
                 layout.w,
                 layout.h,
                 px(MENU_GAP, dpi),
+                edge,
                 work_area(hwnd),
             );
             h.menu_layout = Some(layout);

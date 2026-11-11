@@ -16,12 +16,11 @@ use breakpoint::core::quiet::Quiet;
 use breakpoint::core::scheduler::{Effect, Scheduler, away_left};
 use breakpoint::core::settings::{self, Form};
 use breakpoint::core::wizard::Picks;
-use platform::dialogs::{
-    Saved, WM_OPEN_SETTINGS, WM_SETTINGS_CANCELLED, WM_SETTINGS_SAVED, WM_WIZARD_DONE, WizardDone,
-};
+use platform::dialogs::{WM_OPEN_SETTINGS, WM_WIZARD_DONE, WizardDone};
 use platform::log::Log;
 use platform::popup::{Popup, WM_POPUP_SKIP, WM_POPUP_SNOOZE};
 use platform::presence::{Listener, Vetoes};
+use platform::settings_window::{Saved, WM_SETTINGS_CANCELLED, WM_SETTINGS_SAVED};
 use platform::tray::{Command, Tray};
 use windows::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM,
@@ -128,7 +127,7 @@ impl App {
             platform::dialogs::to_front();
             return;
         }
-        platform::dialogs::open_settings(
+        platform::settings_window::open(
             self.window,
             &Form::new(&self.config),
             platform::startup::is_on(),
@@ -143,7 +142,7 @@ impl App {
             WizardDone::Start(picks) => self.finish_first_run(picks),
             WizardDone::Change(picks, at) => {
                 self.first_run = Some(picks);
-                platform::dialogs::open_settings(
+                platform::settings_window::open(
                     self.window,
                     &picks.form(),
                     picks.start_with_windows,
@@ -171,7 +170,7 @@ impl App {
 
     /// A valid Save closed the settings window. During first run that Save finishes it.
     fn settings_saved(&mut self) -> Option<String> {
-        let saved = platform::dialogs::take_saved()?;
+        let saved = platform::settings_window::take_saved()?;
         self.apply_saved(saved)
     }
 
@@ -386,7 +385,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut msg = MSG::default();
     // SAFETY: the standard message loop over a valid MSG.
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
-        // The wizard and the settings window take their keys (Tab, Enter, Esc) first.
+        // The wizard takes its keys (Tab, Enter, Esc) first; the settings window, a kit
+        // window, takes them as plain key messages.
         if !platform::dialogs::is_dialog_message(&msg) {
             unsafe {
                 let _ = TranslateMessage(&msg);

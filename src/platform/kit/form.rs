@@ -1284,9 +1284,11 @@ pub fn menu_layout(entries: &[Entry], field_w: i32, dpi: u32, m: &dyn Measure) -
 }
 
 /// Where the menu window goes on screen: `gap` under the `field` (in screen pixels), or above
-/// it when there is no room below in the `work` area but there is above. Kept inside `work`
-/// across.
-pub fn menu_place(field: RECT, w: i32, h: i32, gap: i32, work: RECT) -> RECT {
+/// it when there is no room below in the `work` area but there is above. Across, it starts at
+/// the field's left edge; a menu wider than its field that would then cross `edge`, the right
+/// edge of the form's client area, lines up its right edge with the field's instead, so it does
+/// not hang off the window. Kept inside `work` across.
+pub fn menu_place(field: RECT, w: i32, h: i32, gap: i32, edge: i32, work: RECT) -> RECT {
     let below = field.bottom + gap;
     let above = field.top - gap - h;
     let top = if below + h > work.bottom && above >= work.top {
@@ -1294,7 +1296,12 @@ pub fn menu_place(field: RECT, w: i32, h: i32, gap: i32, work: RECT) -> RECT {
     } else {
         below
     };
-    let left = field.left.min(work.right - w).max(work.left);
+    let start = if field.left + w > edge {
+        field.right - w
+    } else {
+        field.left
+    };
+    let left = start.min(work.right - w).max(work.left);
     rect(left, top, w, h)
 }
 
@@ -1925,17 +1932,25 @@ mod tests {
         assert_eq!(m.hit(1, 60), None);
 
         let work = rect(0, 0, 1000, 800);
+        let edge = 1000;
         let field = rect(100, 300, 176, 32);
         assert_eq!(
-            menu_place(field, 176, 152, 4, work),
+            menu_place(field, 176, 152, 4, edge, work),
             rect(100, 336, 176, 152)
         );
         // No room below: above.
         let low = rect(100, 700, 176, 32);
-        assert_eq!(menu_place(low, 176, 152, 4, work), rect(100, 544, 176, 152));
+        assert_eq!(
+            menu_place(low, 176, 152, 4, edge, work),
+            rect(100, 544, 176, 152)
+        );
         // Kept inside the work area across.
         let right = rect(900, 300, 176, 32);
-        assert_eq!(menu_place(right, 176, 152, 4, work).left, 1000 - 176);
+        assert_eq!(menu_place(right, 176, 152, 4, 2000, work).left, 1000 - 176);
+        // Wider than its field near the window's right edge: right edges line up.
+        let near = rect(384, 300, 176, 32);
+        assert_eq!(menu_place(near, 330, 152, 4, 600, work).left, 560 - 330);
+        assert_eq!(menu_place(near, 330, 152, 4, 800, work).left, 384);
     }
 
     // ---- Pointer ----
