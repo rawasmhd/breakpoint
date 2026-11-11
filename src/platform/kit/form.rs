@@ -262,7 +262,7 @@ impl Form {
             .iter()
             .zip(&self.laid)
             .filter_map(|(item, laid)| match item.kind {
-                Kind::Text { .. } if item.at.w > 0 && item.at.h > 0 => {
+                Kind::Text { .. } | Kind::Choice { .. } if item.at.w > 0 && item.at.h > 0 => {
                     let extra = laid.rect.bottom - laid.rect.top - px(item.at.h, dpi);
                     (extra > 0).then_some((item.at.y + item.at.h, extra))
                 }
@@ -1137,25 +1137,27 @@ pub fn stepper_text(kind: &Kind) -> Option<(String, &str)> {
 
 // ---- Layout ----
 
-/// `text` broken at spaces into lines no wider than `width`. A word wider than `width` gets a
-/// line of its own.
+/// `text` broken at spaces into lines no wider than `width`, and at every `\n`. A word wider
+/// than `width` gets a line of its own.
 pub fn wrap(text: &str, width: i32, fits: impl Fn(&str) -> i32) -> Vec<String> {
     let mut lines = Vec::new();
-    let mut line = String::new();
-    for word in text.split_whitespace() {
-        let longer = if line.is_empty() {
-            word.to_owned()
-        } else {
-            format!("{line} {word}")
-        };
-        if line.is_empty() || fits(&longer) <= width {
-            line = longer;
-        } else {
-            lines.push(std::mem::replace(&mut line, word.to_owned()));
+    for paragraph in text.split('\n') {
+        let mut line = String::new();
+        for word in paragraph.split_whitespace() {
+            let longer = if line.is_empty() {
+                word.to_owned()
+            } else {
+                format!("{line} {word}")
+            };
+            if line.is_empty() || fits(&longer) <= width {
+                line = longer;
+            } else {
+                lines.push(std::mem::replace(&mut line, word.to_owned()));
+            }
         }
-    }
-    if !line.is_empty() {
-        lines.push(line);
+        if !line.is_empty() {
+            lines.push(line);
+        }
     }
     lines
 }
@@ -1253,15 +1255,27 @@ fn lay_out(item: &Item, dpi: u32, m: &dyn Measure) -> Laid {
         Kind::Choice {
             title, note, aside, ..
         } => {
-            let text = m
-                .width(Style::BodyStrong, title)
-                .max(m.width(Style::Caption, note));
             let (aside_w, aside_h) = aside
                 .as_ref()
                 .map_or((0, 0), |a| (s(SPACE_4) + s(a.w), s(a.h)));
-            let w = 2 * s(CHOICE_PAD_X) + s(RADIO) + s(SPACE_3) + text + aside_w;
-            let h = 2 * s(CHOICE_PAD_Y) + (lh(Style::BodyStrong) + lh(Style::Caption)).max(aside_h);
-            sized(w, h)
+            let chrome = 2 * s(CHOICE_PAD_X) + s(RADIO) + s(SPACE_3) + aside_w;
+            // The note wraps to the text column of a card given a width, and at each `\n`.
+            lines = match given_w {
+                Some(w) => wrap(note, w - chrome, |t| m.width(Style::Caption, t)),
+                None => wrap(note, i32::MAX, |t| m.width(Style::Caption, t)),
+            };
+            let text = lines
+                .iter()
+                .map(|l| m.width(Style::Caption, l))
+                .chain([m.width(Style::BodyStrong, title)])
+                .max()
+                .unwrap_or(0);
+            let notes = lines.len() as i32 * lh(Style::Caption);
+            let w = chrome + text;
+            let h = 2 * s(CHOICE_PAD_Y) + (lh(Style::BodyStrong) + notes).max(aside_h);
+            let r = sized(w, h);
+            // Never shorter than its lines: the room past its place is growth.
+            rect(r.left, r.top, r.right - r.left, (r.bottom - r.top).max(h))
         }
     };
     if parts.is_empty() {
@@ -2273,6 +2287,42 @@ mod tests {
         )]);
         f.lay_out(96, &Fixed(96));
         assert_eq!(f.height(18), 18);
+    }
+
+    #[test]
+    fn a_card_note_wraps_to_its_column_and_at_line_breaks_and_grows_the_card() {
+        assert_eq!(
+            wrap(
+                "ab cd
+ef",
+                1000,
+                |t| t.len() as i32
+            ),
+            ["ab cd", "ef"]
+        );
+        // 200 wide: padding, radio and gap leave 138 px, 19 characters of 7 px.
+        let note = "aaaa bbbb cccc dddd
+ee"
+        .to_owned();
+        let one_line = 2 * CHOICE_PAD_Y + 20 + 18;
+        let mut f = Form::new(vec![
+            Item::new(
+                1,
+                Place::new(0, 0, 200, one_line),
+                Kind::Choice {
+                    group: 1,
+                    title: "ab".into(),
+                    note,
+                    selected: true,
+                    aside: None,
+                },
+            ),
+            Item::new(2, Place::at(0, one_line), Kind::Switch { on: false }),
+        ]);
+        f.lay_out(96, &Fixed(96));
+        assert_eq!(f.laid()[0].lines, ["aaaa bbbb cccc dddd", "ee"]);
+        assert_eq!(f.laid()[0].rect, rect(0, 0, 200, one_line + 18));
+        assert_eq!(f.laid()[1].rect.top, one_line + 18, "pushed down");
     }
 
     #[test]

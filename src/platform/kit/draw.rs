@@ -515,7 +515,21 @@ fn paint_item(p: &mut Pen, item: &Item, laid: &Laid, look: &Look) {
             }
             let x = r.left + pad_x + radio + px(SPACE_3, p.dpi);
             p.text(Style::BodyStrong, c.ink, x, top, title);
-            p.text(Style::Caption, c.muted, x, top + title_lh, note);
+            let caption_lh = p.lh(Style::Caption);
+            let notes = if laid.lines.is_empty() {
+                std::slice::from_ref(note)
+            } else {
+                laid.lines.as_slice()
+            };
+            for (k, line) in (0..).zip(notes) {
+                p.text(
+                    Style::Caption,
+                    c.muted,
+                    x,
+                    top + title_lh + k * caption_lh,
+                    line,
+                );
+            }
             if let Some(aside) = aside {
                 let (aw, ah) = (px(aside.w, p.dpi), px(aside.h, p.dpi));
                 let at = boxed(r.right - pad_x - aw, r.top + (h - ah) / 2, aw, ah);

@@ -1,4 +1,4 @@
-//! breakpoint: single-instance guard, message loop (with IsDialogMessage) and wiring.
+//! breakpoint: single-instance guard, message loop and wiring.
 
 #![windows_subsystem = "windows"]
 
@@ -385,13 +385,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut msg = MSG::default();
     // SAFETY: the standard message loop over a valid MSG.
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
-        // The wizard takes its keys (Tab, Enter, Esc) first; the settings window, a kit
-        // window, takes them as plain key messages.
-        if !platform::dialogs::is_dialog_message(&msg) {
-            unsafe {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
+        // The wizard and the settings window are kit windows: they take their keys (Tab,
+        // Enter, Esc) as plain key messages.
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
         }
         let mut running = true;
         with_app(|app| running = app.tray_command());
