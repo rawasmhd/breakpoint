@@ -355,7 +355,7 @@ src/
     popup.rs         the nudge popup window
     kit/             the painted dialog window and its controls (switch, day pill, stepper, toggle, drop-down, cards), keyboard, focus, UI Automation
     settings_window.rs  the settings window, built from the kit
-    dialogs.rs       the wizard, built from the kit
+    dialogs.rs       the first-run wizard, built from the kit, and its day timelines
     startup.rs       Run key
     clock.rs         local time and UTC offset
 tests/

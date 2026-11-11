@@ -2,7 +2,8 @@
 
 pub mod clock;
 pub mod dialogs;
-// The form kit: the settings window uses it; the wizard (#79) will use the rest.
+// The form kit. Part of its API has no caller yet: ghost buttons, `set_text` and `fit`, and
+// `focused`, which UI Automation (#80) will use.
 #[allow(dead_code)]
 pub mod kit;
 pub mod log;
