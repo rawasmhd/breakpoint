@@ -6,6 +6,10 @@
 //! - Theme: [`theme::app_theme`], read again on `WM_SETTINGCHANGE`; high contrast paints with the
 //!   system colours ([`Colours::now`]) and no menu shadow.
 //! - DPI: PerMonitorV2. `WM_DPICHANGED` lays the form out again and resizes the window to fit.
+//! - Size: a window too tall for its monitor's work area takes the work area's height; the
+//!   content above the footer band scrolls under the caption and the band stays in view
+//!   ([`Scroll`], issue #84). The wheel, a painted scrollbar and keyboard focus scroll it. The
+//!   window fits itself again on a DPI change, a move to another monitor and a work-area change.
 //! - Input: keys and the pointer go to the [`Form`]; its [`Event`]s go to the caller's callback,
 //!   called with no state borrowed, so it may call back through the [`Handle`], show a message
 //!   box or close the window.
@@ -22,8 +26,9 @@ use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, ClientToScreen, EndPaint, GetDC, GetMonitorInfoW, InvalidateRect,
-    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, PAINTSTRUCT, ReleaseDC,
+    BeginPaint, ClientToScreen, EndPaint, GetDC, GetMonitorInfoW, HMONITOR, InvalidateRect,
+    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, MonitorFromWindow, PAINTSTRUCT,
+    ReleaseDC, ScreenToClient,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemServices::MK_LBUTTON;
@@ -35,24 +40,28 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_DROPSHADOW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetSystemMetrics,
-    GetWindowLongPtrW, GetWindowRect, HICON, IDC_ARROW, IMAGE_ICON, IsWindow, KillTimer,
-    LR_DEFAULTCOLOR, LoadCursorW, LoadImageW, MA_NOACTIVATE, RegisterClassExW, SM_CXICON,
-    SM_CXSMICON, SM_CYICON, SM_CYSMICON, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER,
-    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, WA_INACTIVE,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE,
-    WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOVE, WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_NCRBUTTONDOWN,
+    CS_DROPSHADOW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect,
+    GetCursorPos, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, HICON, IDC_ARROW, IMAGE_ICON,
+    IsWindow, KillTimer, LR_DEFAULTCOLOR, LoadCursorW, LoadImageW, MA_NOACTIVATE, RegisterClassExW,
+    SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, SPI_GETWHEELSCROLLLINES, SPI_SETWORKAREA,
+    SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    SystemParametersInfoW, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE,
+    WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND,
+    WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_NCRBUTTONDOWN,
     WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE, WM_SYSKEYDOWN, WM_THEMECHANGED,
     WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU,
 };
 use windows::core::{BOOL, HSTRING, PCWSTR, Result, w};
 
 use super::draw::{self, GdiMeasure};
-use super::form::{Form, Key, MenuLayout, menu_layout, menu_place, rect};
+use super::form::{Form, Key, MenuLayout, Scroll, inside, menu_layout, menu_place, rect};
 use super::{Event, Id, Item, Value};
-use crate::platform::paint::{self, FRAME};
-use crate::platform::theme::{self, Colours, FontCache, Fonts, MENU_GAP, Theme, px};
+use crate::platform::paint::{self, FRAME, HOVER, REST, step_fill};
+use crate::platform::theme::{
+    self, Colours, FontCache, Fonts, MENU_GAP, SCROLL_LINE, SCROLL_ROOM, Theme, px,
+};
 
 /// The app icon in the caption and on the taskbar (`build.rs` embeds it as icon 1).
 const APP_ICON: u16 = 1;
@@ -100,16 +109,55 @@ struct Host {
     on_event: Option<Callback>,
     /// Events waiting for the callback, in order.
     queue: VecDeque<Event>,
+    /// How the form scrolls when the window is shorter than the form.
+    scroll: Scroll,
+    /// The scrollbar's width level (0 at rest, 1 hot), whether the pointer is over it, and a
+    /// thumb drag: the client y and the offset where it began.
+    bar_level: f32,
+    bar_hot: bool,
+    drag: Option<(i32, i32)>,
 }
 
 impl Host {
-    /// Lays the form out at `dpi`; returns the client size in pixels, its height grown for
-    /// wrapped text that needs more lines at this DPI.
-    fn relayout(&mut self, dpi: u32) -> (i32, i32) {
+    /// Lays the form out at `dpi` for a window on the work area `work`; returns the client
+    /// size in pixels. The height is the form's, grown for wrapped text that needs more lines
+    /// at this DPI, or as much as the work area leaves under the caption when that is less;
+    /// then the form scrolls.
+    fn relayout(&mut self, dpi: u32, work: RECT) -> (i32, i32) {
+        let before = self.form.dpi();
         let fonts = self.fonts.at(dpi);
         with_screen_measure(fonts, |m| self.form.lay_out(dpi, m));
-        self.client = (px(self.size.0, dpi), self.form.height(self.size.1));
+        let (w, full) = (px(self.size.0, dpi), self.form.height(self.size.1));
+        let frame = window_size((w, full), dpi).1 - full;
+        // The same place in the form across a DPI change.
+        let offset = self.scroll.offset() * dpi as i32 / before.max(1) as i32;
+        self.scroll = Scroll::new(full, self.form.footer(), work.bottom - work.top - frame);
+        self.scroll.scroll_to(offset);
+        self.client = (w, self.scroll.view());
         self.client
+    }
+
+    /// Scrolls the focused control into view with `scroll-room` round it.
+    fn reveal_focus(&mut self) -> bool {
+        let room = px(SCROLL_ROOM, self.form.dpi());
+        let focused = self.form.focus_rect();
+        focused.is_some_and(|r| self.scroll.reveal(r, room))
+    }
+
+    /// The pointer is at client (`x`, `y`): a thumb drag, the scrollbar's hover and the form's
+    /// hover follow it. True when the look changed.
+    fn hover(&mut self, x: i32, y: i32, down: bool) -> bool {
+        let dpi = self.form.dpi();
+        if let Some((from_y, from)) = self.drag {
+            return self.scroll.drag(from, y - from_y, dpi);
+        }
+        let hot = self
+            .scroll
+            .bar(self.client.0, dpi)
+            .is_some_and(|bar| inside(&bar, x, y));
+        let bar = std::mem::replace(&mut self.bar_hot, hot) != hot;
+        let (fx, fy) = self.scroll.in_form(x, y);
+        self.form.pointer_move(fx, fy, down) || bar
     }
 
     fn restyle(&mut self) {
@@ -222,6 +270,15 @@ impl Handle {
         with_host(self.0, |h| h.form.focused()).flatten()
     }
 
+    /// Where item `id` is on screen now, the scroll applied, as [`on_screen`] gives it.
+    pub fn screen_rect(self, id: Id) -> Option<RECT> {
+        with_host(self.0, |h| {
+            let i = h.form.index(id)?;
+            Some(on_screen(self.0, &h.scroll, h.form.laid()[i].rect))
+        })
+        .flatten()
+    }
+
     /// Sets a control's value without an event, as when a profile fills the numbers.
     pub fn set(self, id: Id, value: Value) -> bool {
         let done = with_host(self.0, |h| h.form.set(id, value)).unwrap_or(false);
@@ -241,25 +298,31 @@ impl Handle {
     /// corner (moved only as far as needed to stay in the work area). Call it after changes
     /// that alter text, such as a new work-week line in the wizard.
     pub fn fit(self) {
+        let work = work_area(self.0);
         let Some((client, dpi)) = with_host(self.0, |h| {
             let dpi = h.form.dpi();
-            (h.relayout(dpi), dpi)
+            (h.relayout(dpi, work), dpi)
         }) else {
             return;
         };
         let (w, h) = window_size(client, dpi);
         let now = self.window_rect();
-        let (x, y) = keep_inside(now.left, now.top, w, h, work_area(self.0));
+        let (x, y) = keep_inside(now.left, now.top, w, h, work);
         // SAFETY: no state borrow is held.
         unsafe { move_to(self.0, rect(x, y, w, h)) };
         refresh(self.0);
     }
 
-    /// Gives the window the keyboard focus, moves it to item `id` and shows the focus ring,
-    /// as after a refused Save: the ring shows even when Save was clicked, so the user sees
-    /// which control to fix.
+    /// Gives the window the keyboard focus, moves it to item `id`, scrolls it into view and
+    /// shows the focus ring, as after a refused Save: the ring shows even when Save was
+    /// clicked, so the user sees which control to fix.
     pub fn focus(self, id: Id) {
-        let events = with_host(self.0, |h| h.form.focus(id)).unwrap_or_default();
+        let events = with_host(self.0, |h| {
+            let events = h.form.focus(id);
+            h.reveal_focus();
+            events
+        })
+        .unwrap_or_default();
         // SAFETY: no pointers.
         let _ = unsafe { SetFocus(Some(self.0)) };
         after(self.0);
@@ -271,6 +334,42 @@ impl Handle {
 #[cfg(test)]
 pub(crate) fn menu_of(handle: Handle) -> Option<HWND> {
     with_host(handle.0, |h| h.menu).flatten()
+}
+
+/// The window's scroll, for tests.
+#[cfg(test)]
+pub(crate) fn scroll_of(handle: Handle) -> Option<Scroll> {
+    with_host(handle.0, |h| h.scroll)
+}
+
+#[cfg(test)]
+thread_local! {
+    static PRETEND_WORK: std::cell::Cell<Option<RECT>> = const { std::cell::Cell::new(None) };
+}
+
+/// Makes kit windows opened or fitted on this thread take `work` as their monitor's work
+/// area, so a test can try a small screen on any screen. `None` goes back to the real one.
+#[cfg(test)]
+pub(crate) fn pretend_work_area(work: Option<RECT>) {
+    PRETEND_WORK.set(work);
+}
+
+/// The on-screen rectangle of `laid`, a rectangle in form pixels from the window's layout
+/// (an item's [`super::form::Laid::rect`] or one of its parts), with the window's `scroll`
+/// applied: where it shows now. Part of it may be scrolled out of view; [`Scroll::shown`]
+/// says whether any of it shows. The drop-down menu opens from it, and screen readers (#80)
+/// take control bounds from it. Sends no message, so it may run with the state borrowed.
+pub fn on_screen(hwnd: HWND, scroll: &Scroll, laid: RECT) -> RECT {
+    let r = scroll.on_client(laid);
+    let mut corner = POINT::default();
+    // SAFETY: `corner` is a valid in-out pointer; this sends no message.
+    let _ = unsafe { ClientToScreen(hwnd, &mut corner) };
+    RECT {
+        left: r.left + corner.x,
+        top: r.top + corner.y,
+        right: r.right + corner.x,
+        bottom: r.bottom + corner.y,
+    }
 }
 
 fn register() {
@@ -361,12 +460,16 @@ pub fn open(spec: Spec, on_event: impl FnMut(Handle, Event) + 'static) -> Result
             menu_outline: false,
             on_event: Some(Box::new(on_event)),
             queue: VecDeque::new(),
+            scroll: Scroll::default(),
+            bar_level: REST,
+            bar_hot: false,
+            drag: None,
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(host) as isize);
         let dpi = GetDpiForWindow(hwnd);
-        let client = with_host(hwnd, |h| h.relayout(dpi)).unwrap_or_default();
-        let (w, h) = window_size(client, dpi);
         let work = work_area(hwnd);
+        let client = with_host(hwnd, |h| h.relayout(dpi, work)).unwrap_or_default();
+        let (w, h) = window_size(client, dpi);
         let (x, y) = match spec.at {
             Some(p) => keep_inside(p.x, p.y, w, h, work),
             None => (
@@ -390,22 +493,89 @@ fn keep_inside(x: i32, y: i32, w: i32, h: i32, work: RECT) -> (i32, i32) {
 }
 
 /// The window size for a client area of `client` pixels at `dpi`.
-fn window_size(client: (i32, i32), dpi: u32) -> (i32, i32) {
+pub(crate) fn window_size(client: (i32, i32), dpi: u32) -> (i32, i32) {
     let mut r = rect(0, 0, client.0, client.1);
     // SAFETY: `r` is a valid in-out pointer.
     let _ = unsafe { AdjustWindowRectExForDpi(&mut r, STYLE, false, WINDOW_EX_STYLE(0), dpi) };
     (r.right - r.left, r.bottom - r.top)
 }
 
+/// The work area of the monitor the window is on.
 fn work_area(hwnd: HWND) -> RECT {
+    // SAFETY: no pointers.
+    work_of(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) })
+}
+
+fn work_of(monitor: HMONITOR) -> RECT {
+    #[cfg(test)]
+    if let Some(work) = PRETEND_WORK.get() {
+        return work;
+    }
     let mut info = MONITORINFO {
         cbSize: size_of::<MONITORINFO>() as u32,
         ..Default::default()
     };
     // SAFETY: `info` is a valid MONITORINFO with its size set.
-    let _ =
-        unsafe { GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info) };
+    let _ = unsafe { GetMonitorInfoW(monitor, &mut info) };
     info.rcWork
+}
+
+/// Fits the window again to the work area of the monitor it is on now: after a move to
+/// another monitor, a change of the work area (the taskbar moved or grew) or of the display.
+/// Nothing moves or resizes when the client size stays; otherwise the window keeps its
+/// top-left corner as far as the work area allows.
+fn refit(hwnd: HWND) {
+    let work = work_area(hwnd);
+    let Some((client, before, dpi)) = with_host(hwnd, |h| {
+        let (before, dpi) = (h.client, h.form.dpi());
+        (h.relayout(dpi, work), before, dpi)
+    }) else {
+        return;
+    };
+    if client != before {
+        close_menu(hwnd);
+        let (w, h) = window_size(client, dpi);
+        let mut now = RECT::default();
+        // SAFETY: a valid out-pointer.
+        let _ = unsafe { GetWindowRect(hwnd, &mut now) };
+        let (x, y) = keep_inside(now.left, now.top, w, h, work);
+        // SAFETY: no state borrow is held.
+        unsafe { move_to(hwnd, rect(x, y, w, h)) };
+    }
+    refresh(hwnd);
+}
+
+/// The lines one wheel notch scrolls, as the user set it; `u32::MAX` is a page.
+fn wheel_lines() -> u32 {
+    let mut lines = 3u32;
+    // SAFETY: `lines` is a valid out-pointer of the size this action wants.
+    let _ = unsafe {
+        SystemParametersInfoW(
+            SPI_GETWHEELSCROLLLINES,
+            0,
+            Some(&mut lines as *mut u32 as _),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    lines
+}
+
+/// After a scroll: the hover follows what is now under the pointer, if it is over the window.
+fn repoint(hwnd: HWND) {
+    let mut at = POINT::default();
+    let mut client = RECT::default();
+    // SAFETY: valid out-pointers; these send no message.
+    unsafe {
+        if GetCursorPos(&mut at).is_err() || !ScreenToClient(hwnd, &mut at).as_bool() {
+            return;
+        }
+        let _ = GetClientRect(hwnd, &mut client);
+    }
+    if inside(&client, at.x, at.y) {
+        // SAFETY: no pointers.
+        let down = unsafe { GetKeyState(VK_LBUTTON.0.into()) } < 0;
+        with_host(hwnd, |h| h.hover(at.x, at.y, down));
+    }
 }
 
 /// Tints the frame to the theme: dark mode, then on Windows 11 the caption, its text and the
@@ -464,7 +634,14 @@ fn frame(hwnd: HWND) {
         let now = Instant::now();
         let dt = now - h.last_frame;
         h.last_frame = now;
-        h.form.tick(dt, animate)
+        let form = h.form.tick(dt, animate);
+        let bar = if h.bar_hot || h.drag.is_some() {
+            HOVER
+        } else {
+            REST
+        };
+        h.bar_level = step_fill(h.bar_level, bar, dt, animate);
+        form || h.bar_level != bar
     });
     // SAFETY: no pointers.
     unsafe {
@@ -485,11 +662,28 @@ fn paint(hwnd: HWND) {
             let (w, ht) = h.client;
             let c = h.colours;
             let looks = h.form.looks();
+            let scroll = h.scroll;
+            let thumb = scroll.thumb(w, dpi, h.bar_level);
             let form = &h.form;
             let fonts = h.fonts.at(dpi);
-            draw::buffered(dc, w, ht, c.ground, fonts, dpi, |canvas, m, runs| {
-                draw::paint_form(canvas, form, &looks, &c, m, runs);
-            });
+            if scroll.scrolls() {
+                draw::buffered_scrolled(
+                    dc,
+                    w,
+                    &scroll,
+                    &c,
+                    fonts,
+                    dpi,
+                    thumb,
+                    |canvas, m, runs| {
+                        draw::paint_form(canvas, form, &looks, &c, m, runs);
+                    },
+                );
+            } else {
+                draw::buffered(dc, w, ht, c.ground, fonts, dpi, |canvas, m, runs| {
+                    draw::paint_form(canvas, form, &looks, &c, m, runs);
+                });
+            }
         });
         let _ = EndPaint(hwnd, &ps);
     }
@@ -512,7 +706,7 @@ fn sync_menu(hwnd: HWND) {
     let plan = with_host(hwnd, |h| match (h.form.menu(), h.menu) {
         (Some(menu), existing) => {
             let dpi = h.form.dpi();
-            let field = h.form.laid()[menu.item].rect;
+            let laid = h.form.laid()[menu.item].rect;
             let client_w = h.client.0;
             let entries = h
                 .form
@@ -521,22 +715,12 @@ fn sync_menu(hwnd: HWND) {
                 .unwrap_or_default();
             let fonts = h.fonts.at(dpi);
             let layout = with_screen_measure(fonts, |m| {
-                menu_layout(&entries, field.right - field.left, dpi, m)
+                menu_layout(&entries, laid.right - laid.left, dpi, m)
             });
-            let mut corner = POINT {
-                x: field.left,
-                y: field.top,
-            };
-            // SAFETY: `corner` is a valid in-out pointer; this sends no message.
-            let _ = unsafe { ClientToScreen(hwnd, &mut corner) };
+            // Where the field shows now, after any scroll.
+            let field = on_screen(hwnd, &h.scroll, laid);
             // The client area's right edge on screen.
-            let edge = corner.x - field.left + client_w;
-            let field = rect(
-                corner.x,
-                corner.y,
-                field.right - field.left,
-                field.bottom - field.top,
-            );
+            let edge = field.left - laid.left + client_w;
             let place = menu_place(
                 field,
                 layout.w,
@@ -762,9 +946,19 @@ fn key_for(vk: u16, shift: bool, alt: bool) -> Option<Key> {
     (!alt || matches!(key, Key::AltUp | Key::AltDown)).then_some(key)
 }
 
-/// Feeds `key` to the form and hands on what it returns.
+/// Feeds `key` to the form and hands on what it returns. A key that moves the focus or acts
+/// on the focused control scrolls that control into view; Enter and Esc, which press a
+/// button, scroll nothing unless they move the focus.
 fn on_key(hwnd: HWND, key: Key) {
-    let events = with_host(hwnd, |h| h.form.key(key)).unwrap_or_default();
+    let events = with_host(hwnd, |h| {
+        let before = h.form.focused();
+        let events = h.form.key(key);
+        if !matches!(key, Key::Enter | Key::Esc) || h.form.focused() != before {
+            h.reveal_focus();
+        }
+        events
+    })
+    .unwrap_or_default();
     after(hwnd);
     emit(hwnd, events);
 }
@@ -822,7 +1016,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let (x, y) = point(lparam);
                 let down = wparam.0 & MK_LBUTTON.0 as usize != 0;
                 let moved = with_host(hwnd, |h| {
-                    let changed = h.form.pointer_move(x, y, down);
+                    let changed = h.hover(x, y, down);
                     let track = !std::mem::replace(&mut h.tracking, true);
                     (changed, track)
                 });
@@ -846,6 +1040,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let down = GetKeyState(VK_LBUTTON.0.into()) < 0;
                 with_host(hwnd, |h| {
                     h.tracking = false;
+                    h.bar_hot = false;
                     h.form.pointer_leave(down);
                 });
                 refresh(hwnd);
@@ -853,7 +1048,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             WM_LBUTTONDOWN => {
                 let (x, y) = point(lparam);
-                let events = with_host(hwnd, |h| h.form.pointer_down(x, y)).unwrap_or_default();
+                let on_bar = with_host(hwnd, |h| {
+                    let bar = h.scroll.bar(h.client.0, h.form.dpi());
+                    bar.is_some_and(|bar| inside(&bar, x, y))
+                });
+                if on_bar == Some(true) {
+                    // The thumb drags; the track off the thumb pages toward the click.
+                    close_menu(hwnd);
+                    with_host(hwnd, |h| {
+                        let dpi = h.form.dpi();
+                        if h.scroll.on_thumb(y, dpi) {
+                            h.drag = Some((y, h.scroll.offset()));
+                        } else {
+                            h.scroll.page_toward(y, dpi);
+                        }
+                    });
+                    SetCapture(hwnd);
+                    refresh(hwnd);
+                    return LRESULT(0);
+                }
+                let events = with_host(hwnd, |h| {
+                    let (fx, fy) = h.scroll.in_form(x, y);
+                    h.form.pointer_down(fx, fy)
+                })
+                .unwrap_or_default();
                 SetCapture(hwnd);
                 after(hwnd);
                 emit(hwnd, events);
@@ -861,15 +1079,42 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             WM_LBUTTONUP => {
                 let (x, y) = point(lparam);
-                let events = with_host(hwnd, |h| h.form.pointer_up(x, y)).unwrap_or_default();
+                if with_host(hwnd, |h| h.drag.take().is_some()) == Some(true) {
+                    let _ = ReleaseCapture();
+                    refresh(hwnd);
+                    return LRESULT(0);
+                }
+                let events = with_host(hwnd, |h| {
+                    let (fx, fy) = h.scroll.in_form(x, y);
+                    h.form.pointer_up(fx, fy)
+                })
+                .unwrap_or_default();
                 let _ = ReleaseCapture();
                 after(hwnd);
                 emit(hwnd, events);
                 LRESULT(0)
             }
             WM_CAPTURECHANGED => {
-                with_host(hwnd, |h| h.form.pointer_cancel());
+                with_host(hwnd, |h| {
+                    h.drag = None;
+                    h.form.pointer_cancel();
+                });
                 refresh(hwnd);
+                LRESULT(0)
+            }
+            WM_MOUSEWHEEL => {
+                let delta = i32::from((wparam.0 >> 16) as u16 as i16);
+                let lines = wheel_lines();
+                let moved = with_host(hwnd, |h| {
+                    let line = px(SCROLL_LINE, h.form.dpi());
+                    h.scroll.wheel(delta, lines, line)
+                });
+                if moved == Some(true) {
+                    // The menu hangs from its field, which has moved.
+                    close_menu(hwnd);
+                    repoint(hwnd);
+                    refresh(hwnd);
+                }
                 LRESULT(0)
             }
             WM_NCLBUTTONDOWN | WM_NCRBUTTONDOWN => {
@@ -888,14 +1133,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 with_host(hwnd, |h| h.restyle());
                 apply_frame(hwnd);
                 close_menu(hwnd);
+                if msg == WM_SETTINGCHANGE && wparam.0 as u32 == SPI_SETWORKAREA.0 {
+                    refit(hwnd);
+                }
                 refresh(hwnd);
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            // A move may end on a monitor of another size at the same DPI.
+            WM_EXITSIZEMOVE | WM_DISPLAYCHANGE => {
+                refit(hwnd);
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_DPICHANGED => {
                 let dpi = (wparam.0 & 0xffff) as u32;
                 let suggested = *(lparam.0 as *const RECT);
                 close_menu(hwnd);
-                if let Some(client) = with_host(hwnd, |h| h.relayout(dpi)) {
+                // The new monitor's work area; Windows' place for the window is kept.
+                let work = work_of(MonitorFromRect(&suggested, MONITOR_DEFAULTTONEAREST));
+                if let Some(client) = with_host(hwnd, |h| h.relayout(dpi, work)) {
                     let (w, h) = window_size(client, dpi);
                     move_to(hwnd, rect(suggested.left, suggested.top, w, h));
                     refresh(hwnd);
@@ -999,5 +1254,200 @@ mod tests {
         );
         assert_eq!(key_for(VK_NEXT.0, false, false), Some(Key::PageDown));
         assert_eq!(key_for(b'A'.into(), false, false), None);
+    }
+
+    // ---- Scrolling (issue #84) ----
+
+    use super::super::{ButtonKind, Entry, Kind, Place};
+    use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+
+    const SAVE: Id = 1;
+    const DROP: Id = 2;
+
+    /// A form 984 tall at 96 DPI: twenty switches, a drop-down near the bottom, and Save in a
+    /// footer band.
+    fn tall_spec() -> Spec {
+        let mut items: Vec<Item> = (0..20)
+            .map(|k| {
+                Item::new(
+                    100 + k,
+                    Place::at(24, 24 + 40 * i32::from(k)),
+                    Kind::Switch { on: false },
+                )
+            })
+            .collect();
+        items.push(Item::new(
+            DROP,
+            Place::new(24, 840, 160, 0),
+            Kind::DropDown {
+                entries: vec![Entry::new("One", None), Entry::new("Two", None)],
+                current: Some(0),
+                other: "Custom".into(),
+            },
+        ));
+        items.push(Item::new(0, Place::new(0, 920, 300, 64), Kind::Band));
+        items.push(Item::new(
+            SAVE,
+            Place::new(188, 936, 88, 0),
+            Kind::Button {
+                label: "Save".into(),
+                kind: ButtonKind::Primary,
+                default: true,
+                cancel: true,
+            },
+        ));
+        Spec {
+            caption: "kit scroll test".into(),
+            width: 300,
+            height: 0,
+            items,
+            at: None,
+            owner: None,
+        }
+    }
+
+    /// A work area 400 tall at the top-left of the real one: too small for the tall form at
+    /// any scale, on any screen.
+    fn small_work() -> RECT {
+        let real = work_of(unsafe { MonitorFromWindow(HWND::default(), MONITOR_DEFAULTTONEAREST) });
+        rect(real.left, real.top, real.right - real.left, 400)
+    }
+
+    /// The window's client area on screen.
+    fn client_on_screen(handle: Handle) -> RECT {
+        let mut r = RECT::default();
+        unsafe { GetClientRect(handle.hwnd(), &mut r).unwrap() };
+        let mut corner = POINT::default();
+        let _ = unsafe { ClientToScreen(handle.hwnd(), &mut corner) };
+        rect(corner.x, corner.y, r.right, r.bottom)
+    }
+
+    fn within(inner: RECT, outer: RECT) -> bool {
+        inner.left >= outer.left
+            && inner.right <= outer.right
+            && inner.top >= outer.top
+            && inner.bottom <= outer.bottom
+    }
+
+    fn send(handle: Handle, msg: u32, wparam: usize) {
+        unsafe {
+            SendMessageW(handle.hwnd(), msg, Some(WPARAM(wparam)), Some(LPARAM(0)));
+        }
+    }
+
+    /// One wheel notch toward the user (down) or away (up).
+    fn wheel(handle: Handle, down: bool) {
+        let delta: i16 = if down { -120 } else { 120 };
+        send(handle, WM_MOUSEWHEEL, usize::from(delta as u16) << 16);
+    }
+
+    #[test]
+    fn a_window_too_tall_for_its_work_area_scrolls_and_keeps_save_on_screen() {
+        let work = small_work();
+        pretend_work_area(Some(work));
+        let handle = open(tall_spec(), |_, _| {}).unwrap();
+        pretend_work_area(None);
+        let window = handle.window_rect();
+        assert!(within(window, work), "{window:?} in {work:?}");
+        assert_eq!(
+            window.bottom - window.top,
+            400,
+            "it takes the work area's height"
+        );
+        let scroll = scroll_of(handle).unwrap();
+        assert!(scroll.scrolls());
+        let client = client_on_screen(handle);
+        assert_eq!(client.bottom - client.top, scroll.view());
+        let save = handle.screen_rect(SAVE).unwrap();
+        assert!(within(save, client), "Save {save:?} shows in {client:?}");
+
+        // The wheel reaches the end, and Save stays where it was.
+        let lines = wheel_lines();
+        let mut notches = 0;
+        while scroll_of(handle).unwrap().offset() < scroll.range() && notches < 200 {
+            wheel(handle, true);
+            notches += 1;
+        }
+        if lines > 0 {
+            assert_eq!(scroll_of(handle).unwrap().offset(), scroll.range());
+        }
+        assert_eq!(handle.screen_rect(SAVE), Some(save));
+        let last = handle.screen_rect(119).unwrap();
+        if lines > 0 {
+            assert!(within(last, client), "the last switch shows: {last:?}");
+        }
+        wheel(handle, false);
+        if lines > 0 {
+            assert!(scroll_of(handle).unwrap().offset() < scroll.range());
+        }
+
+        // Tab reaches every control, each scrolled fully into view, and wraps to the top.
+        for _ in 0..22 {
+            send(handle, WM_KEYDOWN, VK_TAB.0.into());
+            let id = handle.focused().unwrap();
+            let r = handle.screen_rect(id).unwrap();
+            assert!(within(r, client), "{id} at {r:?} in {client:?}");
+        }
+        assert_eq!(handle.focused(), Some(100));
+        // Back at the top, with `scroll-room` above the first switch.
+        let dpi = unsafe { GetDpiForWindow(handle.hwnd()) };
+        assert_eq!(
+            scroll_of(handle).unwrap().offset(),
+            (px(24, dpi) - px(SCROLL_ROOM, dpi)).max(0)
+        );
+        handle.close();
+    }
+
+    #[test]
+    fn the_menu_opens_from_where_its_field_is_after_scrolling() {
+        pretend_work_area(Some(small_work()));
+        let handle = open(tall_spec(), |_, _| {}).unwrap();
+        pretend_work_area(None);
+        // Focus scrolls the drop-down into view; Space opens its menu there.
+        handle.focus(DROP);
+        assert!(scroll_of(handle).unwrap().offset() > 0);
+        let field = handle.screen_rect(DROP).unwrap();
+        assert!(within(field, client_on_screen(handle)));
+        send(handle, WM_KEYDOWN, VK_SPACE.0.into());
+        let menu = menu_of(handle).expect("the menu is open");
+        let mut m = RECT::default();
+        unsafe { GetWindowRect(menu, &mut m).unwrap() };
+        let gap = px(MENU_GAP, unsafe { GetDpiForWindow(handle.hwnd()) });
+        assert_eq!(m.left, field.left);
+        assert!(
+            m.top == field.bottom + gap || m.bottom == field.top - gap,
+            "{m:?} hangs from {field:?}"
+        );
+        // The wheel moves the field away from its menu, so the menu closes.
+        wheel(handle, false);
+        if wheel_lines() > 0 {
+            assert_eq!(menu_of(handle), None);
+        }
+        handle.close();
+    }
+
+    #[test]
+    fn a_window_that_fits_its_work_area_does_not_scroll() {
+        let mut spec = tall_spec();
+        spec.items
+            .retain(|item| item.id == SAVE || item.at.y < 200 || matches!(item.kind, Kind::Band));
+        for item in &mut spec.items {
+            if item.at.y >= 920 {
+                item.at.y -= 720;
+            }
+        }
+        let handle = open(spec, |_, _| {}).unwrap();
+        let scroll = scroll_of(handle).unwrap();
+        assert!(!scroll.scrolls());
+        let client = client_on_screen(handle);
+        assert_eq!(client.bottom - client.top, scroll.full());
+        assert_eq!(
+            scroll.full(),
+            px(264, unsafe { GetDpiForWindow(handle.hwnd()) })
+        );
+        let offset = scroll.offset();
+        wheel(handle, true);
+        assert_eq!(scroll_of(handle).unwrap().offset(), offset);
+        handle.close();
     }
 }

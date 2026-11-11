@@ -244,6 +244,18 @@ pub const MENU_GAP: i32 = 4;
 pub const CHOICE_PAD_Y: i32 = 14;
 pub const CHOICE_PAD_X: i32 = 16;
 
+/// The scrollbar of a dialog taller than its work area (issue #84): the thumb's width at rest
+/// and under the pointer, its gap to the window's right edge and to the footer band, and its
+/// shortest length. The thumb is `line-strong` with round ends, on no track.
+pub const SCROLLBAR_W: i32 = 4;
+pub const SCROLLBAR_HOT_W: i32 = 8;
+pub const SCROLLBAR_INSET: i32 = 2;
+pub const SCROLLBAR_MIN: i32 = 32;
+/// How far one wheel line scrolls a dialog: one `body` line.
+pub const SCROLL_LINE: i32 = Style::Body.line_height();
+/// Room kept round a control that keyboard focus scrolls into view.
+pub const SCROLL_ROOM: i32 = SPACE_4;
+
 /// The check mark, as points on its square from 0 to 1, drawn with [`MARK_STROKE`].
 pub const CHECK_POINTS: [(f32, f32); 3] = [(0.22, 0.52), (0.42, 0.72), (0.78, 0.3)];
 /// The drop-down chevron, as points on its square from 0 to 1.

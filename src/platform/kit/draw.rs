@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::USER_DEFAULT_SCREEN_DPI as BASE_DPI;
 
-use super::form::{Form, Laid, Look, Measure, MenuLayout, Part, rect, stepper_text};
+use super::form::{Form, Laid, Look, Measure, MenuLayout, Part, Scroll, rect, stepper_text};
 use super::{ButtonKind, Entry, Ink, Item, Kind};
 use crate::platform::paint::{Box2, Canvas, Glyph, HOVER, mix};
 use crate::platform::theme::{
@@ -77,6 +77,65 @@ pub unsafe fn buffered(
         SelectObject(mem, old);
         let _ = DeleteObject(bitmap.into());
         let _ = DeleteDC(mem);
+    }
+}
+
+/// As [`buffered`] for a form taller than its window (issue #84): paints the whole form,
+/// `scroll.full()` tall, off screen with `paint`, then copies onto `dc` the part of the content
+/// that `scroll` shows and the footer band under it, `scroll.view()` tall in all, and lays the
+/// scrollbar's `thumb` over them: `line-strong` (the `edge` colour, a system colour in high
+/// contrast), with round ends.
+///
+/// # Safety
+/// `dc` must be a live device context.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn buffered_scrolled(
+    dc: HDC,
+    w: i32,
+    scroll: &Scroll,
+    c: &Colours,
+    fonts: &Fonts,
+    dpi: u32,
+    thumb: Option<Box2>,
+    paint: impl FnOnce(&Canvas, &dyn Measure, &mut Vec<Run>),
+) {
+    let (full, view, content) = (scroll.full(), scroll.view(), scroll.content());
+    // SAFETY: every GDI object made here is freed here; `dc` is live per the contract; the
+    // canvas drops before its device context.
+    unsafe {
+        let whole = CreateCompatibleDC(Some(dc));
+        let whole_bitmap = CreateCompatibleBitmap(dc, w, full);
+        let old_whole = SelectObject(whole, whole_bitmap.into());
+        paint_on(whole, w, full, c.ground, fonts, dpi, paint);
+        let shown = CreateCompatibleDC(Some(dc));
+        let shown_bitmap = CreateCompatibleBitmap(dc, w, view);
+        let old_shown = SelectObject(shown, shown_bitmap.into());
+        let from = Some(whole);
+        let _ = BitBlt(shown, 0, 0, w, content, from, 0, scroll.offset(), SRCCOPY);
+        let footer = content + scroll.range();
+        let _ = BitBlt(
+            shown,
+            0,
+            content,
+            w,
+            view - content,
+            from,
+            0,
+            footer,
+            SRCCOPY,
+        );
+        if let Some(b) = thumb
+            && let Some(canvas) = Canvas::new(shown)
+        {
+            canvas.fill_round_rect(c.edge, b, b.w / 2.0);
+        }
+        let _ = BitBlt(dc, 0, 0, w, view, Some(shown), 0, 0, SRCCOPY);
+        SelectObject(shown, old_shown);
+        let _ = DeleteObject(shown_bitmap.into());
+        let _ = DeleteDC(shown);
+        SelectObject(whole, old_whole);
+        let _ = DeleteObject(whole_bitmap.into());
+        let _ = DeleteDC(whole);
     }
 }
 

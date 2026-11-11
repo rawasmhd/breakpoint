@@ -146,6 +146,7 @@ Sizes are at 96 DPI. `on-ink` is the `surface` token. The "Press / on" column is
 | Card | `surface-raised`, 1px `line`, `radius-md`, `space-4` side padding, hairlines between rows. | As the size column. | None. | None. | None. |
 | Text | Any type style, in `ink` or `ink-muted`. | As the size column. | None. | None. | None. |
 | Focus ring | 2px `ink` (the `focus` token), 2px gap, following the shape of the control. | Hidden. | None. | None. | Shown after keyboard use, with no transition. |
+| Scrollbar | Only on a dialog too tall for its work area. A thumb at the right edge, 2 in from the edge and from the ends of the scrolling part, at least 32 long, `radius-full`, on no track. | 4 wide, `line-strong`. | 8 wide. | Dragged: 8 wide. A click off the thumb pages toward it. | None. |
 
 - The drop-down menu opens below the field, left edges lined up. When there is no room below, it opens above. A menu wider than its field that would hang past the window's right edge lines up its right edge with the field's instead.
 - The ring shows only after keyboard use, as Windows does with `UISF_HIDEFOCUS`. A click does not show it.
@@ -153,6 +154,7 @@ Sizes are at 96 DPI. `on-ink` is the `surface` token. The "Press / on" column is
 - A typed stepper value outside its range stays as typed, so Save can name it ([SPEC.md](SPEC.md) §9.2).
 - A number typed in a stepper takes effect as it is typed, so the profile drop-down shows Custom at once. Text that is no number gives back the value from before the typing.
 - Enter presses the default button, also on a closed drop-down; Space and Alt+Down open the drop-down. One Esc presses Cancel, also while typing in a stepper.
+- A dialog taller than its monitor's work area takes the work area's height. The part between the caption and the footer band scrolls; the band stays in view. The wheel scrolls it by the system's lines per notch, one `body` line each. Keyboard focus scrolls the focused control into view with `space-4` of room. The fit is checked again on a DPI change, a move to another monitor and a work-area change. A dialog that fits does not scroll and shows no scrollbar.
 
 ### Buttons
 
