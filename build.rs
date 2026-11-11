@@ -13,9 +13,10 @@ fn main() {
     println!("cargo:rerun-if-changed=src/platform/settings_ids.rs");
 
     let mut res = winresource::WindowsResource::new();
-    // Icon 1 is the exe icon and the tray's normal state; icon 2 is the greyed (quiet) state.
+    // Icon 1 is the exe icon and the tray's On state; icon 2 is Quiet, icon 3 is Pending.
     res.set_icon_with_id("assets/breakpoint.ico", "1");
     res.set_icon_with_id("assets/breakpoint-grey.ico", "2");
+    res.set_icon_with_id("assets/breakpoint-pending.ico", "3");
     res.set_manifest_file("assets/breakpoint.exe.manifest");
     // The SDK headers give the template its style names.
     res.add_toolkit_include(true);
