@@ -793,6 +793,7 @@ const WIDTH: i32 = 596;
 const GLYPH: i32 = 20;
 /// Width of each footer button and of Change…: at least `PRIMARY_MIN_WIDTH`.
 const BUTTON: i32 = 88;
+const _: () = assert!(BUTTON >= theme::PRIMARY_MIN_WIDTH);
 /// Footer band height: a button and `space-4` above and below it.
 const BAND: i32 = theme::SIZE_BUTTON + 2 * theme::SPACE_4;
 /// The time pickers.
