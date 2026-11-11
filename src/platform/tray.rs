@@ -1,6 +1,6 @@
 //! The tray-icon menu and icon states.
 //!
-//! So far the off switch with its tooltip and normal or greyed icon (SPEC §7, §8 item 1), the
+//! So far the off switch with its tooltip, the On, Pending and Quiet icons (SPEC §7, §8), the
 //! pending section (§8 item 3), the Today count (§8 item 4), Settings… and Quit. `tray-icon` runs on the app's own message loop.
 
 use std::error::Error;
@@ -11,9 +11,10 @@ use tray_icon::menu::{IsMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedM
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON, SM_CYSMICON};
 
-/// The exe's icon resources (see `build.rs`): the normal state, and the greyed one for quiet.
-const NORMAL_ICON: u16 = 1;
-const GREY_ICON: u16 = 2;
+/// The exe's icon resources (see `build.rs`), one per [`Look`].
+const ON_ICON: u16 = 1;
+const QUIET_ICON: u16 = 2;
+const PENDING_ICON: u16 = 3;
 
 /// Where the pending section goes: under the off switch and its separator, above Today.
 const PENDING_AT: usize = 2;
@@ -29,14 +30,44 @@ pub enum Command {
     Quit,
 }
 
+/// The three icon states, told apart by shape (SPEC §8, DESIGN §7).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Look {
+    /// A filled red dot: nudges can fire and nothing is pending.
+    On,
+    /// A smaller dot inside a ring: an occurrence is pending, popup shown or closed with ×.
+    Pending,
+    /// A hollow grey ring: quiet or Off.
+    Quiet,
+}
+
+impl Look {
+    /// Quiet wins over Pending; starting quiet expires what is pending anyway.
+    fn of(quiet: bool, pending: bool) -> Self {
+        if quiet {
+            Look::Quiet
+        } else if pending {
+            Look::Pending
+        } else {
+            Look::On
+        }
+    }
+}
+
 /// The icon in the notification area; dropping it removes the icon.
 pub struct Tray {
     icon: TrayIcon,
-    normal: Icon,
-    grey: Icon,
+    /// The icon for each [`Look`], in its order.
+    icons: [Icon; 3],
+    /// What the icon shows now, to skip updates that change nothing.
+    shown_look: Option<Look>,
+    /// Quiet or Off, as the off switch last said.
+    quiet: bool,
+    /// An occurrence is pending, as the pending section last said.
+    has_pending: bool,
     menu: Menu,
     switch: MenuItem,
-    /// What the off switch, tooltip and icon show now, to skip updates that change nothing.
+    /// What the off switch and tooltip show now, to skip updates that change nothing.
     shown_switch: Option<SwitchItem>,
     /// The disabled line naming the pending occurrence, e.g. "Pause pending".
     pending: MenuItem,
@@ -71,17 +102,22 @@ impl Tray {
         // SAFETY: no pointers; plain metric queries.
         let size = unsafe { (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON)) };
         let size = Some((size.0 as u32, size.1 as u32));
-        let normal = Icon::from_resource(NORMAL_ICON, size)?;
-        let grey = Icon::from_resource(GREY_ICON, size)?;
+        let icons = [
+            Icon::from_resource(ON_ICON, size)?,
+            Icon::from_resource(PENDING_ICON, size)?,
+            Icon::from_resource(QUIET_ICON, size)?,
+        ];
         let icon = TrayIconBuilder::new()
-            .with_icon(normal.clone())
+            .with_icon(icons[Look::On as usize].clone())
             .with_tooltip("breakpoint")
             .with_menu(Box::new(menu.clone()))
             .build()?;
         Ok(Self {
             icon,
-            normal,
-            grey,
+            icons,
+            shown_look: Some(Look::On),
+            quiet: false,
+            has_pending: false,
             menu,
             switch,
             shown_switch: None,
@@ -95,26 +131,39 @@ impl Tray {
         })
     }
 
-    /// Shows the off switch's label, the tooltip and the normal or greyed icon (SPEC §7 table).
+    /// Shows the off switch's label and the tooltip (SPEC §7 table), and the Quiet icon while
+    /// quiet.
     pub fn set_switch(&mut self, item: &SwitchItem) {
+        self.quiet = item.greyed;
+        self.show_look();
         if self.shown_switch.as_ref() == Some(item) {
             return;
         }
         self.switch.set_text(item.label);
-        // A failed update leaves the old look; the next change tries again.
-        let icon = if item.greyed {
-            &self.grey
-        } else {
-            &self.normal
-        };
-        let ok = self.icon.set_icon(Some(icon.clone())).is_ok()
-            && self.icon.set_tooltip(Some(&item.tooltip)).is_ok();
+        // A failed update leaves the old tooltip; the next change tries again.
+        let ok = self.icon.set_tooltip(Some(&item.tooltip)).is_ok();
         self.shown_switch = ok.then(|| item.clone());
     }
 
+    /// Shows the icon for the state now. A failed update leaves the old icon; the next call
+    /// tries again.
+    fn show_look(&mut self) {
+        let look = Look::of(self.quiet, self.has_pending);
+        if self.shown_look == Some(look) {
+            return;
+        }
+        let ok = self
+            .icon
+            .set_icon(Some(self.icons[look as usize].clone()))
+            .is_ok();
+        self.shown_look = ok.then_some(look);
+    }
+
     /// Shows the pending section for `prompt`, or removes it with nothing pending. Snooze is
-    /// left out once used.
+    /// left out once used. The icon shows Pending while `prompt` is there, unless quiet.
     pub fn set_pending(&mut self, prompt: Option<&Prompt>) {
+        self.has_pending = prompt.is_some();
+        self.show_look();
         for _ in 0..self.shown {
             self.menu.remove_at(PENDING_AT);
         }
@@ -159,5 +208,18 @@ impl Tray {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Look;
+
+    #[test]
+    fn quiet_wins_over_pending_and_pending_over_on() {
+        assert_eq!(Look::of(false, false), Look::On);
+        assert_eq!(Look::of(false, true), Look::Pending);
+        assert_eq!(Look::of(true, false), Look::Quiet);
+        assert_eq!(Look::of(true, true), Look::Quiet);
     }
 }
