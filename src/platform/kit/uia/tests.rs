@@ -11,6 +11,7 @@ use windows::Win32::Foundation::{E_INVALIDARG, HWND, RECT};
 use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC};
 use windows::Win32::System::Ole::{SafeArrayDestroy, SafeArrayGetElement, SafeArrayGetUBound};
 use windows::Win32::System::Variant::{VARIANT, VT_ARRAY, VT_BOOL, VT_BSTR, VT_I4, VT_UNKNOWN};
+use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
 use windows::core::{IUnknown, Interface};
 
 use super::tree::perform;
@@ -497,7 +498,11 @@ thread_local! {
 const ORIGIN: (i32, i32) = (1000, 500);
 
 /// A window over this thread's [`FORM`], its client area at [`ORIGIN`], always focused.
-struct Fake;
+/// `hosted`: a real window on a thread of its own, which owns the form; else no window at all,
+/// the test thread acts as the window's, and a thread timer wakes it for posted actions.
+struct Fake {
+    hosted: bool,
+}
 
 impl Source for Fake {
     fn tree(&self, _: HWND) -> Option<Tree> {
@@ -527,9 +532,33 @@ impl Source for Fake {
     fn has_focus(&self, _: HWND) -> bool {
         true
     }
+
+    fn on_thread(&self, hwnd: HWND) -> bool {
+        if self.hosted {
+            window_thread(hwnd)
+        } else {
+            FORM.with_borrow(Option::is_some)
+        }
+    }
+
+    fn wake(&self, hwnd: HWND, wait: bool) {
+        if self.hosted {
+            wake_window(hwnd, wait);
+        } else {
+            // SAFETY: a thread timer with no window; it kills itself.
+            unsafe { SetTimer(None, 0, 0, Some(wake_fake)) };
+        }
+    }
 }
 
-static FAKE: Fake = Fake;
+unsafe extern "system" fn wake_fake(_: HWND, _: u32, id: usize, _: u32) {
+    // SAFETY: the thread timer that called.
+    let _ = unsafe { KillTimer(None, id) };
+    run_posted(HWND::default());
+}
+
+static FAKE: Fake = Fake { hosted: false };
+static HOSTED: Fake = Fake { hosted: true };
 
 /// The root provider of a fake window over `form`.
 fn root(form: Form) -> IRawElementProviderFragmentRoot {
@@ -929,3 +958,5 @@ fn a_gone_window_says_so() {
         .expect("an error");
     assert_eq!(err.code(), HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32));
 }
+
+mod client;
