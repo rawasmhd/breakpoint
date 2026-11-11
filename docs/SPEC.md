@@ -216,7 +216,7 @@ Both are painted windows, not `DIALOGEX` templates: one raw Win32 top-level wind
 Decided in [First-run wizard questions and public defaults](https://github.com/rawasmhd/breakpoint/issues/32). Shown only when `config.json` does not exist.
 
 One page that **asks two things**:
-1. **Profile:** three selectable cards, **Balanced** preselected, each with its name, one plain line of its numbers, e.g. *Balanced: stand every 30 min, pause every 60 (Pause insists). Water rides along hourly.*, and a small day timeline.
+1. **Profile:** three selectable cards, **Balanced** preselected, each with its name, a short plain note of its numbers (it may wrap to two lines), e.g. *Balanced: stand every 30 min, pause every 60 (Pause insists). Water rides along hourly.*, and a small day timeline.
 2. **Start with Windows:** a checkbox, **on**.
 
 And **shows two things**:

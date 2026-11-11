@@ -10,7 +10,7 @@ The red dot comes from the debugger. In a code editor, a breakpoint is a red dot
 
 1. **Quiet until needed.** Neutral surfaces, no colour fills in the popup, no motion except the popup's fade, control feedback and the switch knob. A nudge must not feel like an error.
 2. **Behaviour over buttons.** The popup has no primary button. Snooze is a secondary button and Skip is a ghost button. The `action` fill appears only in dialogs, on Start and Save.
-3. **One dot per surface.** `dot` appears once: the tray icon, the popup header, the wizard header. Never use it for text, borders or states.
+3. **One dot per surface.** `dot` appears once: the tray icon, the popup header, and the app icon in a dialog's caption. Never use it for text, borders or states.
 4. **breakpoint paints its controls.** Windows draws the window frame, the tray menu and message boxes. Every control inside the wizard and the settings window is painted by breakpoint.
 
 ## 2. Voice
@@ -44,7 +44,7 @@ The red dot comes from the debugger. In a code editor, a breakpoint is a red dot
 | `ink-muted` | `#57534f` | `#b3aea8` | The nudge line, the countdown, captions and notes. 7.3:1 light, 7.0:1 dark on `surface` and `surface-raised`. |
 | `line` | `#e3e1de` | `#3a3835` | Hairlines, card outlines, the popup outline on Windows 10, press fill of buttons and stepper zones. Never the only edge of a control. |
 | `line-strong` | `#8c8782` | `#77726d` | Border of buttons and every other control at rest, and the knob of an off switch. At least 3.2:1 on `surface` and `surface-raised`. |
-| `dot` | `#e5484d` | `#e5484d` | The breakpoint dot: tray icon, popup header, wizard header. Never text. |
+| `dot` | `#e5484d` | `#e5484d` | The breakpoint dot: tray icon, popup header, the app icon in dialog captions. Never text. |
 | `action` | `#c8333a` | `#c8333a` | Fill of the one primary button in a dialog: Start, Save. Never in the popup. |
 | `action-hover` | `#b02a31` | `#b02a31` | Primary button fill on hover and press. |
 | `on-action` | `#ffffff` | `#ffffff` | Label on `action` (5.3:1) and `action-hover` (6.5:1). |
