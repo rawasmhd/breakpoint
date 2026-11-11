@@ -1,6 +1,6 @@
 # breakpoint: v1 spec
 
-Status: **locked v1, 2026-11-02.** Rewritten from the decisions on the [wayfinder map](https://github.com/rawasmhd/breakpoint/issues/23); each section links the ticket that holds its detail and reasoning. Where this file and a ticket disagree, the ticket's resolution wins and this file has a bug. Companions: [GLOSSARY.md](../GLOSSARY.md) (the vocabulary, used strictly below), [RESEARCH.md](RESEARCH.md) (the evidence behind the defaults) and [ADR 0001](adr/0001-rust-for-the-desktop-app.md) (why Rust).
+Status: **locked v1, 2026-11-02.** Rewritten from the decisions on the [wayfinder map](https://github.com/rawasmhd/breakpoint/issues/23); each section links the ticket that holds its detail and reasoning. Where this file and a ticket disagree, the ticket's resolution wins and this file has a bug. Companions: [GLOSSARY.md](../GLOSSARY.md) (the vocabulary, used strictly below), [RESEARCH.md](RESEARCH.md) (the evidence behind the defaults), [ADR 0001](adr/0001-rust-for-the-desktop-app.md) (why Rust) and [DESIGN.md](DESIGN.md) (the look and the voice).
 
 ## 1. Pitch
 
@@ -159,10 +159,10 @@ Decided in [Notification channel: toast vs popup](https://github.com/rawasmhd/br
 - breakpoint's own small raw-Win32 window, bottom-right of the primary monitor's work area, just above the tray. Always on top.
 - Shown **without taking focus** (`WS_EX_NOACTIVATE`, `SW_SHOWNOACTIVATE`, `MA_NOACTIVATE`), so typing never lands on it.
 - Content: title, line, a riding Water line if any, a **live away countdown** of the stand or pause length measured from the last input ("Away 1:59 more and it counts"; restarts on any input), and the buttons **Snooze 5 min** and **Skip** (Skip only after the snooze). While a veto applies (§4) the countdown holds at the full length and does not run. The countdown is a display of Presence; satisfaction is decided by Presence (§5.5), never by the countdown alone.
-- **X** hides it; the occurrence stays pending and is still reachable from the tray. Snooze hides it until the re-prompt. **Any ending** (satisfied, skipped, any expiry) closes it; an expiry with cause `next` is replaced by the new occurrence's popup.
+- **×** (the popup's own close) hides it; the occurrence stays pending and is still reachable from the tray. Snooze hides it until the re-prompt. **Any ending** (satisfied, skipped, any expiry) closes it; an expiry with cause `next` is replaced by the new occurrence's popup.
 - At most one popup on screen. A Firm repeat brings the same window back unchanged.
 - It **ignores Windows Do not disturb** by design; only breakpoint's quiet rules silence it. In v1 this means a popup can appear over a presentation or screen share (see §15).
-- Standard light Win32 look (comctl32 v6 controls, system message font), PerMonitorV2 DPI; the popup handles `WM_DPICHANGED` itself.
+- Painted to [DESIGN.md](DESIGN.md) §6: no Windows caption bar (breakpoint paints its own header and close ×), round corners from DWM on Windows 11, GDI+ drawing, and the Windows app theme (light or dark). PerMonitorV2 DPI; the popup handles `WM_DPICHANGED` itself.
 
 ## 7. Quiet, the work week, Off and Overtime
 
@@ -180,12 +180,14 @@ The top tray item, tooltip and icon in every case:
 
 | Now | Item reads | Pressing it | Tooltip | Icon |
 |---|---|---|---|---|
-| In hours, nudging | Turn off until next work day | starts Off | `breakpoint` | normal |
-| In hours, Off | Turn back on | ends Off (clocks restart) | `breakpoint: off until Sunday 08:00` | greyed |
-| Outside hours, quiet | Turn on until midnight | starts Overtime (clocks restart) | `breakpoint: quiet until Sunday 08:00` | greyed |
-| Outside hours, Off still in force | Turn on until midnight | ends Off, starts Overtime | `breakpoint: off until Sunday 08:00` | greyed |
-| Overtime, outside hours | Turn off now | ends Overtime | `breakpoint: on until midnight` | normal |
-| Overtime, in hours (started before work began) | Turn off until next work day | ends Overtime, starts Off | `breakpoint: on until midnight` | normal |
+| In hours, nudging | Turn off until next work day | starts Off | `breakpoint` | on |
+| In hours, Off | Turn back on | ends Off (clocks restart) | `breakpoint: off until Sunday 08:00` | quiet |
+| Outside hours, quiet | Turn on until midnight | starts Overtime (clocks restart) | `breakpoint: quiet until Sunday 08:00` | quiet |
+| Outside hours, Off still in force | Turn on until midnight | ends Off, starts Overtime | `breakpoint: off until Sunday 08:00` | quiet |
+| Overtime, outside hours | Turn off now | ends Overtime | `breakpoint: on until midnight` | on |
+| Overtime, in hours (started before work began) | Turn off until next work day | ends Overtime, starts Off | `breakpoint: on until midnight` | on |
+
+Icon names are the states in §8; any state shown as on becomes pending while an occurrence is pending.
 
 Overtime that runs into work hours keeps going until midnight; work hours starting under it is not a quiet edge, so no clock restarts.
 - Nothing else quiets breakpoint automatically in v1: no full-screen, presenting, meetings, Focus Assist or app rules; no holiday calendar; no hotkey.
@@ -194,7 +196,7 @@ Overtime that runs into work hours keeps going until midnight; work hours starti
 
 Uses `tray-icon` on breakpoint's own Win32 message loop. Left or right click opens the menu; there is no click-to-toggle.
 
-**Icon and tooltip:** the normal icon while nudges can fire, a greyed one while quiet; tooltip per the table in §7.
+**Icon and tooltip:** three icon states told apart by shape ([DESIGN.md](DESIGN.md) §7): **on**, a filled red dot, while nudges can fire; **pending**, a smaller dot inside a ring, while an occurrence is pending (popup shown or closed with ×); **quiet**, a hollow grey ring, while quiet or Off. Quiet wins over pending. Tooltip per the table in §7.
 
 **Menu, top to bottom:**
 1. The off switch (labels in §7).
@@ -207,7 +209,7 @@ Uses `tray-icon` on breakpoint's own Win32 message loop. Left or right click ope
 
 ## 9. First-run wizard and settings window
 
-Both are raw Win32 `DIALOGEX` templates (from [UI technology for Rust windows](https://github.com/rawasmhd/breakpoint/issues/26)), caption *breakpoint*, app icon, comctl32 v6 and PerMonitorV2 from the manifest.
+Both are raw Win32 `DIALOGEX` templates (from [UI technology for Rust windows](https://github.com/rawasmhd/breakpoint/issues/26)), caption *breakpoint*, app icon, comctl32 v6 and PerMonitorV2 from the manifest. They keep native controls and stay light in every Windows theme (native controls have no supported dark mode). Their layout follows [DESIGN.md](DESIGN.md) §6: sections with headings instead of group boxes, fonts built from the type styles, and the buttons in a footer band with one owner-drawn primary button.
 
 ### 9.1 First-run wizard
 
@@ -328,7 +330,7 @@ Fields are written in that order; absent fields are omitted, never `null`. In a 
 
 | Concern | Crate | Notes |
 |---|---|---|
-| Win32 and WinRT calls, dialogs, popup | `windows` | Presence APIs, power and session notifications, `SHQueryUserNotificationState`, media controls (WinRT), Run key, named mutex, `PlaySound`, `DIALOGEX` dialogs, the popup window |
+| Win32 and WinRT calls, dialogs, popup | `windows` | Presence APIs, power and session notifications, `SHQueryUserNotificationState`, media controls (WinRT), Run key, named mutex, `PlaySound`, `DIALOGEX` dialogs, the popup window, GDI+ drawing and DWM round corners (features, not new crates) |
 | Tray icon and menu | `tray-icon` (with its `muda` menus) | Needs only a Win32 message loop on the thread; no `winit` |
 | Config and log | `serde` + `serde_json` | No file watcher, no date-time crate: the platform layer supplies local time and UTC offset |
 | Exe resources | `winresource` (build dependency) | Icon, version info, manifest (comctl32 v6 + PerMonitorV2), `DIALOGEX` templates via `append_rc_content` |
@@ -384,7 +386,7 @@ Terms used above are defined in [GLOSSARY.md](../GLOSSARY.md): nudge, occurrence
 - The popup shows over presentations, screen shares and full-screen apps when they fall inside work hours: it ignores Do not disturb, and automatic quiet contexts are not in v1.
 - Standing while typing at a sit-stand desk is not detected; the user presses Skip.
 - Water cannot be acknowledged; it is a heads-up only.
-- Light theme only for the popup and dialogs.
+- The wizard and the settings window are light only; the popup follows the Windows app theme.
 - Rawas's week is the hard-coded default for everyone; other users change it in Settings.
 
 ## 16. Filled in during the rewrite
@@ -405,7 +407,7 @@ The map left these small gaps; the rewrite closed them with the leanest option, 
 12. **The bad-config notice** sits in the popup's place, no buttons, until closed (§10.1).
 13. **Single instance**: a second launch opens Settings in the running instance (§11).
 14. **The wizard's button** is named Start (§9.1).
-15. **Light theme only** in v1; dark mode moves to the fog (§15, §17).
+15. **Light theme only** in v1; dark mode moves to the fog (§15, §17). Later overturned for the popup by the [restyle](https://github.com/rawasmhd/breakpoint/issues/63); the dialogs stay light.
 16. **Nudge copy** (§3).
 17. **Suspend and display-off satisfy a Pause** as they do a Stand/Move (the Pause ticket named only lock; the event log's `by` values already allowed both) (§3, §5.5).
 
@@ -419,7 +421,7 @@ Fog left on the map, revisited after living with v1:
 - Auto-detected work day; overnight work hours; a holiday calendar or "off until a date".
 - A Water acknowledgement; counting standing while typing; using a presence sensor where the machine has one.
 - Looking back at past days (a weekly view or export).
-- Sounds per nudge; dark mode.
+- Sounds per nudge; dark mode for the dialogs.
 - Code signing.
 
 ## 18. Decision index
@@ -439,3 +441,4 @@ Fog left on the map, revisited after living with v1:
 | [Notification channel: toast vs popup](https://github.com/rawasmhd/breakpoint/issues/34) | 6 |
 | [Make the windows crate build locally (MSVC toolchain)](https://github.com/rawasmhd/breakpoint/issues/35) | 12.1 |
 | [Event log schema and the Today tray item](https://github.com/rawasmhd/breakpoint/issues/36) | 10.2, 10.3 |
+| [Restyle: the breakpoint design system](https://github.com/rawasmhd/breakpoint/issues/63) | 6, 7, 8, 9, 12.1, 15; [DESIGN.md](DESIGN.md) |
