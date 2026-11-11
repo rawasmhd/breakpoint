@@ -151,6 +151,8 @@ Sizes are at 96 DPI. `on-ink` is the `surface` token. The "Press / on" column is
 - The ring shows only after keyboard use, as Windows does with `UISF_HIDEFOCUS`. A click does not show it.
 - A group of selectable cards is one Tab stop, and so is a segmented toggle. Arrow keys move the selection.
 - A typed stepper value outside its range stays as typed, so Save can name it ([SPEC.md](SPEC.md) §9.2).
+- A number typed in a stepper takes effect as it is typed, so the profile drop-down shows Custom at once. Text that is no number gives back the value from before the typing.
+- Enter presses the default button, also on a closed drop-down; Space and Alt+Down open the drop-down. One Esc presses Cancel, also while typing in a stepper.
 
 ### Buttons
 

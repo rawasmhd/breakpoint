@@ -8,8 +8,8 @@ use std::time::Duration;
 use breakpoint::core::config::Config;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, EnumDisplayMonitors, GetDC, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, ReleaseDC,
-    SRCCOPY,
+    BitBlt, EnumDisplayMonitors, GetDC, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST,
+    MONITORINFO, MonitorFromPoint, ReleaseDC, SRCCOPY,
 };
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, GetDpiForWindow,
@@ -269,13 +269,20 @@ fn picking_a_profile_fills_the_numbers_and_leaves_the_switches() {
 }
 
 #[test]
-fn typing_a_number_no_preset_has_shows_custom_and_back_shows_the_profile() {
+fn typing_a_number_no_preset_has_shows_custom_at_once_and_back_shows_the_profile() {
     let handle = open_hidden(&defaults());
     handle.focus(STAND.every);
-    type_text(handle, "35");
-    key(handle, VK_TAB);
+    type_text(handle, "3");
+    assert_eq!(
+        handle.value(PROFILE),
+        Some(Value::Index(None)),
+        "Custom while typing"
+    );
+    type_text(handle, "5");
     assert_eq!(handle.value(STAND.every), Some(Value::Number(35)));
     assert_eq!(handle.value(PROFILE), Some(Value::Index(None)), "Custom");
+    key(handle, VK_TAB);
+    assert_eq!(handle.value(PROFILE), Some(Value::Index(None)));
     handle.focus(STAND.every);
     key(handle, VK_DOWN);
     assert_eq!(handle.value(STAND.every), Some(Value::Number(30)));
@@ -313,7 +320,22 @@ fn enter_saves_what_was_typed_and_esc_cancels() {
     assert!(take_saved().is_none(), "Esc saved nothing");
     assert!(!handle.is_open());
 
-    // Space on Save saves too; on Cancel it cancels.
+    // Enter on the closed profile drop-down saves too.
+    let handle = open_hidden(&defaults());
+    handle.focus(PROFILE);
+    key(handle, VK_RETURN);
+    assert!(take_saved().is_some(), "Enter on the drop-down saved");
+    assert!(!handle.is_open());
+
+    // One Esc while typing cancels.
+    let handle = open_hidden(&defaults());
+    handle.focus(STAND.every);
+    type_text(handle, "45");
+    key(handle, VK_ESCAPE);
+    assert!(take_saved().is_none());
+    assert!(!handle.is_open(), "one Esc closed the window");
+
+    // Space on Cancel cancels.
     let handle = open_hidden(&defaults());
     handle.focus(CANCEL);
     key(handle, VK_SPACE);
@@ -323,11 +345,30 @@ fn enter_saves_what_was_typed_and_esc_cancels() {
 
 #[test]
 fn opened_at_a_point_its_top_left_is_there() {
-    // Change… opens the window where the wizard's top-left was.
+    // Change… opens the window where the wizard's top-left was, moved only as far as it must
+    // to stay in the work area (a small screen, such as a CI runner's, moves it up).
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
     let at = POINT { x: 60, y: 50 };
+    let _ = unsafe { GetMonitorInfoW(MonitorFromPoint(at, MONITOR_DEFAULTTONEAREST), &mut info) };
+    let work = info.rcWork;
+    let at = POINT {
+        x: work.left + 60,
+        y: work.top + 50,
+    };
     let handle = create(&defaults(), true, Some(at)).unwrap();
     let r = handle.window_rect();
-    assert_eq!((r.left, r.top), (at.x, at.y));
+    let (w, h) = (r.right - r.left, r.bottom - r.top);
+    let want = (
+        at.x.min(work.right - w).max(work.left),
+        at.y.min(work.bottom - h).max(work.top),
+    );
+    assert_eq!((r.left, r.top), want, "{w}x{h} in {work:?}");
+    if w <= work.right - at.x && h <= work.bottom - at.y {
+        assert_eq!((r.left, r.top), (at.x, at.y), "it fits, so it is not moved");
+    }
     let mut client = RECT::default();
     unsafe { GetClientRect(handle.hwnd(), &mut client).unwrap() };
     let dpi = unsafe { GetDpiForWindow(handle.hwnd()) };
