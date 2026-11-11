@@ -8,10 +8,10 @@ The red dot comes from the debugger. In a code editor, a breakpoint is a red dot
 
 ## 1. Principles
 
-1. **Quiet until needed.** Neutral surfaces, no colour fills in the popup, no motion except the popup's fade and button feedback. A nudge must not feel like an error.
+1. **Quiet until needed.** Neutral surfaces, no colour fills in the popup, no motion except the popup's fade, control feedback and the switch knob. A nudge must not feel like an error.
 2. **Behaviour over buttons.** The popup has no primary button. Snooze is a secondary button and Skip is a ghost button. The `action` fill appears only in dialogs, on Start and Save.
 3. **One dot per surface.** `dot` appears once: the tray icon, the popup header, the wizard header. Never use it for text, borders or states.
-4. **Native where Windows draws, ours where we paint.** Checkboxes, radios, time pickers, drop-downs and the tray menu stay native controls. breakpoint owns the layout, the type, the popup and the icons.
+4. **breakpoint paints its controls.** Windows draws the window frame, the tray menu and message boxes. Every control inside the wizard and the settings window is painted by breakpoint.
 
 ## 2. Voice
 
@@ -37,13 +37,13 @@ The red dot comes from the debugger. In a code editor, a breakpoint is a red dot
 
 | Token | Light | Dark | Use |
 | --- | --- | --- | --- |
-| `surface` | `#fafaf9` | `#1c1b1a` | Ground of the wizard and the settings window. |
-| `surface-raised` | `#ffffff` | `#262422` | Ground of the popup. One step lighter than `surface` in both themes, because the popup floats over other apps. |
-| `surface-sunken` | `#f1f0ee` | `#141312` | Dialog footer band, countdown bar track, hover fill of secondary and ghost buttons. |
-| `ink` | `#1c1b1a` | `#f2f1ef` | Titles, body text and button labels on every surface. 16:1 light, 13:1 dark on `surface-raised`. |
+| `surface` | `#fafaf9` | `#1c1b1a` | Ground of the wizard and the settings window. Also `on-ink`: the label or mark on a control filled with `ink`. |
+| `surface-raised` | `#ffffff` | `#262422` | Ground of the popup, of the cards in dialogs and of controls at rest. One step lighter than `surface` in both themes. |
+| `surface-sunken` | `#f1f0ee` | `#141312` | Dialog footer band, countdown bar track, segmented toggle track, hover fill of buttons, day pills, stepper zones and menu items. |
+| `ink` | `#1c1b1a` | `#f2f1ef` | Titles, body text and button labels on every surface. Fill and border of a selected or on control. 16:1 light, 13:1 dark on `surface-raised`. |
 | `ink-muted` | `#57534f` | `#b3aea8` | The nudge line, the countdown, captions and notes. 7.3:1 light, 7.0:1 dark on `surface` and `surface-raised`. |
-| `line` | `#e3e1de` | `#3a3835` | Hairlines, the popup outline on Windows 10, press fill of secondary and ghost buttons. Never the only edge of a control. |
-| `line-strong` | `#8c8782` | `#77726d` | Border of secondary buttons and other control edges. At least 3.2:1 on `surface` and `surface-raised`. |
+| `line` | `#e3e1de` | `#3a3835` | Hairlines, card outlines, the popup outline on Windows 10, press fill of buttons and stepper zones. Never the only edge of a control. |
+| `line-strong` | `#8c8782` | `#77726d` | Border of buttons and every other control at rest, and the knob of an off switch. At least 3.2:1 on `surface` and `surface-raised`. |
 | `dot` | `#e5484d` | `#e5484d` | The breakpoint dot: tray icon, popup header, wizard header. Never text. |
 | `action` | `#c8333a` | `#c8333a` | Fill of the one primary button in a dialog: Start, Save. Never in the popup. |
 | `action-hover` | `#b02a31` | `#b02a31` | Primary button fill on hover and press. |
@@ -52,13 +52,14 @@ The red dot comes from the debugger. In a code editor, a breakpoint is a red dot
 | `water` | `#2b6cb0` | `#6aaef0` | Water glyph. Marks only, never text. |
 | `pause` | `#2f7d5b` | `#5fc495` | Pause glyph and its countdown bar fill. Marks only, never text. |
 | `quiet` | `#969696` | `#969696` | The hollow tray ring while quiet or Off. Reads on light and dark taskbars. |
-| `focus` | `#1c1b1a` | `#f2f1ef` | Keyboard focus ring in dialogs: solid 2px, 2px off the control. |
+| `focus` | `#1c1b1a` | `#f2f1ef` | Keyboard focus ring in dialogs: solid 2px, 2px off the control. It shows only after keyboard use. |
 
-- Popup ground is `surface-raised`; dialog ground is `surface`; the dialog footer band is `surface-sunken`.
+- Popup ground is `surface-raised`; dialog ground is `surface`; a card in a dialog is `surface-raised`; the dialog footer band is `surface-sunken`.
+- A selected or on control fills with `ink`, and its label or mark is `surface`. In prose this is `on-ink`. It is the `surface` token, not a new colour. Red stays for the dot and the one primary button.
 - All text is `ink` or `ink-muted`. There is no coloured text.
 - `stand`, `water` and `pause` colour only their glyph and the countdown bar. The nudge's word is always beside its colour, so colour is never the only signal.
 - Control edges use `line-strong`. `line` is for hairlines that carry no meaning.
-- The popup follows the Windows app theme (`AppsUseLightTheme`). The wizard and the settings window stay light, because native Win32 controls have no supported dark mode.
+- The popup, the wizard and the settings window all follow the Windows app theme (`AppsUseLightTheme`). A change of theme repaints an open dialog at once.
 
 ## 4. Type
 
@@ -84,21 +85,22 @@ Sizes are at 96 DPI and scale with the monitor.
 | Token | Value | Use |
 | --- | --- | --- |
 | `space-1` | 4 | Title to line. |
-| `space-2` | 8 | Between buttons. Glyph to title. Between rows inside a section. |
-| `space-3` | 12 | Popup header to title. Label to its control. |
-| `space-4` | 16 | Popup padding. Popup gap to the work-area corner. Line to countdown, countdown to buttons. |
+| `space-2` | 8 | Between buttons. Glyph to title. A dialog section heading to its card. |
+| `space-3` | 12 | Popup header to title. Label to its control. Top and bottom padding of a card row. |
+| `space-4` | 16 | Popup padding. Popup gap to the work-area corner. Line to countdown, countdown to buttons. Side padding of a card. |
 | `space-6` | 24 | Dialog padding. Between dialog sections. |
 | `space-8` | 32 | Wizard heading to its first section. |
-| `radius-sm` | 4 | Buttons and the profile options. |
-| `radius-md` | 8 | The popup window (`DWMWCP_ROUND` on Windows 11; square on Windows 10). |
-| `radius-full` | full | The dot, the tray marks, the countdown bar. |
+| `radius-sm` | 4 | Buttons, steppers, the drop-down, checkboxes and menu items. |
+| `radius-md` | 8 | The popup window and the drop-down menu (`DWMWCP_ROUND` on Windows 11; square on Windows 10), cards and selectable cards. |
+| `radius-full` | full | The dot, the tray marks, the countdown bar, switches and day pills. |
 | `size-popup` | 360 | Popup width. Height follows the content. |
 | `size-button` | 32 | Button height. |
 | `size-glyph` | 20 | Nudge glyph beside the popup title; 16 beside the Water line. |
 | `size-mark` | 8 | The dot in the popup header. |
 | `size-bar` | 4 | Countdown bar height. |
+| `shadow-popup` | system | The shadow Windows gives a rounded floating window. The popup and the drop-down menu have it. |
 
-- Only the popup has depth: the shadow Windows gives a rounded window. Do not paint a shadow. Dialogs are flat.
+- Only the popup and the drop-down menu have depth: `shadow-popup`, given by Windows. Do not paint a shadow. Dialogs, cards and controls are flat.
 
 ## 6. Layout
 
@@ -117,10 +119,38 @@ Sizes are at 96 DPI and scale with the monitor.
 
 ### Dialogs (wizard and settings)
 
-- `space-6` padding on a `surface` ground. No group boxes: a section is a `body-strong` heading and the controls under it, `space-6` between sections.
-- The wizard opens with one `title-lg` heading, "Pick a rhythm". Each profile option is a native radio with the name in `body-strong` and its numbers under it in `caption` `ink-muted`.
-- Labels sit left of their controls, `space-3` apart, on one column. Units ("min") follow the edit boxes in `body`. Notes sit under the control they explain in `caption` `ink-muted`.
+- `space-6` padding on a `surface` ground. The system caption and frame stay; breakpoint paints the client area.
+- A section is a heading in `body-strong` and a card under it. The card starts `space-2` below the heading. `space-6` separates one section from the next. There are no group boxes.
+- **Card:** `surface-raised`, 1px `line` border, `radius-md`, `space-4` padding left and right. Each row has `space-3` above and below its content. A 1px `line` hairline separates two rows.
+- Labels sit in one column, 104 wide, left of their controls. Units ("min") follow a stepper in `body`. A note sits under what it explains, in `caption` `ink-muted`.
+- The wizard opens with one `title-lg` heading, "Pick a rhythm". Under it, the three profiles are selectable cards: the radio mark, the name in `body-strong`, the numbers in `caption` `ink-muted`, and a small day timeline on the right. Start with Windows is a checkbox row.
+- The settings window has three sections: Work week, Nudges (the profile drop-down is its first row) and General (Start with Windows). Its controls are in the Controls table below.
 - Buttons sit in a footer band of `surface-sunken` with a `line` hairline above it, right-aligned, `space-2` apart: the primary first, then Cancel. Wizard: Start. Settings: Save, Cancel.
+
+### Controls
+
+Sizes are at 96 DPI. `on-ink` is the `surface` token. The "Press / on" column is the pressed state for a button or a stepper zone, and the on or selected state for the other controls. In high contrast, see §9.
+
+| Control | Size and shape | Rest | Hover | Press / on | Focus |
+| --- | --- | --- | --- | --- | --- |
+| Button | As Buttons below. | As Buttons below. | As Buttons below. | As Buttons below. | Ring. |
+| Switch | 40 × 22, `radius-full`. Knob 14, 3 from the edge. | Off: `surface-raised` track, 1px `line-strong` border, `line-strong` knob. | 1px `ink` border, knob 16. | On: `ink` track and border, `on-ink` knob. The knob slides over 150 ms. | Ring. |
+| Checkbox | 18 × 18, `radius-sm`, 1.5px border. | `surface-raised`, `line-strong` border. | `ink` border. | On: `ink` fill, check mark in `on-ink`. | Ring. |
+| Day pill | 52 × 32, `radius-full`. Label in `caption-strong`. | `surface-raised`, 1px `line-strong` border, `ink` label. | `surface-sunken` fill. | On: `ink` fill and border, `on-ink` label. | Ring. |
+| Stepper | 32 tall, `radius-sm`, 1px `line-strong` border, `surface-raised`. The − and + zones are 28 wide with 12px marks. The value is 56 wide: the number in `body-strong` (tabular), the unit in `body`. | Marks `ink-muted`. | Zone fills `surface-sunken`, mark `ink`. | Zone `line`. | Ring around the field. |
+| Time stepper | As Stepper. The value reads `HH:mm`. | As Stepper. | As Stepper. | As Stepper. | As Stepper. |
+| Segmented toggle | Track 32 tall, `surface-sunken`, padding 2, gap 2, radius `radius-sm` + 2. Segments 28 tall, at least 50 wide, label in `caption-strong`. | `ink-muted` label. | `ink` label. | Selected: `surface-raised` segment, 1px `line` ring, `ink` label. | Ring around the track. |
+| Drop-down | 32 tall, `radius-sm`, 1px `line-strong` border, `surface-raised`. Value in `body`. Chevron 12px in `ink-muted`, 10 from the right. | As the size column. | `surface-sunken` fill. | Open: 1px `ink` border plus a 1px `ink` ring. | Ring. |
+| Menu | An owned popup window: `surface-raised`, 1px `line`, `radius-md` (`DWMWCP_ROUND`), `shadow-popup`, padding 4. Items `radius-sm`, padding 8 by 10. Name in `body-strong`, an optional line under it in `caption` `ink-muted`. A 14px check at the left of the current item. | Plain item. | Item `surface-sunken`. | None. | Item `surface-sunken`. |
+| Selectable card | `surface-raised`, 1px `line`, `radius-md`, padding 14 by 16. Radio mark 18, 1.5px border, an 8px `ink` dot when selected. The caller paints the content on the right. | `line-strong` radio border. | `ink` radio border. | Selected: 1px `ink` border plus a 1px `ink` ring. | Ring. |
+| Card | `surface-raised`, 1px `line`, `radius-md`, `space-4` side padding, hairlines between rows. | As the size column. | None. | None. | None. |
+| Text | Any type style, in `ink` or `ink-muted`. | As the size column. | None. | None. | None. |
+| Focus ring | 2px `ink` (the `focus` token), 2px gap, following the shape of the control. | Hidden. | None. | None. | Shown after keyboard use, with no transition. |
+
+- The drop-down menu opens below the field. When there is no room below, it opens above.
+- The ring shows only after keyboard use, as Windows does with `UISF_HIDEFOCUS`. A click does not show it.
+- A group of selectable cards is one Tab stop, and so is a segmented toggle. Arrow keys move the selection.
+- A typed stepper value outside its range stays as typed, so Save can name it ([SPEC.md](SPEC.md) §9.2).
 
 ### Buttons
 
@@ -154,9 +184,11 @@ Sizes are at 96 DPI and scale with the monitor.
 
 - The popup fades in over 150 ms and out over 100 ms.
 - Buttons and the close × answer the pointer. Hover: the fill changes over 150 ms, and back over 120 ms when the pointer leaves. Press: the fill goes one step further within 90 ms and the label moves down 1px. Release: back to hover.
+- The switch knob slides over 150 ms. Day pills, checkboxes, steppers, the segmented toggle and the drop-down answer the pointer as buttons do: hover over 150 ms in and 120 ms out, press within 90 ms.
+- The drop-down menu appears and goes at once, with no fade.
 - The focus ring shows at once, with no transition.
 - A Firm repeat shows the popup again the same way. It does not shake, flash or grow.
-- When Windows animation is off (`SPI_GETCLIENTAREAANIMATION`), everything changes at once.
+- When Windows animation is off (`SPI_GETCLIENTAREAANIMATION`), nothing moves: everything changes at once, and the switch knob jumps to its place.
 - Nothing else moves.
 
 ## 9. Applying it to Windows
@@ -164,4 +196,7 @@ Sizes are at 96 DPI and scale with the monitor.
 - One theme module in `src/platform/` holds every token as Win32 values (`COLORREF`, DPI-scaled sizes, `HFONT`s per style and DPI). No window procedure holds a colour or size literal.
 - The popup is painted in `WM_PAINT` with GDI+, double-buffered. Rounded corners come from `DwmSetWindowAttribute` with `DWMWCP_ROUND`. GDI+ and DWM are `windows` crate features, not new crates.
 - Fonts fall back from Segoe UI Variable to Segoe UI when the Variable face is missing.
-- The dialogs keep native controls. They change through fonts (`WM_SETFONT`), colours (`WM_CTLCOLORDLG`, `WM_CTLCOLORSTATIC`), layout and an owner-drawn primary button.
+- Each dialog is one window, painted with GDI+ in `WM_PAINT` and double-buffered, like the popup. It has no child controls. The layout is a list of items with places at 96 DPI, scaled for the monitor DPI.
+- The system caption follows the theme: `DWMWA_USE_IMMERSIVE_DARK_MODE` in dark, and on Windows 11 `DWMWA_CAPTION_COLOR` = `surface`, `DWMWA_TEXT_COLOR` = `ink` and `DWMWA_BORDER_COLOR` = `line`.
+- In high contrast, every control paints with system colours instead of tokens: `COLOR_WINDOW`, `COLOR_WINDOWTEXT`, `COLOR_HIGHLIGHT`, `COLOR_HIGHLIGHTTEXT`, `COLOR_BTNFACE` and `COLOR_GRAYTEXT`. Nothing has a shadow.
+- Keyboard, focus and screen-reader support are breakpoint's own work. UI Automation exposes every control with a name, a role and its state.
