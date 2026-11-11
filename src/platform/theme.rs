@@ -2,18 +2,24 @@
 //!
 //! Every window takes its colours, sizes, fonts and timings from here. No window procedure holds
 //! a colour or size literal. Sizes are at 96 DPI; [`px`] scales them for a monitor. The popup
-//! follows the Windows app theme ([`app_theme`]); the dialogs stay [`Theme::Light`].
+//! and the form kit's windows follow the Windows app theme ([`app_theme`]), and the kit's
+//! controls take their colours by role from [`Colours`], which also covers high contrast. The
+//! native-control dialogs stay [`Theme::Light`] until they move to the kit.
 
 use std::time::Duration;
 
 use windows::Win32::Foundation::{COLORREF, ERROR_SUCCESS, LPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CLEARTYPE_QUALITY, CreateFontIndirectW, DEFAULT_CHARSET, DeleteObject, EnumFontFamiliesExW,
-    GetDC, HFONT, LOGFONTW, ReleaseDC, TEXTMETRICW,
+    CLEARTYPE_QUALITY, COLOR_BTNFACE, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT,
+    COLOR_WINDOW, COLOR_WINDOWTEXT, CreateFontIndirectW, DEFAULT_CHARSET, DeleteObject,
+    EnumFontFamiliesExW, GetDC, GetSysColor, HFONT, LOGFONTW, ReleaseDC, SYS_COLOR_INDEX,
+    TEXTMETRICW,
 };
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
 use windows::Win32::UI::WindowsAndMessaging::{
-    SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+    SPI_GETCLIENTAREAANIMATION, SPI_GETHIGHCONTRAST, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    SystemParametersInfoW,
 };
 use windows::core::{BOOL, PCWSTR, w};
 
@@ -134,8 +140,10 @@ pub const SPACE_8: i32 = 32;
 
 /// Buttons and the profile options.
 pub const RADIUS_SM: i32 = 4;
-// `radius-md` (the popup) comes from DWM (`DWMWCP_ROUND`), and `radius-full` is half a
-// shape's height, so neither needs a const here.
+/// Cards, selectable cards and the drop-down menu. The popup and the menu window get theirs from
+/// DWM (`DWMWCP_ROUND`); painted cards use this value. `radius-full` is half a shape's height,
+/// so it needs no const.
+pub const RADIUS_MD: i32 = 8;
 
 /// Popup width. Height follows the content.
 pub const SIZE_POPUP: i32 = 360;
@@ -177,6 +185,70 @@ pub const CLOSE_MARK: f32 = 10.0;
 pub const CLOSE_INSET: f32 = 1.0;
 pub const CLOSE_STROKE: f32 = 1.5;
 
+// ---- Painted dialog controls (the form kit, issue #77), at 96 DPI ----
+
+/// Height of the stepper, the drop-down and the segmented track. Same as a button.
+pub const SIZE_FIELD: i32 = SIZE_BUTTON;
+
+/// Switch track.
+pub const SWITCH_W: i32 = 40;
+pub const SWITCH_H: i32 = 22;
+/// Switch knob at rest, and while the pointer is over the switch.
+pub const KNOB: i32 = 14;
+pub const KNOB_HOT: i32 = 16;
+/// Room between the resting knob and the track edge.
+pub const KNOB_INSET: i32 = 3;
+
+/// The checkbox square and the selectable card's radio mark.
+pub const CHECKBOX: i32 = 18;
+pub const RADIO: i32 = 18;
+/// The dot inside a selected radio mark.
+pub const RADIO_DOT: i32 = 8;
+/// Border of the checkbox and the radio mark, scaled with the DPI but not rounded.
+pub const BORDER_THICK: f32 = 1.5;
+
+/// Day pill (one work day).
+pub const PILL_W: i32 = 52;
+pub const PILL_H: i32 = 32;
+
+/// Stepper: the − and + zones, the value between them, and the marks in the zones.
+pub const STEPPER_ZONE: i32 = 28;
+pub const STEPPER_VALUE: i32 = 56;
+pub const STEPPER_MARK: i32 = 12;
+/// Stroke of the − and + marks, the check mark and the chevron, scaled but not rounded.
+pub const MARK_STROKE: f32 = 1.5;
+/// How many steps Page Up and Page Down take.
+pub const PAGE_STEPS: i32 = 5;
+/// The text caret in a stepper being typed in.
+pub const CARET: i32 = 1;
+
+/// Segmented toggle: the track's inner padding, the gap between segments, and each segment.
+pub const SEGMENT_PAD: i32 = 2;
+pub const SEGMENT_GAP: i32 = 2;
+pub const SEGMENT_H: i32 = 28;
+pub const SEGMENT_MIN_W: i32 = 50;
+
+/// Drop-down chevron, and its gap to the field's right edge.
+pub const CHEVRON: i32 = 12;
+pub const CHEVRON_RIGHT: i32 = 10;
+
+/// Drop-down menu: padding round the items, each item's padding, the check mark at the left of
+/// the current item, and the gap between the field and the menu.
+pub const MENU_PAD: i32 = 4;
+pub const MENU_ITEM_PAD_Y: i32 = 8;
+pub const MENU_ITEM_PAD_X: i32 = 10;
+pub const MENU_CHECK: i32 = 14;
+pub const MENU_GAP: i32 = 4;
+
+/// Selectable card padding, top and bottom, then left and right.
+pub const CHOICE_PAD_Y: i32 = 14;
+pub const CHOICE_PAD_X: i32 = 16;
+
+/// The check mark, as points on its square from 0 to 1, drawn with [`MARK_STROKE`].
+pub const CHECK_POINTS: [(f32, f32); 3] = [(0.22, 0.52), (0.42, 0.72), (0.78, 0.3)];
+/// The drop-down chevron, as points on its square from 0 to 1.
+pub const CHEVRON_POINTS: [(f32, f32); 3] = [(0.2, 0.36), (0.5, 0.66), (0.8, 0.36)];
+
 // ---- Motion (DESIGN.md §8) ----
 
 pub const FADE_IN: Duration = Duration::from_millis(150);
@@ -184,6 +256,8 @@ pub const FADE_OUT: Duration = Duration::from_millis(100);
 pub const HOVER_IN: Duration = Duration::from_millis(150);
 pub const HOVER_OUT: Duration = Duration::from_millis(120);
 pub const PRESS: Duration = Duration::from_millis(90);
+/// A switch knob sliding between off and on.
+pub const KNOB_SLIDE: Duration = Duration::from_millis(150);
 
 /// Whether Windows animation is on. When it is off, everything changes at once.
 pub fn animations_on() -> bool {
@@ -238,6 +312,173 @@ pub fn theme_on_setting_change(lparam: LPARAM) -> Option<Theme> {
             .copied()
             .eq("ImmersiveColorSet".encode_utf16());
     is_colour_set.then(app_theme)
+}
+
+// ---- Control colours (the form kit) ----
+
+/// The colours a painted dialog control uses: the palette's tokens by role, or, in high
+/// contrast, the system colours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Colours {
+    /// Window ground (`surface`).
+    pub ground: COLORREF,
+    /// Ground of cards and controls (`surface-raised`).
+    pub raised: COLORREF,
+    /// Footer band and the segmented track (`surface-sunken`).
+    pub sunken: COLORREF,
+    /// Main text and marks (`ink`).
+    pub ink: COLORREF,
+    /// Notes, units at rest, the chevron (`ink-muted`).
+    pub muted: COLORREF,
+    /// Hairlines and card outlines (`line`).
+    pub hairline: COLORREF,
+    /// Control edges (`line-strong`).
+    pub edge: COLORREF,
+    /// Fill of a control that is on or selected (`ink`).
+    pub on: COLORREF,
+    /// Label and knob on [`Colours::on`] (`surface`).
+    pub on_ink: COLORREF,
+    /// Hover fill (`surface-sunken`).
+    pub hover: COLORREF,
+    /// Press fill (`line`).
+    pub press: COLORREF,
+    /// Labels and marks on the hover and press fills (`ink`).
+    pub hover_ink: COLORREF,
+    /// Edge of a switch, checkbox or radio mark under the pointer (`ink`).
+    pub hover_edge: COLORREF,
+    /// The primary button (`action`, `action-hover`, `on-action`).
+    pub action: COLORREF,
+    pub action_hover: COLORREF,
+    pub on_action: COLORREF,
+    /// The keyboard focus ring (`focus`).
+    pub focus: COLORREF,
+    /// The selected segment of a segmented toggle: fill, label and edge (`surface-raised`,
+    /// `ink`, `line`).
+    pub chosen: COLORREF,
+    pub on_chosen: COLORREF,
+    pub chosen_edge: COLORREF,
+    /// The highlighted row of an open menu and its text (`surface-sunken`, `ink`).
+    pub hot_row: COLORREF,
+    pub on_hot_row: COLORREF,
+    /// The nudge glyphs.
+    pub stand: COLORREF,
+    pub water: COLORREF,
+    pub pause: COLORREF,
+    /// Whether menus may cast a shadow. Never in high contrast.
+    pub shadows: bool,
+}
+
+impl Colours {
+    /// The tokens of `theme`.
+    pub const fn of(theme: Theme) -> Colours {
+        let p = theme.palette();
+        Colours {
+            ground: p.surface,
+            raised: p.surface_raised,
+            sunken: p.surface_sunken,
+            ink: p.ink,
+            muted: p.ink_muted,
+            hairline: p.line,
+            edge: p.line_strong,
+            on: p.ink,
+            on_ink: p.surface,
+            hover: p.surface_sunken,
+            press: p.line,
+            hover_ink: p.ink,
+            hover_edge: p.ink,
+            action: p.action,
+            action_hover: p.action_hover,
+            on_action: p.on_action,
+            focus: p.focus,
+            chosen: p.surface_raised,
+            on_chosen: p.ink,
+            chosen_edge: p.line,
+            hot_row: p.surface_sunken,
+            on_hot_row: p.ink,
+            stand: p.stand,
+            water: p.water,
+            pause: p.pause,
+            shadows: true,
+        }
+    }
+
+    /// High contrast: every colour from `system`, which reads a system colour. Text and edges in
+    /// `COLOR_WINDOWTEXT` on `COLOR_WINDOW`, the segmented track and footer band in
+    /// `COLOR_BTNFACE`, hairlines in `COLOR_GRAYTEXT`, and what is under the pointer, on,
+    /// selected, highlighted or primary in `COLOR_HIGHLIGHT` with `COLOR_HIGHLIGHTTEXT`.
+    pub fn high_contrast(system: impl Fn(SYS_COLOR_INDEX) -> COLORREF) -> Colours {
+        let (window, text) = (system(COLOR_WINDOW), system(COLOR_WINDOWTEXT));
+        let (highlight, on_highlight) = (system(COLOR_HIGHLIGHT), system(COLOR_HIGHLIGHTTEXT));
+        Colours {
+            ground: window,
+            raised: window,
+            sunken: system(COLOR_BTNFACE),
+            ink: text,
+            muted: text,
+            hairline: system(COLOR_GRAYTEXT),
+            edge: text,
+            on: highlight,
+            on_ink: on_highlight,
+            hover: highlight,
+            press: highlight,
+            hover_ink: on_highlight,
+            hover_edge: highlight,
+            action: highlight,
+            action_hover: highlight,
+            on_action: on_highlight,
+            focus: text,
+            chosen: highlight,
+            on_chosen: on_highlight,
+            chosen_edge: highlight,
+            hot_row: highlight,
+            on_hot_row: on_highlight,
+            stand: text,
+            water: text,
+            pause: text,
+            shadows: false,
+        }
+    }
+
+    /// The colours to paint with now: the system's in high contrast, else `theme`'s.
+    pub fn now(theme: Theme) -> Colours {
+        if high_contrast() {
+            // SAFETY: GetSysColor takes any index and has no pointers.
+            Colours::high_contrast(|i| COLORREF(unsafe { GetSysColor(i) }))
+        } else {
+            Colours::of(theme)
+        }
+    }
+}
+
+/// Whether Windows high contrast is on.
+pub fn high_contrast() -> bool {
+    let mut hc = HIGHCONTRASTW {
+        cbSize: size_of::<HIGHCONTRASTW>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `hc` is a HIGHCONTRASTW with its size set, as this action wants.
+    let read = unsafe {
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            hc.cbSize,
+            Some(&mut hc as *mut HIGHCONTRASTW as _),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    read.is_ok() && hc.dwFlags.contains(HCF_HIGHCONTRASTON)
+}
+
+/// The High Contrast Black system colours, for pictures of the high-contrast look on a machine
+/// that is not in high contrast.
+#[cfg(test)]
+pub fn high_contrast_black(index: SYS_COLOR_INDEX) -> COLORREF {
+    match index {
+        COLOR_WINDOW | COLOR_BTNFACE | COLOR_HIGHLIGHTTEXT => rgb(0x000000),
+        COLOR_WINDOWTEXT => rgb(0xffffff),
+        COLOR_HIGHLIGHT => rgb(0x1aebff),
+        COLOR_GRAYTEXT => rgb(0x3ff23f),
+        _ => rgb(0xffffff),
+    }
 }
 
 // ---- Type (DESIGN.md §4) ----
