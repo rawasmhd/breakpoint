@@ -330,7 +330,7 @@ Fields are written in that order; absent fields are omitted, never `null`. In a 
 
 | Concern | Crate | Notes |
 |---|---|---|
-| Win32 and WinRT calls, dialogs, popup | `windows` | Presence APIs, power and session notifications, `SHQueryUserNotificationState`, media controls (WinRT), Run key, named mutex, `PlaySound`, the popup window, the painted dialog windows, GDI+ drawing for the popup and the dialogs, DWM round corners and caption colours, UI Automation (features, not new crates) |
+| Win32 and WinRT calls, dialogs, popup | `windows` (and its own `windows-core`) | Presence APIs, power and session notifications, `SHQueryUserNotificationState`, media controls (WinRT), Run key, named mutex, `PlaySound`, the popup window, the painted dialog windows, GDI+ drawing for the popup and the dialogs, DWM round corners and caption colours, UI Automation (features, not new crates). `windows-core` comes with `windows`; it is named only because the code `windows::core::implement` writes for the UI Automation providers refers to it by name |
 | Tray icon and menu | `tray-icon` (with its `muda` menus) | Needs only a Win32 message loop on the thread; no `winit` |
 | Config and log | `serde` + `serde_json` | No file watcher, no date-time crate: the platform layer supplies local time and UTC offset |
 | Exe resources | `winresource` (build dependency) | Icon, version info, manifest (PerMonitorV2) |

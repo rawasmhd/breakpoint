@@ -277,7 +277,7 @@ fn menu_note(profile: Profile) -> String {
 }
 
 /// The whole window as kit items, filled with `form`, top to bottom in reading order.
-fn items(form: &Form, start_with_windows: bool) -> Vec<Item> {
+pub(super) fn items(form: &Form, start_with_windows: bool) -> Vec<Item> {
     let mut b = Builder::default();
     let mut y = PAD;
     b.text(PAD, y, "Settings", Style::TitleLg, Ink::Main);
