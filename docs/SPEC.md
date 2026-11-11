@@ -353,8 +353,9 @@ src/
     tray.rs          tray-icon menu and icon states
     presence.rs      GetLastInputInfo, vetoes, session and power notifications
     popup.rs         the nudge popup window
-    kit.rs           the painted dialog window and its controls (switch, day pill, stepper, toggle, drop-down, cards), keyboard, focus, UI Automation
-    dialogs.rs       the wizard and the settings window, built from the kit
+    kit/             the painted dialog window and its controls (switch, day pill, stepper, toggle, drop-down, cards), keyboard, focus, UI Automation
+    settings_window.rs  the settings window, built from the kit
+    dialogs.rs       the wizard, built from the kit
     startup.rs       Run key
     clock.rs         local time and UTC offset
 tests/

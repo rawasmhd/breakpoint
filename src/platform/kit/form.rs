@@ -165,6 +165,8 @@ struct Anim {
 struct Edit {
     item: usize,
     text: String,
+    /// The value when typing began, which text that is no number gives back on commit.
+    before: i32,
 }
 
 /// A form: its items and everything the user has done to them.
@@ -490,25 +492,22 @@ impl Form {
             Key::Tab => return self.move_focus(true),
             Key::BackTab => return self.move_focus(false),
             Key::Enter => {
-                // As in a Windows dialog: Enter presses the focused button, opens the focused
-                // drop-down, and otherwise presses the default button.
-                match self.focus.map(|i| (&self.items[i].kind, self.items[i].id)) {
-                    Some((Kind::DropDown { .. }, _)) => {
-                        self.open_menu(self.focus.unwrap_or_default());
-                        return Vec::new();
-                    }
-                    Some((Kind::Button { .. }, id)) => return vec![Event::Pressed(id)],
-                    _ => {}
+                // As in a Windows dialog: Enter presses the focused button, and otherwise the
+                // default button, also on a closed drop-down (Space and Alt+Down open it).
+                if let Some(i) = self.focus
+                    && let Kind::Button { .. } = self.items[i].kind
+                {
+                    return vec![Event::Pressed(self.items[i].id)];
                 }
                 let mut out = self.commit();
                 out.extend(self.button(|default, _| default).map(Event::Pressed));
                 return out;
             }
             Key::Esc => {
-                if self.edit.take().is_some() {
-                    return Vec::new();
-                }
-                return vec![self.escape()];
+                // One Esc cancels, also while typing: the typed text goes with the other edits.
+                let mut out = self.drop_edit();
+                out.push(self.escape());
+                return out;
             }
             _ => {}
         }
@@ -541,14 +540,8 @@ impl Form {
                 }
                 Vec::new()
             }
-            Key::Back => {
-                self.erase(i);
-                Vec::new()
-            }
-            Key::Char(c) => {
-                self.type_char(i, c);
-                Vec::new()
-            }
+            Key::Back => self.erase(i),
+            Key::Char(c) => self.type_char(i, c),
             _ => Vec::new(),
         }
     }
@@ -691,56 +684,112 @@ impl Form {
         out
     }
 
-    fn type_char(&mut self, i: usize, c: char) {
+    /// The number or time item `i` shows when nothing is typed.
+    fn shown(&self, i: usize) -> Option<i32> {
+        match self.items[i].kind {
+            Kind::Stepper { value, .. } => Some(value),
+            Kind::Time { minutes, .. } => Some(minutes),
+            _ => None,
+        }
+    }
+
+    fn type_char(&mut self, i: usize, c: char) -> Vec<Event> {
         let (limit, allowed) = match self.items[i].kind {
             Kind::Stepper { .. } => (NUMBER_CHARS, c.is_ascii_digit()),
             Kind::Time { .. } => (TIME_CHARS, c.is_ascii_digit() || c == ':'),
-            _ => return,
+            _ => return Vec::new(),
         };
-        if !allowed {
-            return;
-        }
+        let Some(before) = self.shown(i).filter(|_| allowed) else {
+            return Vec::new();
+        };
         let edit = self.edit.get_or_insert_with(|| Edit {
             item: i,
             text: String::new(),
+            before,
         });
         if edit.text.len() < limit {
             edit.text.push(c);
         }
+        self.take_typed(i)
     }
 
-    fn erase(&mut self, i: usize) {
+    fn erase(&mut self, i: usize) -> Vec<Event> {
+        let Some(before) = self.shown(i) else {
+            return Vec::new();
+        };
         let shown = match self.items[i].kind {
-            Kind::Stepper { value, .. } => value.to_string(),
             Kind::Time { minutes, .. } => time_text(minutes),
-            _ => return,
+            _ => before.to_string(),
         };
         let edit = self.edit.get_or_insert(Edit {
             item: i,
             text: shown,
+            before,
         });
         edit.text.pop();
+        self.take_typed(i)
+    }
+
+    /// A number stepper takes each typed number at once and reports it, so the caller can
+    /// follow the typing, as the settings window's profile does (SPEC §9.2). A time stepper
+    /// waits for the commit, since a part of a time is a different time.
+    fn take_typed(&mut self, i: usize) -> Vec<Event> {
+        let (Some(edit), id) = (&self.edit, self.items[i].id) else {
+            return Vec::new();
+        };
+        match &mut self.items[i].kind {
+            Kind::Stepper { value, .. } => parse_number(&edit.text)
+                .filter(|v| v != value)
+                .map(|v| {
+                    *value = v;
+                    vec![Event::Changed(id, Value::Number(v))]
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
     }
 
     /// Ends typing in a stepper: a number keeps what was typed, even out of range; a time keeps
-    /// it if it is a real time. Anything else shows the value again.
+    /// it if it is a real time. Anything else gives back the value from before the typing.
     fn commit(&mut self) -> Vec<Event> {
         let Some(edit) = self.edit.take() else {
             return Vec::new();
         };
-        let id = self.items[edit.item].id;
-        let changed = match &mut self.items[edit.item].kind {
-            Kind::Stepper { value, .. } => parse_number(&edit.text)
-                .filter(|v| v != value)
-                .inspect(|&v| *value = v),
-            Kind::Time { minutes, .. } => parse_time(&edit.text)
-                .filter(|v| v != minutes)
-                .inspect(|&v| *minutes = v),
+        let parsed = match self.items[edit.item].kind {
+            Kind::Stepper { .. } => parse_number(&edit.text),
+            Kind::Time { .. } => parse_time(&edit.text),
             _ => None,
         };
-        changed
-            .map(|v| vec![Event::Changed(id, Value::Number(v))])
-            .unwrap_or_default()
+        self.set_typed(edit.item, parsed.unwrap_or(edit.before))
+    }
+
+    /// Drops the typing and gives back the value from before it.
+    fn drop_edit(&mut self) -> Vec<Event> {
+        match self.edit.take() {
+            Some(edit) => self.set_typed(edit.item, edit.before),
+            None => Vec::new(),
+        }
+    }
+
+    /// Sets a stepper's value to `v`, reporting it when it changes.
+    fn set_typed(&mut self, i: usize, v: i32) -> Vec<Event> {
+        let id = self.items[i].id;
+        let changed = match &mut self.items[i].kind {
+            Kind::Stepper { value, .. } if *value != v => {
+                *value = v;
+                true
+            }
+            Kind::Time { minutes, .. } if *minutes != v => {
+                *minutes = v;
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            vec![Event::Changed(id, Value::Number(v))]
+        } else {
+            Vec::new()
+        }
     }
 
     // ---- Drop-down menu ----
@@ -1284,9 +1333,11 @@ pub fn menu_layout(entries: &[Entry], field_w: i32, dpi: u32, m: &dyn Measure) -
 }
 
 /// Where the menu window goes on screen: `gap` under the `field` (in screen pixels), or above
-/// it when there is no room below in the `work` area but there is above. Kept inside `work`
-/// across.
-pub fn menu_place(field: RECT, w: i32, h: i32, gap: i32, work: RECT) -> RECT {
+/// it when there is no room below in the `work` area but there is above. Across, it starts at
+/// the field's left edge; a menu wider than its field that would then cross `edge`, the right
+/// edge of the form's client area, lines up its right edge with the field's instead, so it does
+/// not hang off the window. Kept inside `work` across.
+pub fn menu_place(field: RECT, w: i32, h: i32, gap: i32, edge: i32, work: RECT) -> RECT {
     let below = field.bottom + gap;
     let above = field.top - gap - h;
     let top = if below + h > work.bottom && above >= work.top {
@@ -1294,7 +1345,12 @@ pub fn menu_place(field: RECT, w: i32, h: i32, gap: i32, work: RECT) -> RECT {
     } else {
         below
     };
-    let left = field.left.min(work.right - w).max(work.left);
+    let start = if field.left + w > edge {
+        field.right - w
+    } else {
+        field.left
+    };
+    let left = start.min(work.right - w).max(work.left);
     rect(left, top, w, h)
 }
 
@@ -1687,47 +1743,58 @@ mod tests {
     }
 
     #[test]
-    fn typed_digits_commit_on_enter_then_enter_presses_the_default() {
+    fn typed_digits_take_effect_at_once_and_enter_presses_the_default() {
         let mut f = sample();
         f.focus(EVERY);
-        for c in "45".chars() {
-            assert_eq!(f.key(Key::Char(c)), []);
-        }
+        assert_eq!(
+            f.key(Key::Char('4')),
+            [Event::Changed(EVERY, Value::Number(4))]
+        );
+        assert_eq!(
+            f.key(Key::Char('5')),
+            [Event::Changed(EVERY, Value::Number(45))]
+        );
         assert_eq!(
             f.looks()[f.index(EVERY).unwrap()].edit.as_deref(),
             Some("45")
         );
-        assert_eq!(
-            f.key(Key::Enter),
-            [
-                Event::Changed(EVERY, Value::Number(45)),
-                Event::Pressed(SAVE)
-            ]
-        );
         assert_eq!(f.value(EVERY), Some(Value::Number(45)));
+        assert_eq!(f.key(Key::Enter), [Event::Pressed(SAVE)]);
+        assert_eq!(f.looks()[f.index(EVERY).unwrap()].edit, None);
     }
 
     #[test]
-    fn typed_digits_commit_on_tab_and_on_focus_loss() {
+    fn typing_ends_on_tab_focus_loss_and_click_and_no_number_gives_the_old_one_back() {
         let mut f = sample();
         f.focus(EVERY);
         f.key(Key::Char('5'));
         f.key(Key::Char('0'));
-        assert_eq!(f.key(Key::Tab), [Event::Changed(EVERY, Value::Number(50))]);
+        assert_eq!(f.key(Key::Tab), []);
         assert_eq!(f.focused(), Some(FROM));
+        assert_eq!(f.value(EVERY), Some(Value::Number(50)));
         f.focus(EVERY);
         f.key(Key::Char('6'));
-        assert_eq!(f.focus_out(), [Event::Changed(EVERY, Value::Number(6))]);
-        // And when a click moves the focus.
+        assert_eq!(f.focus_out(), []);
+        assert_eq!(f.looks()[f.index(EVERY).unwrap()].edit, None);
+        // A click that moves the focus ends it too.
         f.focus_in();
         f.key(Key::Char('7'));
         assert_eq!(
             click(&mut f, SWITCH, Part::Body),
-            [
-                Event::Changed(EVERY, Value::Number(7)),
-                Event::Changed(SWITCH, Value::On(true))
-            ]
+            [Event::Changed(SWITCH, Value::On(true))]
         );
+        // Typed down to nothing: the value from before the typing comes back.
+        f.focus(EVERY);
+        f.key(Key::Back);
+        assert_eq!(f.value(EVERY), Some(Value::Number(7)));
+        assert_eq!(f.key(Key::Tab), []);
+        f.focus(EVERY);
+        assert_eq!(
+            f.key(Key::Char('9')),
+            [Event::Changed(EVERY, Value::Number(9))]
+        );
+        f.key(Key::Back);
+        assert_eq!(f.key(Key::Tab), [Event::Changed(EVERY, Value::Number(7))]);
     }
 
     #[test]
@@ -1759,17 +1826,23 @@ mod tests {
         assert_eq!(edit(&f).as_deref(), Some("1234"));
         f.key(Key::Back);
         assert_eq!(edit(&f).as_deref(), Some("123"));
-        // Esc drops the typing and does not cancel; the next Esc does.
-        assert_eq!(f.key(Key::Esc), []);
+        assert_eq!(f.value(EVERY), Some(Value::Number(123)));
+        // One Esc cancels, also while typing; the typed value goes back first.
+        assert_eq!(
+            f.key(Key::Esc),
+            [
+                Event::Changed(EVERY, Value::Number(30)),
+                Event::Pressed(CANCEL)
+            ]
+        );
         assert_eq!(edit(&f), None);
         assert_eq!(f.value(EVERY), Some(Value::Number(30)));
-        assert_eq!(f.key(Key::Esc), [Event::Pressed(CANCEL)]);
         // Backspace with nothing typed edits the value shown.
         f.key(Key::Back);
         assert_eq!(edit(&f).as_deref(), Some("3"));
-        // Nothing typed at all: the value stays.
+        // Nothing typed at all: the value from before comes back.
         f.key(Key::Back);
-        assert_eq!(f.key(Key::Tab), []);
+        assert_eq!(f.key(Key::Tab), [Event::Changed(EVERY, Value::Number(30))]);
         assert_eq!(f.value(EVERY), Some(Value::Number(30)));
     }
 
@@ -1779,13 +1852,7 @@ mod tests {
         f.focus(EVERY);
         f.key(Key::Char('4'));
         f.key(Key::Char('0'));
-        assert_eq!(
-            f.key(Key::Up),
-            [
-                Event::Changed(EVERY, Value::Number(40)),
-                Event::Changed(EVERY, Value::Number(41))
-            ]
-        );
+        assert_eq!(f.key(Key::Up), [Event::Changed(EVERY, Value::Number(41))]);
     }
 
     #[test]
@@ -1823,8 +1890,8 @@ mod tests {
     // ---- Drop-down ----
 
     #[test]
-    fn space_enter_and_alt_down_open_the_menu() {
-        for open in [Key::Space, Key::Enter, Key::AltDown] {
+    fn space_and_alt_down_open_the_menu() {
+        for open in [Key::Space, Key::AltDown] {
             let mut f = sample();
             f.focus(PROFILE);
             assert_eq!(f.key(open), []);
@@ -1854,8 +1921,11 @@ mod tests {
         assert_eq!(f.menu(), None);
         assert_eq!(f.value(PROFILE), Some(Value::Index(Some(0))));
         // Picking the current entry changes nothing.
-        f.key(Key::Enter);
+        f.key(Key::Space);
         assert_eq!(f.key(Key::Enter), []);
+        // On the closed drop-down, Enter presses the default button.
+        assert_eq!(f.key(Key::Enter), [Event::Pressed(SAVE)]);
+        assert_eq!(f.menu(), None);
     }
 
     #[test]
@@ -1925,17 +1995,25 @@ mod tests {
         assert_eq!(m.hit(1, 60), None);
 
         let work = rect(0, 0, 1000, 800);
+        let edge = 1000;
         let field = rect(100, 300, 176, 32);
         assert_eq!(
-            menu_place(field, 176, 152, 4, work),
+            menu_place(field, 176, 152, 4, edge, work),
             rect(100, 336, 176, 152)
         );
         // No room below: above.
         let low = rect(100, 700, 176, 32);
-        assert_eq!(menu_place(low, 176, 152, 4, work), rect(100, 544, 176, 152));
+        assert_eq!(
+            menu_place(low, 176, 152, 4, edge, work),
+            rect(100, 544, 176, 152)
+        );
         // Kept inside the work area across.
         let right = rect(900, 300, 176, 32);
-        assert_eq!(menu_place(right, 176, 152, 4, work).left, 1000 - 176);
+        assert_eq!(menu_place(right, 176, 152, 4, 2000, work).left, 1000 - 176);
+        // Wider than its field near the window's right edge: right edges line up.
+        let near = rect(384, 300, 176, 32);
+        assert_eq!(menu_place(near, 330, 152, 4, 600, work).left, 560 - 330);
+        assert_eq!(menu_place(near, 330, 152, 4, 800, work).left, 384);
     }
 
     // ---- Pointer ----

@@ -19,7 +19,7 @@
 pub mod draw;
 pub mod form;
 #[cfg(test)]
-mod shots;
+pub(crate) mod shots;
 pub mod window;
 
 use std::fmt;
@@ -151,8 +151,9 @@ pub enum Kind {
         label: String,
         on: bool,
     },
-    /// A number stepper in `min..=max` with `unit` after the number ("min"). A typed value
-    /// outside the range stays as typed, so the caller's Save can name it (SPEC §9.2).
+    /// A number stepper in `min..=max` with `unit` after the number ("min"). A typed number
+    /// takes effect, with its event, as it is typed; one outside the range stays as typed, so
+    /// the caller's Save can name it (SPEC §9.2).
     Stepper {
         value: i32,
         min: i32,
