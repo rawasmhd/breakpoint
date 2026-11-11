@@ -63,6 +63,8 @@ pub struct Laid {
     pub lines: Vec<String>,
     /// The parts that answer the pointer.
     pub parts: Vec<(Part, RECT)>,
+    /// A card's row hairlines, as client y.
+    pub rows: Vec<i32>,
 }
 
 /// A key the form handles. The window turns Win32 key messages into these.
@@ -180,6 +182,9 @@ pub struct Form {
     anim: Vec<Anim>,
     edit: Option<Edit>,
     menu: Option<Menu>,
+    /// Where wrapped text needs more room than its place gives at this DPI: the y at 96 DPI
+    /// under which items move down, and by how many pixels.
+    growth: Vec<(i32, i32)>,
 }
 
 impl Form {
@@ -203,6 +208,7 @@ impl Form {
             anim,
             edit: None,
             menu: None,
+            growth: Vec::new(),
         };
         form.focus = form.tab_stops().first().copied();
         form
@@ -237,6 +243,11 @@ impl Form {
 
     /// Lays every item out at `dpi`: places scaled with [`px`], own sizes from the controls
     /// table, text measured with `m`.
+    ///
+    /// A wrapped text whose place gives a height reserves that room. When it needs more lines
+    /// at this DPI, every item placed at or under its bottom moves down by the extra, and a
+    /// card or band round its bottom grows by it, so the form keeps its reading order and
+    /// [`Form::height`] grows with it.
     pub fn lay_out(&mut self, dpi: u32, m: &dyn Measure) {
         self.dpi = dpi;
         self.laid = self
@@ -244,6 +255,50 @@ impl Form {
             .iter()
             .map(|item| lay_out(item, dpi, m))
             .collect();
+        self.growth = self
+            .items
+            .iter()
+            .zip(&self.laid)
+            .filter_map(|(item, laid)| match item.kind {
+                Kind::Text { .. } if item.at.w > 0 && item.at.h > 0 => {
+                    let extra = laid.rect.bottom - laid.rect.top - px(item.at.h, dpi);
+                    (extra > 0).then_some((item.at.y + item.at.h, extra))
+                }
+                _ => None,
+            })
+            .collect();
+        let growth = &self.growth;
+        for (item, laid) in self.items.iter().zip(&mut self.laid) {
+            let (top, bottom) = (item.at.y, item.at.y + item.at.h);
+            let down = shift(growth, top);
+            let grow = shift(growth, bottom) - down;
+            let grows = matches!(item.kind, Kind::Card { .. } | Kind::Band);
+            let move_rect = |r: &mut RECT| {
+                r.top += down;
+                r.bottom += down;
+            };
+            move_rect(&mut laid.rect);
+            laid.parts.iter_mut().for_each(|(_, r)| move_rect(r));
+            if grows {
+                laid.rect.bottom += grow;
+            }
+            if let Kind::Card { rows } = &item.kind {
+                laid.rows = rows
+                    .iter()
+                    .map(|&row| laid.rect.top + px(row, dpi) + shift(growth, top + row) - down)
+                    .collect();
+            }
+        }
+    }
+
+    /// The client height for a form `height` tall at 96 DPI, grown for wrapped text. With a
+    /// `height` of 0, the bottom of the lowest item.
+    pub fn height(&self, height: i32) -> i32 {
+        if height > 0 {
+            px(height, self.dpi) + shift(&self.growth, height)
+        } else {
+            self.laid.iter().map(|l| l.rect.bottom).max().unwrap_or(0)
+        }
     }
 
     /// The item and part under (`x`, `y`) in client pixels. Later items win.
@@ -364,8 +419,10 @@ impl Form {
         out
     }
 
-    /// Focuses the item `id`, as after a refused Save.
+    /// Focuses the item `id` and shows the focus ring, as after a refused Save: the user must
+    /// see which control to fix, even when Save was clicked.
     pub fn focus(&mut self, id: Id) -> Vec<Event> {
+        self.cues = true;
         match self.index(id) {
             Some(i) if self.items[i].kind.focusable() => self.focus_on(i),
             _ => Vec::new(),
@@ -374,7 +431,18 @@ impl Form {
 
     fn move_focus(&mut self, forward: bool) -> Vec<Event> {
         let stops = self.tab_stops();
-        let cur = self.focus;
+        // From inside a card group, Tab leaves the whole group, whichever card has the focus.
+        let cur = self.focus.map(|c| match self.items[c].kind {
+            Kind::Choice { group, .. } => {
+                let members = self.group(group);
+                if forward {
+                    members.last().copied().unwrap_or(c)
+                } else {
+                    members.first().copied().unwrap_or(c)
+                }
+            }
+            _ => c,
+        });
         let next = if forward {
             stops
                 .iter()
@@ -422,11 +490,15 @@ impl Form {
             Key::Tab => return self.move_focus(true),
             Key::BackTab => return self.move_focus(false),
             Key::Enter => {
-                if let Some(i) = self.focus
-                    && matches!(self.items[i].kind, Kind::DropDown { .. })
-                {
-                    self.open_menu(i);
-                    return Vec::new();
+                // As in a Windows dialog: Enter presses the focused button, opens the focused
+                // drop-down, and otherwise presses the default button.
+                match self.focus.map(|i| (&self.items[i].kind, self.items[i].id)) {
+                    Some((Kind::DropDown { .. }, _)) => {
+                        self.open_menu(self.focus.unwrap_or_default());
+                        return Vec::new();
+                    }
+                    Some((Kind::Button { .. }, id)) => return vec![Event::Pressed(id)],
+                    _ => {}
                 }
                 let mut out = self.commit();
                 out.extend(self.button(|default, _| default).map(Event::Pressed));
@@ -514,7 +586,9 @@ impl Form {
                 selected: false, ..
             } => {
                 self.select_choice(i);
-                vec![Event::Changed(id, Value::On(true))]
+                let mut out = self.focus_on(i);
+                out.push(Event::Changed(id, Value::On(true)));
+                out
             }
             _ => Vec::new(),
         }
@@ -785,7 +859,19 @@ impl Form {
         let Some((i, part)) = hit else {
             return Vec::new();
         };
-        let mut out = self.focus_on(i);
+        // A card that is not selected takes the focus only when the click selects it, on
+        // release; a press dragged off it leaves the focus where it was.
+        let mut out = if matches!(
+            self.items[i].kind,
+            Kind::Choice {
+                selected: false,
+                ..
+            }
+        ) {
+            self.commit()
+        } else {
+            self.focus_on(i)
+        };
         match (&self.items[i].kind, part) {
             (Kind::Stepper { .. } | Kind::Time { .. }, Part::Minus) => {
                 out.extend(self.step(i, Step::By(-1)))
@@ -1043,7 +1129,15 @@ fn lay_out(item: &Item, dpi: u32, m: &dyn Measure) -> Laid {
                 None => vec![text.clone()],
             };
             let widest = lines.iter().map(|l| m.width(*style, l)).max().unwrap_or(0);
-            sized(widest, lines.len() as i32 * lh(*style))
+            let tall = lines.len() as i32 * lh(*style);
+            let r = sized(widest, tall);
+            // Never shorter than its lines: the room past its place is growth.
+            rect(
+                r.left,
+                r.top,
+                r.right - r.left,
+                (r.bottom - r.top).max(tall),
+            )
         }
         Kind::Glyph(_) => sized(s(SIZE_GLYPH), s(SIZE_GLYPH)),
         Kind::Button { label, kind, .. } => {
@@ -1128,7 +1222,17 @@ fn lay_out(item: &Item, dpi: u32, m: &dyn Measure) -> Laid {
         rect: r,
         lines,
         parts,
+        rows: Vec::new(),
     }
+}
+
+/// How far items placed at `y` (96 DPI) move down for the `growth` above them, in pixels.
+fn shift(growth: &[(i32, i32)], y: i32) -> i32 {
+    growth
+        .iter()
+        .filter(|&&(under, _)| under <= y)
+        .map(|&(_, extra)| extra)
+        .sum()
 }
 
 /// The open menu's size and rows, in the menu window's client pixels.
@@ -1427,6 +1531,29 @@ mod tests {
         assert_eq!(f.key(Key::Enter), [Event::Pressed(SAVE)]);
         assert_eq!(f.key(Key::Esc), [Event::Pressed(CANCEL)]);
         assert_eq!(f.escape(), Event::Pressed(CANCEL));
+    }
+
+    #[test]
+    fn enter_presses_the_focused_button_as_in_a_windows_dialog() {
+        let mut f = sample();
+        f.focus(CANCEL);
+        assert_eq!(f.key(Key::Enter), [Event::Pressed(CANCEL)]);
+        f.focus(SAVE);
+        assert_eq!(f.key(Key::Enter), [Event::Pressed(SAVE)]);
+        // Any other control: the default button.
+        f.focus(SWITCH);
+        assert_eq!(f.key(Key::Enter), [Event::Pressed(SAVE)]);
+    }
+
+    #[test]
+    fn focus_from_code_shows_the_ring() {
+        let mut f = sample();
+        // A click on Save hides nothing and shows nothing: no keyboard yet.
+        click(&mut f, SAVE, Part::Body);
+        assert!(!f.looks().iter().any(|l| l.ring));
+        // The refused Save focuses its field, and the user must see where.
+        f.focus(EVERY);
+        assert!(f.looks()[f.index(EVERY).unwrap()].ring);
     }
 
     #[test]
@@ -1845,6 +1972,34 @@ mod tests {
     }
 
     #[test]
+    fn a_press_dragged_off_an_unselected_card_leaves_the_focus_alone() {
+        let mut f = sample();
+        f.focus(SWITCH);
+        let (x, y) = centre(&f, CARD_A, Part::Body);
+        f.pointer_down(x, y);
+        assert_eq!(f.focused(), Some(SWITCH));
+        let (x, y) = centre(&f, DAY_MON, Part::Body);
+        assert_eq!(f.pointer_up(x, y), []);
+        assert_eq!(f.focused(), Some(SWITCH));
+        assert_eq!(f.value(CARD_A), Some(Value::On(false)));
+        // A press on the selected card focuses it at once, as on any control.
+        let (x, y) = centre(&f, CARD_B, Part::Body);
+        f.pointer_down(x, y);
+        assert_eq!(f.focused(), Some(CARD_B));
+    }
+
+    #[test]
+    fn tab_leaves_the_group_from_any_of_its_cards() {
+        let mut f = sample();
+        f.focus(CARD_A);
+        assert_eq!(focus_after(&mut f, &[Key::Tab]), Some(DAY_MON));
+        f.focus(CARD_C);
+        assert_eq!(focus_after(&mut f, &[Key::BackTab]), Some(CANCEL));
+        f.focus(CARD_A);
+        assert_eq!(focus_after(&mut f, &[Key::BackTab]), Some(CANCEL));
+    }
+
+    #[test]
     fn stepper_zones_step_on_press() {
         let mut f = sample();
         let (x, y) = centre(&f, EVERY, Part::Plus);
@@ -1999,6 +2154,47 @@ mod tests {
         f.lay_out(96, &Fixed(96));
         assert_eq!(f.laid()[0].lines, ["aaaa", "bbbb", "cccc"]);
         assert_eq!(f.laid()[0].rect, rect(0, 0, 60, 3 * 18));
+    }
+
+    #[test]
+    fn wrapped_text_that_needs_more_room_pushes_what_is_under_it_down() {
+        // The note reserves one caption line at 96 DPI but needs three.
+        let note = Kind::text("aaaa bbbb cccc", Style::Caption, Ink::Muted);
+        let switch = Kind::Switch { on: false };
+        let mut f = Form::new(vec![
+            Item::new(
+                1,
+                Place::new(0, 0, 200, 100),
+                Kind::Card { rows: vec![20, 60] },
+            ),
+            Item::new(2, Place::new(10, 20, 60, 18), note),
+            Item::new(3, Place::at(100, 20), switch.clone()),
+            Item::new(4, Place::at(10, 38), switch),
+            Item::new(5, Place::new(0, 100, 200, 40), Kind::Band),
+        ]);
+        f.lay_out(96, &Fixed(96));
+        let extra = 3 * 18 - 18;
+        let laid = |id: Id| f.laid()[f.index(id).unwrap()].clone();
+        assert_eq!(laid(2).rect, rect(10, 20, 60, 54));
+        // Beside the note: stays. Under it: moves down, and hit-testing follows.
+        assert_eq!(laid(3).rect.top, 20);
+        assert_eq!(laid(4).rect.top, 38 + extra);
+        assert_eq!(f.hit(15, 38 + extra + 5).map(|(i, _)| i), f.index(4));
+        // The card round it grows; its rows under the note move down, the row above stays.
+        assert_eq!(laid(1).rect, rect(0, 0, 200, 100 + extra));
+        assert_eq!(laid(1).rows, [20, 60 + extra]);
+        // The band under it moves down, and so does the window's height.
+        assert_eq!(laid(5).rect, rect(0, 100 + extra, 200, 40));
+        assert_eq!(f.height(140), 140 + extra);
+        assert_eq!(f.height(0), 140 + extra);
+        // Where the text fits, nothing moves.
+        let mut f = Form::new(vec![Item::new(
+            1,
+            Place::new(0, 0, 200, 18),
+            Kind::text("aaaa bbbb cccc", Style::Caption, Ink::Muted),
+        )]);
+        f.lay_out(96, &Fixed(96));
+        assert_eq!(f.height(18), 18);
     }
 
     #[test]

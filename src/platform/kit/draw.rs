@@ -242,13 +242,13 @@ fn paint_item(p: &mut Pen, item: &Item, laid: &Laid, look: &Look) {
     let sm = p.s(RADIUS_SM);
     let h = r.bottom - r.top;
     match &item.kind {
-        Kind::Card { rows } => {
+        Kind::Card { .. } => {
             let md = p.s(RADIUS_MD);
             p.canvas.fill_round_rect(c.raised, b, md);
             p.canvas.stroke_round_rect(c.hairline, b, md, hair);
             let side = p.s(SPACE_4);
-            for &row in rows {
-                let y = (r.top + px(row, p.dpi)) as f32;
+            for &row in &laid.rows {
+                let y = row as f32;
                 p.canvas.fill_rect(
                     c.hairline,
                     Box2 {

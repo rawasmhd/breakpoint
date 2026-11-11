@@ -11,6 +11,7 @@
 //!   box or close the window.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::sync::Once;
 use std::time::Instant;
 
@@ -66,12 +67,14 @@ const FRAME_TIMER: usize = 1;
 /// A form window to open: its caption, its client size at 96 DPI, its items, and where it goes.
 pub struct Spec {
     pub caption: String,
-    /// Client width and height at 96 DPI.
+    /// Client width and height at 96 DPI. The height grows at run time when wrapped text needs
+    /// more lines at the window's DPI (see [`Form::lay_out`]). A height of 0 takes the bottom
+    /// of the lowest item, such as the footer band.
     pub width: i32,
     pub height: i32,
     pub items: Vec<Item>,
-    /// The window's top-left corner on screen. `None` centres it on the primary monitor's work
-    /// area.
+    /// The window's top-left corner on screen, moved into the work area of its monitor if the
+    /// window would not fit there. `None` centres it on the primary monitor's work area.
     pub at: Option<POINT>,
     pub owner: Option<HWND>,
 }
@@ -93,15 +96,19 @@ struct Host {
     menu_layout: Option<MenuLayout>,
     /// No DWM round corners (Windows 10): the menu paints its own outline.
     menu_outline: bool,
+    /// The caller's callback; `None` while it runs.
     on_event: Option<Callback>,
+    /// Events waiting for the callback, in order.
+    queue: VecDeque<Event>,
 }
 
 impl Host {
-    /// Lays the form out at `dpi`; returns the client size in pixels.
+    /// Lays the form out at `dpi`; returns the client size in pixels, its height grown for
+    /// wrapped text that needs more lines at this DPI.
     fn relayout(&mut self, dpi: u32) -> (i32, i32) {
         let fonts = self.fonts.at(dpi);
         with_screen_measure(fonts, |m| self.form.lay_out(dpi, m));
-        self.client = (px(self.size.0, dpi), px(self.size.1, dpi));
+        self.client = (px(self.size.0, dpi), self.form.height(self.size.1));
         self.client
     }
 
@@ -139,16 +146,25 @@ fn with_host<R>(hwnd: HWND, f: impl FnOnce(&mut Host) -> R) -> Option<R> {
     Some(f(&mut h))
 }
 
-/// Hands `events` to the caller's callback with no state borrowed. Stops if the callback
-/// closes the window.
+/// Hands `events` to the caller's callback, in order, with no state borrowed.
+///
+/// Events raised while the callback runs (it pressed a key through `SendMessage`, focused a
+/// stepper with typed text, or a message box let input through) wait in the queue, and the
+/// running call hands them on after it returns, so none is lost. Stops if the callback closes
+/// the window.
 fn emit(hwnd: HWND, events: Vec<Event>) {
     if events.is_empty() {
         return;
     }
-    let Some(mut callback) = with_host(hwnd, |h| h.on_event.take()).flatten() else {
+    let Some(mut callback) = with_host(hwnd, |h| {
+        h.queue.extend(events);
+        h.on_event.take()
+    })
+    .flatten() else {
+        // The callback is running further up the stack; it takes these when it returns.
         return;
     };
-    for event in events {
+    while let Some(event) = with_host(hwnd, |h| h.queue.pop_front()).flatten() {
         callback(Handle(hwnd), event);
         // SAFETY: no pointers.
         if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
@@ -208,20 +224,35 @@ impl Handle {
         done
     }
 
-    /// Changes a text, label or drop-down `other` text, and lays the form out again.
+    /// Changes a text, label or drop-down `other` text, lays the form out again and resizes
+    /// the window to fit, as [`Handle::fit`] does.
     pub fn set_text(self, id: Id, text: &str) -> bool {
-        let done = with_host(self.0, |h| {
-            let done = h.form.set_text(id, text);
-            let dpi = h.form.dpi();
-            h.relayout(dpi);
-            done
-        })
-        .unwrap_or(false);
-        refresh(self.0);
+        let done = with_host(self.0, |h| h.form.set_text(id, text)).unwrap_or(false);
+        self.fit();
         done
     }
 
-    /// Gives the window the keyboard focus and moves it to item `id`, as after a refused Save.
+    /// Lays the form out again and resizes the window to its content, keeping its top-left
+    /// corner (moved only as far as needed to stay in the work area). Call it after changes
+    /// that alter text, such as a new work-week line in the wizard.
+    pub fn fit(self) {
+        let Some((client, dpi)) = with_host(self.0, |h| {
+            let dpi = h.form.dpi();
+            (h.relayout(dpi), dpi)
+        }) else {
+            return;
+        };
+        let (w, h) = window_size(client, dpi);
+        let now = self.window_rect();
+        let (x, y) = keep_inside(now.left, now.top, w, h, work_area(self.0));
+        // SAFETY: no state borrow is held.
+        unsafe { move_to(self.0, rect(x, y, w, h)) };
+        refresh(self.0);
+    }
+
+    /// Gives the window the keyboard focus, moves it to item `id` and shows the focus ring,
+    /// as after a refused Save: the ring shows even when Save was clicked, so the user sees
+    /// which control to fix.
     pub fn focus(self, id: Id) {
         let events = with_host(self.0, |h| h.form.focus(id)).unwrap_or_default();
         // SAFETY: no pointers.
@@ -324,25 +355,33 @@ pub fn open(spec: Spec, on_event: impl FnMut(Handle, Event) + 'static) -> Result
             menu_layout: None,
             menu_outline: false,
             on_event: Some(Box::new(on_event)),
+            queue: VecDeque::new(),
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(host) as isize);
         let dpi = GetDpiForWindow(hwnd);
         let client = with_host(hwnd, |h| h.relayout(dpi)).unwrap_or_default();
         let (w, h) = window_size(client, dpi);
+        let work = work_area(hwnd);
         let (x, y) = match spec.at {
-            Some(p) => (p.x, p.y),
-            None => {
-                let work = work_area(hwnd);
-                (
-                    work.left + (work.right - work.left - w) / 2,
-                    work.top + (work.bottom - work.top - h) / 2,
-                )
-            }
+            Some(p) => keep_inside(p.x, p.y, w, h, work),
+            None => (
+                work.left + (work.right - work.left - w) / 2,
+                work.top + (work.bottom - work.top - h) / 2,
+            ),
         };
         let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
         apply_frame(hwnd);
         Ok(Handle(hwnd))
     }
+}
+
+/// The top-left corner for a `w` by `h` window asked at (`x`, `y`), moved as little as needed
+/// to lie inside `work`. A window larger than `work` keeps its top-left corner in it.
+fn keep_inside(x: i32, y: i32, w: i32, h: i32, work: RECT) -> (i32, i32) {
+    (
+        x.min(work.right - w).max(work.left),
+        y.min(work.bottom - h).max(work.top),
+    )
 }
 
 /// The window size for a client area of `client` pixels at `dpi`.
@@ -878,6 +917,65 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_window_asked_off_its_work_area_is_moved_in() {
+        let work = rect(0, 0, 1000, 800);
+        assert_eq!(keep_inside(100, 100, 600, 400, work), (100, 100));
+        assert_eq!(keep_inside(900, 700, 600, 400, work), (400, 400));
+        assert_eq!(keep_inside(-50, -20, 600, 400, work), (0, 0));
+        assert_eq!(keep_inside(300, 300, 1200, 900, work), (0, 0));
+        let second = rect(1000, 0, 1920, 1040);
+        assert_eq!(keep_inside(2800, 100, 600, 400, second), (2320, 100));
+    }
+
+    /// The callback presses a key through `SendMessage`; the toggle that raises arrives after
+    /// the first call returns, not dropped.
+    #[test]
+    fn events_raised_while_the_callback_runs_are_handed_on_after_it() {
+        use super::super::{Item, Kind, Place, Value};
+        use std::rc::Rc;
+        use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+
+        let seen: Rc<RefCell<Vec<Event>>> = Rc::default();
+        let log = seen.clone();
+        let spec = Spec {
+            caption: "kit test".into(),
+            width: 100,
+            height: 50,
+            items: vec![Item::new(7, Place::at(8, 8), Kind::Switch { on: false })],
+            at: Some(POINT { x: 0, y: 0 }),
+            owner: None,
+        };
+        let space = |hwnd: HWND| unsafe {
+            SendMessageW(
+                hwnd,
+                WM_KEYDOWN,
+                Some(WPARAM(VK_SPACE.0.into())),
+                Some(LPARAM(0)),
+            );
+        };
+        let handle = open(spec, move |handle, event| {
+            log.borrow_mut().push(event);
+            if log.borrow().len() == 1 {
+                space(handle.hwnd());
+                // Still running: the second toggle waits for this call to return.
+                assert_eq!(log.borrow().len(), 1);
+            }
+        })
+        .unwrap();
+        space(handle.hwnd());
+        assert_eq!(
+            *seen.borrow(),
+            [
+                Event::Changed(7, Value::On(true)),
+                Event::Changed(7, Value::On(false))
+            ]
+        );
+        assert_eq!(handle.value(7), Some(Value::On(false)));
+        handle.close();
+        assert!(!handle.is_open());
+    }
 
     #[test]
     fn keys_map_to_form_keys() {

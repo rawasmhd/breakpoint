@@ -360,7 +360,7 @@ fn demo() -> (Vec<(Item, Shot)>, i32) {
 
     // A card of text styles and glyphs, with hairlines between its rows.
     let card_w = WIDTH - 2 * SPACE_6;
-    let rows = [56, 44, 60];
+    let rows = [56, 44, 44];
     add(
         &mut out,
         Place::new(SPACE_6, y, card_w, rows.iter().sum()),
@@ -418,7 +418,8 @@ fn demo() -> (Vec<(Item, Shot)>, i32) {
     }
     add(
         &mut out,
-        Place::new(inner + 110, line, 560, 0),
+        // One line reserved: the second line grows the card and moves the footer down.
+        Place::new(inner + 110, line, 560, Style::Caption.line_height()),
         text(
             "Always gentle; rides along with the next nudge. A long note wraps at spaces to the width its place gives it.",
             Style::Caption,
@@ -580,10 +581,20 @@ fn shots() {
         for dpi in [96, 120, 144, 192] {
             let fonts = Fonts::new(dpi);
             let mut form = Form::new(demo.iter().map(|(item, _)| item.clone()).collect());
-            let (w, h) = (px(WIDTH, dpi), px(height, dpi));
+            unsafe {
+                let screen = GetDC(None);
+                form.lay_out(
+                    dpi,
+                    &GdiMeasure {
+                        dc: screen,
+                        fonts: &fonts,
+                    },
+                );
+                ReleaseDC(None, screen);
+            }
+            let (w, h) = (px(WIDTH, dpi), form.height(height));
             let path = folder.join(format!("kit-{name}-{dpi}.bmp"));
             render(w, h, &path, |dc| unsafe {
-                form.lay_out(dpi, &GdiMeasure { dc, fonts: &fonts });
                 let mut looks = form.looks();
                 for (look, (_, shot)) in looks.iter_mut().zip(&demo) {
                     apply(look, *shot);
