@@ -172,6 +172,18 @@ pub const FOCUS_RING: i32 = 2;
 pub const WATER_ALONE_PAD_Y: i32 = 12;
 /// Water alone padding, left and right.
 pub const WATER_ALONE_PAD_X: i32 = 16;
+/// A hairline: the secondary button border and the Windows 10 popup outline.
+pub const HAIRLINE: i32 = 1;
+/// How far a pressed button's label moves down.
+pub const PRESS_DROP: i32 = 1;
+/// How far the popup's close × hit area reaches past the popup padding, right, top and bottom,
+/// so the × itself lines up with the padding edge.
+pub const CLOSE_OVERHANG: i32 = 4;
+/// The close × mark's box, centred in its hit area. The × is two strokes from corner to corner,
+/// [`CLOSE_INSET`] in from each, [`CLOSE_STROKE`] wide; all three scale with the DPI.
+pub const CLOSE_MARK: f32 = 10.0;
+pub const CLOSE_INSET: f32 = 1.0;
+pub const CLOSE_STROKE: f32 = 1.5;
 
 // ---- Motion (DESIGN.md §8) ----
 

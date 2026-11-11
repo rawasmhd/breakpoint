@@ -20,19 +20,7 @@ use windows::Win32::Graphics::GdiPlus::{
     PixelOffsetModeHalf, SmoothingModeAntiAlias, UnitPixel,
 };
 
-use super::theme::{HOVER_IN, HOVER_OUT, PRESS, Palette};
-
-// ---- Sizes the design shows but the theme module does not hold, at 96 DPI ----
-
-/// A hairline: the secondary button border and the Windows 10 popup outline.
-pub const HAIRLINE: i32 = 1;
-/// How far a pressed button's label moves down.
-pub const PRESS_DROP: i32 = 1;
-/// How far the close × hit area reaches past the popup padding, right, top and bottom, so the
-/// × itself lines up with the padding edge as in the design preview.
-pub const CLOSE_OVERHANG: i32 = 4;
-/// The close × mark's box, centred in its hit area.
-pub const CLOSE_MARK: f32 = 10.0;
+use super::theme::{CLOSE_INSET, CLOSE_MARK, CLOSE_STROKE, HOVER_IN, HOVER_OUT, PRESS, Palette};
 
 /// How often a running fade or button fill repaints.
 pub const FRAME: Duration = Duration::from_millis(16);
@@ -288,10 +276,6 @@ const DROP_TIP: (f32, f32) = (10.0, 1.75);
 const DROP_RIGHT: (f32, f32) = (15.2, 10.2);
 const DROP_LEFT: (f32, f32) = (4.8, 10.2);
 const DROP_R: f32 = 5.9;
-
-/// The close × in a 10-unit box: two strokes from corner to corner, 1 unit in, 1.5 wide.
-const CLOSE_INSET: f32 = 1.0;
-const CLOSE_STROKE: f32 = 1.5;
 
 /// The drop's arc as GDI+ wants it: the circle's centre and the angles in degrees, clockwise
 /// from the x axis (y points down, as in SVG).

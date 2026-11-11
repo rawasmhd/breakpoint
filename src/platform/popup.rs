@@ -24,18 +24,20 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
-    EndPaint, GetDC, GetMonitorInfoW, GetTextExtentPoint32W, GetTextMetricsW, HDC, HMONITOR,
-    InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, PAINTSTRUCT,
-    ReleaseDC, SRCCOPY, SelectObject, SetBkMode, SetTextAlign, SetTextColor, TA_BASELINE, TA_LEFT,
-    TEXTMETRICW, TRANSPARENT, TextOutW,
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush, DeleteDC,
+    DeleteObject, EndPaint, FillRect, GetDC, GetMonitorInfoW, GetTextExtentPoint32W,
+    GetTextMetricsW, HDC, HMONITOR, InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
+    MonitorFromPoint, PAINTSTRUCT, ReleaseDC, SRCCOPY, SelectObject, SetBkMode, SetTextAlign,
+    SetTextColor, TA_BASELINE, TA_LEFT, TEXTMETRICW, TRANSPARENT, TextOutW,
 };
 use windows::Win32::Media::Audio::{PlaySoundW, SND_ALIAS, SND_ASYNC};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::SystemServices::MK_LBUTTON;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    VK_LBUTTON,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DROPSHADOW, CreateWindowExW, DefWindowProcW, HWND_TOPMOST, IDC_ARROW, IsWindowVisible,
@@ -49,13 +51,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{Result, w};
 
-use super::paint::{
-    self, Box2, CLOSE_OVERHANG, Canvas, FRAME, Glyph, HAIRLINE, HOVER, PRESS_DROP, PRESSED, REST,
-};
+use super::paint::{self, Box2, Canvas, FRAME, Glyph, HOVER, PRESSED, REST};
 use super::theme::{
-    self, BAR_GAP, CLOSE_HIT, FADE_IN, FADE_OUT, FontCache, Fonts, POPUP_HEADER, Palette,
-    RADIUS_SM, SIZE_BAR, SIZE_BUTTON, SIZE_GLYPH, SIZE_GLYPH_INLINE, SIZE_MARK, SIZE_POPUP,
-    SPACE_1, SPACE_2, SPACE_3, SPACE_4, Style, Theme, WATER_ALONE_PAD_X, WATER_ALONE_PAD_Y, px,
+    self, BAR_GAP, CLOSE_HIT, CLOSE_OVERHANG, FADE_IN, FADE_OUT, FontCache, Fonts, HAIRLINE,
+    POPUP_HEADER, PRESS_DROP, Palette, RADIUS_SM, SIZE_BAR, SIZE_BUTTON, SIZE_GLYPH,
+    SIZE_GLYPH_INLINE, SIZE_MARK, SIZE_POPUP, SPACE_1, SPACE_2, SPACE_3, SPACE_4, Style, Theme,
+    WATER_ALONE_PAD_X, WATER_ALONE_PAD_Y, px,
 };
 
 /// Posted to the owner window when the user presses Skip.
@@ -400,8 +401,7 @@ struct State {
     fonts: FontCache,
     /// No DWM round corners (Windows 10): paint a hairline outline instead.
     outline: bool,
-    hot: Option<Part>,
-    pressed: Option<Part>,
+    pointer: Pointer,
     tracking: bool,
     /// Fill level per part, in [`Part::ALL`] order: 0 rest, 1 hover, 2 press.
     fills: [f32; 3],
@@ -422,13 +422,63 @@ fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
     STATE.with(|cell| cell.try_borrow_mut().ok()?.as_mut().map(f))
 }
 
-impl State {
+/// Which part the pointer is over, and which part a press started on.
+///
+/// The popup never activates, so after `SetCapture` Windows still sends the release to the
+/// window under the pointer once it leaves the popup. A press whose release went elsewhere ends
+/// at the next sign that the button is up, so it can never act later.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Pointer {
+    hot: Option<Part>,
+    pressed: Option<Part>,
+}
+
+impl Pointer {
+    /// The pointer moved over `hit`, with the left button `down` or not. True if anything changed.
+    fn moved(&mut self, hit: Option<Part>, down: bool) -> bool {
+        let before = *self;
+        if !down {
+            self.pressed = None;
+        }
+        self.hot = hit;
+        *self != before
+    }
+
+    /// The pointer left the popup, with the left button `down` or not.
+    fn left(&mut self, down: bool) {
+        self.hot = None;
+        if !down {
+            self.pressed = None;
+        }
+    }
+
+    fn down(&mut self, hit: Option<Part>) {
+        self.hot = hit;
+        self.pressed = hit;
+    }
+
+    /// The button came up over `hit`: the part to act on, only if the press started on it.
+    fn up(&mut self, hit: Option<Part>) -> Option<Part> {
+        self.hot = hit;
+        self.pressed.take().filter(|&p| Some(p) == hit)
+    }
+
+    fn cancel(&mut self) {
+        self.pressed = None;
+    }
+
     fn target(&self, part: Part) -> f32 {
         match (self.hot == Some(part), self.pressed) {
             (true, Some(p)) if p == part => PRESSED,
             (true, None) => HOVER,
             _ => REST,
         }
+    }
+}
+
+impl State {
+    fn target(&self, part: Part) -> f32 {
+        self.pointer.target(part)
     }
 
     fn moving(&self) -> bool {
@@ -510,8 +560,7 @@ impl Popup {
                 theme: theme::app_theme(),
                 fonts,
                 outline: round.is_err(),
-                hot: None,
-                pressed: None,
+                pointer: Pointer::default(),
                 tracking: false,
                 fills: [REST; 3],
                 alpha: 0.0,
@@ -575,8 +624,7 @@ impl Popup {
             s.theme = theme::app_theme();
             if !visible {
                 s.alpha = if animate { 0.0 } else { 1.0 };
-                s.hot = None;
-                s.pressed = None;
+                s.pointer = Pointer::default();
                 s.fills = [REST; 3];
             }
             s.fade_to = 1.0;
@@ -722,7 +770,7 @@ fn hide(hwnd: HWND) {
         if theme::animations_on() {
             with_state(|s| {
                 s.fade_to = 0.0;
-                s.pressed = None;
+                s.pointer.cancel();
                 s.last_frame = Instant::now();
             });
             start_frames(hwnd);
@@ -736,8 +784,7 @@ unsafe fn finish_hide(hwnd: HWND) {
     with_state(|s| {
         s.alpha = 0.0;
         s.fade_to = 0.0;
-        s.hot = None;
-        s.pressed = None;
+        s.pointer = Pointer::default();
         s.tracking = false;
         s.fills = [REST; 3];
     });
@@ -804,6 +851,10 @@ unsafe fn paint(hwnd: HWND) {
             let mem = CreateCompatibleDC(Some(dc));
             let bitmap = CreateCompatibleBitmap(dc, w, h);
             let old = SelectObject(mem, bitmap.into());
+            // The ground in GDI first, so text stays readable even if GDI+ is not up.
+            let ground = CreateSolidBrush(s.theme.palette().surface_raised);
+            FillRect(mem, &rect(0, 0, w, h), ground);
+            let _ = DeleteObject(ground.into());
             paint_shapes(s, mem);
             paint_text(s, mem);
             let _ = BitBlt(dc, 0, 0, w, h, Some(mem), 0, 0, SRCCOPY);
@@ -945,7 +996,7 @@ unsafe fn paint_text(s: &mut State, dc: HDC) {
                 }
                 Item::Button(part, r) => {
                     let Some(label) = part.label() else { continue };
-                    let pressed = s.pressed == Some(*part) && s.hot == Some(*part);
+                    let pressed = s.pointer.target(*part) == PRESSED;
                     let drop = if pressed { px(PRESS_DROP, dpi) } else { 0 };
                     let wide: Vec<u16> = label.encode_utf16().collect();
                     let old = SelectObject(dc, fonts.get(Style::BodyStrong).into());
@@ -995,14 +1046,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             WM_MOUSEMOVE => {
                 let (x, y) = point(lparam);
+                let down = wparam.0 & MK_LBUTTON.0 as usize != 0;
                 let track = with_state(|s| {
                     let hot = if s.fade_to > 0.0 {
                         s.layout.hit(x, y)
                     } else {
                         None
                     };
-                    let changed = hot != s.hot;
-                    s.hot = hot;
+                    let changed = s.pointer.moved(hot, down);
                     let track = !s.tracking;
                     s.tracking = true;
                     (changed, track)
@@ -1024,9 +1075,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 LRESULT(0)
             }
             WM_MOUSELEAVE => {
+                let down = GetKeyState(VK_LBUTTON.0.into()) < 0;
                 with_state(|s| {
                     s.tracking = false;
-                    s.hot = None;
+                    s.pointer.left(down);
                 });
                 refresh(hwnd);
                 LRESULT(0)
@@ -1035,8 +1087,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let (x, y) = point(lparam);
                 let hit = with_state(|s| {
                     let hit = (s.fade_to > 0.0).then(|| s.layout.hit(x, y)).flatten();
-                    s.hot = hit;
-                    s.pressed = hit;
+                    s.pointer.down(hit);
                     hit
                 })
                 .flatten();
@@ -1050,9 +1101,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let (x, y) = point(lparam);
                 let done = with_state(|s| {
                     let over = s.layout.hit(x, y);
-                    let pressed = s.pressed.take();
-                    s.hot = over;
-                    pressed.filter(|&p| Some(p) == over).map(|p| (p, s.owner))
+                    s.pointer.up(over).map(|p| (p, s.owner))
                 })
                 .flatten();
                 let _ = ReleaseCapture();
@@ -1071,7 +1120,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 LRESULT(0)
             }
             WM_CAPTURECHANGED => {
-                with_state(|s| s.pressed = None);
+                with_state(|s| s.pointer.cancel());
                 refresh(hwnd);
                 LRESULT(0)
             }
@@ -1277,6 +1326,43 @@ mod tests {
         assert_eq!(l.hit(skip.right, skip.top), None);
         assert_eq!(l.hit(330, 20), Some(Part::Close));
         assert_eq!(l.hit(100, 100), None);
+    }
+
+    #[test]
+    fn a_press_acts_only_when_released_on_the_part_it_started_on() {
+        let mut p = Pointer::default();
+        p.down(Some(Part::Snooze));
+        assert_eq!(p.target(Part::Snooze), PRESSED);
+        assert_eq!(p.up(Some(Part::Snooze)), Some(Part::Snooze));
+        p.down(Some(Part::Snooze));
+        assert_eq!(p.up(Some(Part::Skip)), None);
+        assert_eq!(p.target(Part::Skip), HOVER);
+        // Pressed outside every part: no part is pressed, so no release acts.
+        p.down(None);
+        assert_eq!(p.up(Some(Part::Skip)), None);
+    }
+
+    #[test]
+    fn a_press_released_outside_the_popup_never_acts_later() {
+        // Released outside: the up went to another window. The next move without the button
+        // ends the press.
+        let mut p = Pointer::default();
+        p.down(Some(Part::Snooze));
+        p.moved(None, true);
+        assert!(p.moved(Some(Part::Snooze), false));
+        assert_eq!(p.target(Part::Snooze), HOVER);
+        assert_eq!(p.up(Some(Part::Snooze)), None);
+
+        // Or the leave, when the button is up by then.
+        p.down(Some(Part::Snooze));
+        p.left(false);
+        assert_eq!(p.up(Some(Part::Snooze)), None);
+
+        // Leaving with the button still down keeps the press, as in a native button.
+        p.down(Some(Part::Snooze));
+        p.left(true);
+        p.moved(Some(Part::Snooze), true);
+        assert_eq!(p.up(Some(Part::Snooze)), Some(Part::Snooze));
     }
 
     #[test]
