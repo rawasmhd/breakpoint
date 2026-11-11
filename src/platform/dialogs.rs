@@ -31,11 +31,11 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreatePen, CreateSolidBrush, DT_CENTER,
-    DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, FillRect, GetMonitorInfoW,
-    GetStockObject, HBRUSH, HDC, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-    MapWindowPoints, MonitorFromWindow, NULL_BRUSH, PS_INSIDEFRAME, RDW_ALLCHILDREN, RDW_ERASE,
-    RDW_INVALIDATE, RedrawWindow, RoundRect, SRCCOPY, SelectObject, SetBkColor, SetBkMode,
-    SetTextColor, TRANSPARENT,
+    DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, Ellipse, FillRect,
+    GetMonitorInfoW, GetStockObject, HBRUSH, HDC, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST,
+    MONITORINFO, MapWindowPoints, MonitorFromWindow, NULL_BRUSH, PS_INSIDEFRAME, RDW_ALLCHILDREN,
+    RDW_ERASE, RDW_INVALIDATE, RedrawWindow, RoundRect, SRCCOPY, SelectObject, SetBkColor,
+    SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetLocalTime;
@@ -47,7 +47,8 @@ use windows::Win32::UI::Controls::{
     UDM_SETBUDDY, UDM_SETRANGE32, WM_MOUSELEAVE,
 };
 use windows::Win32::UI::HiDpi::{
-    AdjustWindowRectExForDpi, DDC_DISABLE_ALL, GetDpiForWindow, SetDialogDpiChangeBehavior,
+    AdjustWindowRectExForDpi, DDC_DISABLE_ALL, GetDpiForWindow, GetSystemMetricsForDpi,
+    SetDialogDpiChangeBehavior,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
@@ -57,13 +58,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, GWL_STYLE, GetClientRect, GetDlgCtrlID, GetDlgItem, GetDlgItemTextW,
     GetSystemMetrics, GetWindowLongW, GetWindowRect, GetWindowTextW, ICON_BIG, ICON_SMALL,
     IDCANCEL, IDOK, IMAGE_ICON, IsDialogMessageW, IsIconic, KillTimer, LR_DEFAULTCOLOR, LoadImageW,
-    MB_ICONWARNING, MB_OK, MSG, MessageBoxW, PostMessageW, SM_CXICON, SM_CXSMICON, SM_CYICON,
-    SM_CYSMICON, STN_CLICKED, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SendDlgItemMessageW, SendMessageW, SetDlgItemTextW, SetForegroundWindow,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX,
-    WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLORSTATIC,
-    WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND, WM_INITDIALOG, WM_MOUSEMOVE,
-    WM_NCDESTROY, WM_NEXTDLGCTL, WM_PRINTCLIENT, WM_SETFONT, WM_SETICON, WM_TIMER,
+    MB_ICONWARNING, MB_OK, MSG, MessageBoxW, PostMessageW, SM_CXICON, SM_CXSMICON, SM_CXVSCROLL,
+    SM_CYICON, SM_CYSMICON, STN_CLICKED, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SendDlgItemMessageW, SendMessageW, SetDlgItemTextW,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE,
+    WINDOW_LONG_PTR_INDEX, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN,
+    WM_CTLCOLORDLG, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND,
+    WM_INITDIALOG, WM_MOUSEMOVE, WM_NCDESTROY, WM_NEXTDLGCTL, WM_PRINTCLIENT, WM_SETFONT,
+    WM_SETICON, WM_TIMER,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
@@ -742,12 +744,17 @@ fn profile_name(profile: Profile) -> &'static str {
 }
 
 /// The core's line of a profile's numbers without the "Name: " in front, which the radio
-/// button above it already shows.
+/// button above it already shows, and so with a capital first letter.
 fn numbers_line(profile: Profile) -> String {
     let line = wizard::profile_line(profile);
-    match line.split_once(": ") {
-        Some((name, numbers)) if name == profile_name(profile) => numbers.to_string(),
-        _ => line,
+    let numbers = match line.split_once(": ") {
+        Some((name, numbers)) if name == profile_name(profile) => numbers,
+        _ => &line,
+    };
+    let mut chars = numbers.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 
@@ -807,12 +814,14 @@ struct Place {
     style: Style,
 }
 
-/// A dialog at 96 DPI: client size, where the footer band starts, and every placed control.
+/// A dialog at 96 DPI: client size, where the footer band starts, every placed control, and
+/// the top-left of the `dot` (`size-mark` wide) where the dialog has one.
 struct Layout {
     width: i32,
     height: i32,
     band: i32,
     places: Vec<Place>,
+    dot: Option<(i32, i32)>,
 }
 
 /// The combo boxes, which are placed by their list's size and then centred in their row.
@@ -889,10 +898,13 @@ fn wizard_layout() -> Layout {
     let mut b = Builder(Vec::new());
     let right = WIDTH - PAD;
     let title = Style::TitleLg.line_height();
+    // The dot comes first, `space-2` before the heading, centred on its line box.
+    let dot = (PAD, PAD + (title - theme::SIZE_MARK) / 2);
+    let title_x = PAD + theme::SIZE_MARK + theme::SPACE_2;
     // GDI sets the 28px heading 37px tall, so its control gets `space-1` more than the line
     // box; the spacing below still counts from the line box.
-    let title_box = (right - PAD, title + theme::SPACE_1);
-    b.put(IDC_WIZARD_TITLE, (PAD, PAD), title_box, Style::TitleLg);
+    let title_box = (right - title_x, title + theme::SPACE_1);
+    b.put(IDC_WIZARD_TITLE, (title_x, PAD), title_box, Style::TitleLg);
     let mut y = b.heading(IDC_WIZARD_PROFILE_HEADING, PAD + title + theme::SPACE_8);
     for i in 0..3 {
         if i > 0 {
@@ -939,6 +951,7 @@ fn wizard_layout() -> Layout {
         height,
         band,
         places: b.0,
+        dot: Some(dot),
     }
 }
 
@@ -1033,6 +1046,7 @@ fn settings_layout() -> Layout {
         height,
         band,
         places: b.0,
+        dot: None,
     }
 }
 
@@ -1043,6 +1057,28 @@ fn scaled(place: &Place, dpi: u32) -> RECT {
         top: px(place.y, dpi),
         right: px(place.x + place.w, dpi),
         bottom: px(place.y + place.h, dpi),
+    }
+}
+
+/// The focus ring's width at `dpi`.
+fn ring_width(dpi: u32) -> i32 {
+    px(theme::FOCUS_RING, dpi)
+}
+
+/// How far the primary button's window reaches past its fill: the focus ring, then a gap as
+/// wide. [`lay_out`] grows the window by it and [`draw_primary`] insets the fill by it, so the
+/// fill is always the scaled place, at every DPI.
+fn ring_inset(dpi: u32) -> i32 {
+    2 * ring_width(dpi)
+}
+
+/// `rect` grown by `by` on every side.
+fn grown(rect: RECT, by: i32) -> RECT {
+    RECT {
+        left: rect.left - by,
+        top: rect.top - by,
+        right: rect.right + by,
+        bottom: rect.bottom + by,
     }
 }
 
@@ -1139,13 +1175,7 @@ fn lay_out(dialog: HWND, kind: Kind, dpi: u32) {
             if place.id == IDOK.0 {
                 // The primary button paints its focus ring 2px off its fill, so its window is
                 // larger than the fill by the ring and the gap.
-                let ring = px(2 * theme::FOCUS_RING, dpi);
-                rect = RECT {
-                    left: rect.left - ring,
-                    top: rect.top - ring,
-                    right: rect.right + ring,
-                    bottom: rect.bottom + ring,
-                };
+                rect = grown(rect, ring_inset(dpi));
             }
             let combo = COMBOS.contains(&place.id);
             let drop = if combo { px(DROP, dpi) } else { 0 };
@@ -1160,11 +1190,25 @@ fn lay_out(dialog: HWND, kind: Kind, dpi: u32) {
                 let _ = SetWindowPos(control, None, rect.left, top, 0, 0, flags | SWP_NOSIZE);
             }
         }
-        // Each up-down control sits again at its edit box's right edge, inside it.
-        for (spin, edit) in SPINS {
-            if let Ok(edit) = GetDlgItem(Some(dialog), edit) {
-                send(dialog, spin, UDM_SETBUDDY, edit.0 as usize, 0);
-            }
+        // Each up-down control takes the width of a scroll bar at this DPI, inside its edit
+        // box's place at the right edge; the edit box keeps the rest. UDM_SETBUDDY sizes the
+        // up-down for the monitor it was made on, so it is placed after that.
+        let spin_w = GetSystemMetricsForDpi(SM_CXVSCROLL, dpi);
+        let flags = SWP_NOZORDER | SWP_NOACTIVATE;
+        for (spin_id, edit_id) in SPINS {
+            let place = layout.places.iter().find(|p| p.id == edit_id);
+            let (Ok(spin), Ok(edit), Some(place)) = (
+                GetDlgItem(Some(dialog), spin_id),
+                GetDlgItem(Some(dialog), edit_id),
+                place,
+            ) else {
+                continue;
+            };
+            SendMessageW(spin, UDM_SETBUDDY, Some(WPARAM(edit.0 as usize)), None);
+            let r = scaled(place, dpi);
+            let (w, h) = (r.right - r.left, r.bottom - r.top);
+            let _ = SetWindowPos(edit, None, r.left, r.top, w - spin_w, h, flags);
+            let _ = SetWindowPos(spin, None, r.right - spin_w, r.top, spin_w, h, flags);
         }
         let style = WINDOW_STYLE(GetWindowLongW(dialog, GWL_STYLE) as u32);
         let ex_style = WINDOW_EX_STYLE(GetWindowLongW(dialog, GWL_EXSTYLE) as u32);
@@ -1293,7 +1337,8 @@ fn on_band(dialog: HWND, kind: Kind, control: HWND) -> bool {
     corners[0].y >= look_band(kind)
 }
 
-/// `surface` above the band; the band in `surface-sunken` under a 1px `line` hairline.
+/// `surface` above the band; the band in `surface-sunken` under a 1px `line` hairline; the
+/// wizard's `dot` before its heading.
 fn paint_ground(dialog: HWND, kind: Kind, dc: HDC) {
     let mut client = RECT::default();
     // SAFETY: `dialog` is live; `dc` paints its client area.
@@ -1313,6 +1358,20 @@ fn paint_ground(dialog: HWND, kind: Kind, dc: HDC) {
                 ..client
             };
             FillRect(dc, &rect, brush(ground));
+        }
+        if let Some((x, y)) = kind.layout().dot {
+            let dpi = look_dpi(kind);
+            let mark = theme::SIZE_MARK;
+            let pen = CreatePen(PS_INSIDEFRAME, 1, LIGHT.dot);
+            let fill = CreateSolidBrush(LIGHT.dot);
+            let old_pen = SelectObject(dc, pen.into());
+            let old_brush = SelectObject(dc, fill.into());
+            let (left, top) = (px(x, dpi), px(y, dpi));
+            let _ = Ellipse(dc, left, top, px(x + mark, dpi), px(y + mark, dpi));
+            SelectObject(dc, old_brush);
+            SelectObject(dc, old_pen);
+            let _ = DeleteObject(fill.into());
+            let _ = DeleteObject(pen.into());
         }
     }
 }
@@ -1505,8 +1564,8 @@ fn draw_primary(kind: Kind, item: &DRAWITEMSTRUCT) {
 
     let r = item.rcItem;
     let (w, h) = (r.right - r.left, r.bottom - r.top);
-    let width = px(theme::FOCUS_RING, dpi);
-    let inset = 2 * width;
+    let width = ring_width(dpi);
+    let inset = ring_inset(dpi);
     let radius = px(theme::RADIUS_SM, dpi);
     let mut label = [0u16; 32];
     // SAFETY: every GDI object made here is selected out and freed before return; the DCs and
@@ -1585,8 +1644,9 @@ mod tests {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         BS_OWNERDRAW, DispatchMessageW, FindWindowExW, GW_CHILD, GW_HWNDNEXT, GetClassNameW,
-        GetWindow, HWND_TOPMOST, IsWindow, PM_REMOVE, PeekMessageW, TranslateMessage, UIS_CLEAR,
-        UISF_HIDEFOCUS, WM_CHANGEUISTATE, WM_GETFONT, WM_KEYDOWN,
+        GetWindow, HWND_TOPMOST, IsWindow, PM_REMOVE, PRF_CHILDREN, PRF_CLIENT, PRF_ERASEBKGND,
+        PRF_NONCLIENT, PeekMessageW, TranslateMessage, UIS_CLEAR, UISF_HIDEFOCUS, WM_CHANGEUISTATE,
+        WM_GETFONT, WM_KEYDOWN, WM_PRINT,
     };
     use windows::core::BOOL;
 
@@ -1647,10 +1707,47 @@ mod tests {
     #[test]
     fn numbers_line_drops_the_name() {
         let line = numbers_line(Profile::Balanced);
-        assert!(line.starts_with("stand every 30 min"), "{line}");
+        assert!(line.starts_with("Stand every 30 min"), "{line}");
         for profile in Profile::ALL {
             assert!(!numbers_line(profile).contains(profile_name(profile)));
         }
+    }
+
+    #[test]
+    fn primary_fill_is_its_scaled_place_and_ring_and_gap_match_at_125() {
+        let dpi = 120;
+        let place = *settings_layout()
+            .places
+            .iter()
+            .find(|p| p.id == IDOK.0)
+            .unwrap();
+        let fill = scaled(&place, dpi);
+        assert_eq!((fill.right - fill.left, fill.bottom - fill.top), (110, 40));
+        let window = grown(fill, ring_inset(dpi));
+        let (w, h) = (window.right - window.left, window.bottom - window.top);
+        // draw_primary's fill: the window's own rectangle inset by the same amount.
+        let inset = ring_inset(dpi);
+        assert_eq!((w - 2 * inset, h - 2 * inset), (110, 40));
+        assert_eq!(ring_width(dpi), inset - ring_width(dpi), "ring and gap");
+        for dpi in [96, 120, 144, 192] {
+            assert_eq!(ring_inset(dpi), 2 * ring_width(dpi));
+        }
+    }
+
+    #[test]
+    fn wizard_dot_sits_space_2_before_the_heading_centred_on_it() {
+        let layout = wizard_layout();
+        let (x, y) = layout.dot.expect("the wizard has the dot");
+        let title = *layout
+            .places
+            .iter()
+            .find(|p| p.id == IDC_WIZARD_TITLE)
+            .unwrap();
+        assert_eq!(title.x - (x + theme::SIZE_MARK), theme::SPACE_2);
+        let line = Style::TitleLg.line_height();
+        assert_eq!(2 * y + theme::SIZE_MARK, 2 * title.y + line);
+        assert_eq!(x, PAD);
+        assert!(settings_layout().dot.is_none());
     }
 
     #[test]
@@ -1743,6 +1840,29 @@ mod tests {
         all
     }
 
+    /// `control`'s rectangle in `dialog`'s client coordinates.
+    fn in_client(dialog: HWND, control: HWND) -> RECT {
+        let mut r = RECT::default();
+        unsafe { GetWindowRect(control, &mut r).unwrap() };
+        let mut corners = [
+            POINT {
+                x: r.left,
+                y: r.top,
+            },
+            POINT {
+                x: r.right,
+                y: r.bottom,
+            },
+        ];
+        unsafe { MapWindowPoints(None, Some(dialog), &mut corners) };
+        RECT {
+            left: corners[0].x,
+            top: corners[0].y,
+            right: corners[1].x,
+            bottom: corners[1].y,
+        }
+    }
+
     fn class(control: HWND) -> String {
         let mut name = [0u16; 64];
         let n = unsafe { GetClassNameW(control, &mut name) } as usize;
@@ -1784,6 +1904,19 @@ mod tests {
             assert_eq!(client.bottom, px(layout.height, real), "{kind:?} at {real}");
             for dpi in SCALES {
                 lay_out(dialog, kind, dpi);
+                for (spin_id, edit_id) in SPINS {
+                    let Ok(spin) = (unsafe { GetDlgItem(Some(dialog), spin_id) }) else {
+                        continue;
+                    };
+                    let edit = unsafe { GetDlgItem(Some(dialog), edit_id).unwrap() };
+                    let (s, e) = (in_client(dialog, spin), in_client(dialog, edit));
+                    let place = layout.places.iter().find(|p| p.id == edit_id).unwrap();
+                    let want = unsafe { GetSystemMetricsForDpi(SM_CXVSCROLL, dpi) };
+                    let what = format!("up-down of {edit_id} at {dpi}");
+                    assert_eq!(s.right - s.left, want, "{what}: width");
+                    assert_eq!(s.right, scaled(place, dpi).right, "{what}: right edge");
+                    assert_eq!(e.right, s.left, "{what}: edit box ends where it starts");
+                }
                 for control in children(dialog) {
                     let id = unsafe { GetDlgCtrlID(control) };
                     if spins.contains(&id) {
@@ -2045,6 +2178,13 @@ mod tests {
                 (px(layout.width, dpi), px(layout.height, dpi)),
                 "{kind:?} at {dpi}"
             );
+            let want = unsafe { GetSystemMetricsForDpi(SM_CXVSCROLL, dpi) };
+            for (spin, _) in SPINS {
+                if let Ok(spin) = unsafe { GetDlgItem(Some(dialog), spin) } {
+                    let r = in_client(dialog, spin);
+                    assert_eq!(r.right - r.left, want, "up-down at {dpi} after the move");
+                }
+            }
             if let Ok(folder) = std::env::var("BP_SHOTS") {
                 let path = std::path::Path::new(&folder).join(format!("{kind:?}-moved-{dpi}.bmp"));
                 shot(dialog, &path);
@@ -2056,6 +2196,8 @@ mod tests {
     /// Writes `dialog`'s window, as on screen, to a 32-bit BMP.
     fn shot(dialog: HWND, path: &std::path::Path) {
         unsafe {
+            // The dialog draws itself into the bitmap: no screen capture, so no other window
+            // can show up in the file. With its frame, so the children land where they are.
             let mut r = RECT::default();
             GetWindowRect(dialog, &mut r).unwrap();
             let (w, h) = (r.right - r.left, r.bottom - r.top);
@@ -2063,7 +2205,13 @@ mod tests {
             let dc = CreateCompatibleDC(Some(screen));
             let bitmap = CreateCompatibleBitmap(screen, w, h);
             let old = SelectObject(dc, bitmap.into());
-            BitBlt(dc, 0, 0, w, h, Some(screen), r.left, r.top, SRCCOPY).unwrap();
+            let what = (PRF_NONCLIENT | PRF_CLIENT | PRF_CHILDREN | PRF_ERASEBKGND) as isize;
+            SendMessageW(
+                dialog,
+                WM_PRINT,
+                Some(WPARAM(dc.0 as usize)),
+                Some(LPARAM(what)),
+            );
             SelectObject(dc, old);
             let mut info = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {
