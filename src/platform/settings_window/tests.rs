@@ -373,7 +373,19 @@ fn opened_at_a_point_its_top_left_is_there() {
     unsafe { GetClientRect(handle.hwnd(), &mut client).unwrap() };
     let dpi = unsafe { GetDpiForWindow(handle.hwnd()) };
     assert_eq!(client.right, px(WIDTH, dpi));
-    assert_eq!(client.bottom, laid_out(dpi).height(0));
+    // Windows keeps a window no taller than the screen, so on a small screen (a CI runner's)
+    // the client is cut; the full height is checked only where it fits. #84 adds scrolling.
+    let full = laid_out(dpi).height(0);
+    let frame = h - client.bottom;
+    if full + frame <= work.bottom - work.top {
+        assert_eq!(client.bottom, full);
+    } else {
+        assert!(
+            client.bottom > 0 && client.bottom <= full,
+            "{} of {full}",
+            client.bottom
+        );
+    }
     handle.close();
 }
 
