@@ -1423,13 +1423,6 @@ impl Scroll {
         }
     }
 
-    /// As [`Scroll::new`] for a new layout, keeping as much of the offset as still fits.
-    pub fn resized(self, full: i32, footer: Option<i32>, room: i32) -> Scroll {
-        let mut next = Scroll::new(full, footer, room);
-        next.offset = self.offset.clamp(0, next.range());
-        next
-    }
-
     /// The client height: the form's full height, or less when it does not fit.
     pub fn view(&self) -> i32 {
         self.view

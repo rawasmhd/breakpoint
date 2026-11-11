@@ -740,7 +740,8 @@ fn on_a_small_work_area_the_window_scrolls_and_a_refused_save_shows_its_control(
 /// --ignored` writes the settings window as 1366 x 768 at 100 % and 1920 x 1080 at 150 % show
 /// it, at the top (focus ring on Sunday) and scrolled to the end (thumb under the pointer),
 /// in light, dark and high contrast. Then it opens the window on a work area 520 tall at the
-/// monitor's scale and captures it with its frame, at the top and after the wheel.
+/// monitor's scale and captures it with its frame, at the top and after the wheel, then with
+/// the profile menu open, and the menu window itself. It captures only its own windows.
 #[test]
 #[ignore = "writes BMPs and shows the window"]
 fn scroll_shots() {
@@ -815,32 +816,15 @@ fn scroll_shots() {
     key(handle, VK_SPACE);
     pump(300);
     capture(handle.hwnd(), &folder.join("settings-scroll-live-open.bmp"));
-    render(
-        {
-            let r = handle.window_rect();
-            r.right - r.left
-        },
-        {
-            let r = handle.window_rect();
-            r.bottom - r.top + 200
-        },
-        &folder.join("settings-scroll-live-screen.bmp"),
-        |dc| unsafe {
-            let r = handle.window_rect();
-            let screen = GetDC(None);
-            let _ = BitBlt(
-                dc,
-                0,
-                0,
-                r.right - r.left,
-                r.bottom - r.top + 200,
-                Some(screen),
-                r.left,
-                r.top,
-                SRCCOPY,
-            );
-            ReleaseDC(None, screen);
-        },
+    // The menu's own window, which hangs from the scrolled field.
+    let menu = menu_of(handle).expect("the menu is open");
+    capture(menu, &folder.join("settings-scroll-live-menu.bmp"));
+    let mut m = RECT::default();
+    unsafe { GetWindowRect(menu, &mut m).unwrap() };
+    let field = handle.screen_rect(PROFILE).unwrap();
+    assert!(
+        m.top >= field.bottom || m.bottom <= field.top,
+        "{m:?} by {field:?}"
     );
     eprintln!(
         "live: theme {:?}, high contrast {}, {} DPI",

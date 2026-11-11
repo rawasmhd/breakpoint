@@ -47,11 +47,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     SystemParametersInfoW, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE,
-    WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_NCRBUTTONDOWN,
-    WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE, WM_SYSKEYDOWN, WM_THEMECHANGED,
-    WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU,
+    WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENTERSIZEMOVE,
+    WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCDESTROY, WM_NCLBUTTONDOWN,
+    WM_NCRBUTTONDOWN, WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE, WM_SYSKEYDOWN,
+    WM_THEMECHANGED, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_POPUP, WS_SYSMENU,
 };
 use windows::core::{BOOL, HSTRING, PCWSTR, Result, w};
 
@@ -116,6 +117,9 @@ struct Host {
     bar_level: f32,
     bar_hot: bool,
     drag: Option<(i32, i32)>,
+    /// Whether the user is moving the window (between `WM_ENTERSIZEMOVE` and
+    /// `WM_EXITSIZEMOVE`): then its place is the user's.
+    sizing: bool,
 }
 
 impl Host {
@@ -317,12 +321,14 @@ impl Handle {
     /// shows the focus ring, as after a refused Save: the ring shows even when Save was
     /// clicked, so the user sees which control to fix.
     pub fn focus(self, id: Id) {
-        let events = with_host(self.0, |h| {
+        let (events, scrolled) = with_host(self.0, |h| {
             let events = h.form.focus(id);
-            h.reveal_focus();
-            events
+            (events, h.reveal_focus())
         })
         .unwrap_or_default();
+        if scrolled {
+            repoint(self.0);
+        }
         // SAFETY: no pointers.
         let _ = unsafe { SetFocus(Some(self.0)) };
         after(self.0);
@@ -359,6 +365,9 @@ pub(crate) fn pretend_work_area(work: Option<RECT>) {
 /// applied: where it shows now. Part of it may be scrolled out of view; [`Scroll::shown`]
 /// says whether any of it shows. The drop-down menu opens from it, and screen readers (#80)
 /// take control bounds from it. Sends no message, so it may run with the state borrowed.
+///
+/// The rectangle is not clipped: for a control partly under the footer band or past the top
+/// of the client area, the caller must clip it to the part that shows.
 pub fn on_screen(hwnd: HWND, scroll: &Scroll, laid: RECT) -> RECT {
     let r = scroll.on_client(laid);
     let mut corner = POINT::default();
@@ -464,6 +473,7 @@ pub fn open(spec: Spec, on_event: impl FnMut(Handle, Event) + 'static) -> Result
             bar_level: REST,
             bar_hot: false,
             drag: None,
+            sizing: false,
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(host) as isize);
         let dpi = GetDpiForWindow(hwnd);
@@ -522,17 +532,19 @@ fn work_of(monitor: HMONITOR) -> RECT {
 
 /// Fits the window again to the work area of the monitor it is on now: after a move to
 /// another monitor, a change of the work area (the taskbar moved or grew) or of the display.
-/// Nothing moves or resizes when the client size stays; otherwise the window keeps its
-/// top-left corner as far as the work area allows.
+/// The window keeps its top-left corner as far as the work area allows. A window that fits
+/// and keeps its size stays where it is; a window that scrolls is always moved inside the work
+/// area, since it is as tall as the work area and Save is at its bottom.
 fn refit(hwnd: HWND) {
     let work = work_area(hwnd);
-    let Some((client, before, dpi)) = with_host(hwnd, |h| {
+    let Some((client, before, dpi, scrolls)) = with_host(hwnd, |h| {
         let (before, dpi) = (h.client, h.form.dpi());
-        (h.relayout(dpi, work), before, dpi)
+        let client = h.relayout(dpi, work);
+        (client, before, dpi, h.scroll.scrolls())
     }) else {
         return;
     };
-    if client != before {
+    if client != before || scrolls {
         close_menu(hwnd);
         let (w, h) = window_size(client, dpi);
         let mut now = RECT::default();
@@ -950,15 +962,17 @@ fn key_for(vk: u16, shift: bool, alt: bool) -> Option<Key> {
 /// on the focused control scrolls that control into view; Enter and Esc, which press a
 /// button, scroll nothing unless they move the focus.
 fn on_key(hwnd: HWND, key: Key) {
-    let events = with_host(hwnd, |h| {
+    let (events, scrolled) = with_host(hwnd, |h| {
         let before = h.form.focused();
         let events = h.form.key(key);
-        if !matches!(key, Key::Enter | Key::Esc) || h.form.focused() != before {
-            h.reveal_focus();
-        }
-        events
+        let scrolled = (!matches!(key, Key::Enter | Key::Esc) || h.form.focused() != before)
+            && h.reveal_focus();
+        (events, scrolled)
     })
     .unwrap_or_default();
+    if scrolled {
+        repoint(hwnd);
+    }
     after(hwnd);
     emit(hwnd, events);
 }
@@ -1055,15 +1069,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if on_bar == Some(true) {
                     // The thumb drags; the track off the thumb pages toward the click.
                     close_menu(hwnd);
-                    with_host(hwnd, |h| {
+                    let paged = with_host(hwnd, |h| {
                         let dpi = h.form.dpi();
                         if h.scroll.on_thumb(y, dpi) {
                             h.drag = Some((y, h.scroll.offset()));
+                            false
                         } else {
-                            h.scroll.page_toward(y, dpi);
+                            h.scroll.page_toward(y, dpi)
                         }
                     });
                     SetCapture(hwnd);
+                    if paged == Some(true) {
+                        repoint(hwnd);
+                    }
                     refresh(hwnd);
                     return LRESULT(0);
                 }
@@ -1081,6 +1099,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let (x, y) = point(lparam);
                 if with_host(hwnd, |h| h.drag.take().is_some()) == Some(true) {
                     let _ = ReleaseCapture();
+                    // The pointer may have left the bar during the drag.
+                    repoint(hwnd);
                     refresh(hwnd);
                     return LRESULT(0);
                 }
@@ -1140,7 +1160,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             // A move may end on a monitor of another size at the same DPI.
+            WM_ENTERSIZEMOVE => {
+                with_host(hwnd, |h| h.sizing = true);
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_EXITSIZEMOVE | WM_DISPLAYCHANGE => {
+                with_host(hwnd, |h| h.sizing = false);
                 refit(hwnd);
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
@@ -1148,11 +1173,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let dpi = (wparam.0 & 0xffff) as u32;
                 let suggested = *(lparam.0 as *const RECT);
                 close_menu(hwnd);
-                // The new monitor's work area; Windows' place for the window is kept.
+                // The new monitor's work area. Windows' place for the window is kept while the
+                // user drags it (the drag's end fits it again); otherwise a window that scrolls,
+                // as tall as the work area, moves inside it, so Save is not under the taskbar.
                 let work = work_of(MonitorFromRect(&suggested, MONITOR_DEFAULTTONEAREST));
-                if let Some(client) = with_host(hwnd, |h| h.relayout(dpi, work)) {
+                let fitted = with_host(hwnd, |h| {
+                    (h.relayout(dpi, work), h.scroll.scrolls() && !h.sizing)
+                });
+                if let Some((client, inside_work)) = fitted {
                     let (w, h) = window_size(client, dpi);
-                    move_to(hwnd, rect(suggested.left, suggested.top, w, h));
+                    let (x, y) = if inside_work {
+                        keep_inside(suggested.left, suggested.top, w, h, work)
+                    } else {
+                        (suggested.left, suggested.top)
+                    };
+                    move_to(hwnd, rect(x, y, w, h));
                     refresh(hwnd);
                 }
                 LRESULT(0)
@@ -1259,7 +1294,7 @@ mod tests {
     // ---- Scrolling (issue #84) ----
 
     use super::super::{ButtonKind, Entry, Kind, Place};
-    use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+    use windows::Win32::UI::WindowsAndMessaging::{SWP_NOSIZE, SendMessageW};
 
     const SAVE: Id = 1;
     const DROP: Id = 2;
@@ -1448,6 +1483,68 @@ mod tests {
         let offset = scroll.offset();
         wheel(handle, true);
         assert_eq!(scroll_of(handle).unwrap().offset(), offset);
+        // Dragged partly past the bottom of the screen: it fits, so it stays where it was put.
+        let work = work_area(handle.hwnd());
+        drag_to(handle, work.left + 10, work.bottom - 50);
+        let r = handle.window_rect();
+        assert_eq!((r.left, r.top), (work.left + 10, work.bottom - 50));
+        handle.close();
+    }
+
+    /// Moves the window's top-left to (`x`, `y`) as a user's drag would, then ends the move.
+    fn drag_to(handle: Handle, x: i32, y: i32) {
+        unsafe {
+            SetWindowPos(
+                handle.hwnd(),
+                None,
+                x,
+                y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+            .unwrap();
+        }
+        send(handle, WM_EXITSIZEMOVE, 0);
+    }
+
+    #[test]
+    fn a_scrolling_window_stays_inside_its_work_area_after_a_scale_or_work_area_change() {
+        let work = small_work();
+        pretend_work_area(Some(work));
+        let handle = open(tall_spec(), |_, _| {}).unwrap();
+        let w = handle.window_rect().right - handle.window_rect().left;
+        // The scale goes up by half. Windows suggests the old top-left, low on the work area;
+        // the window, now as tall as the work area, moves up into it.
+        let dpi = unsafe { GetDpiForWindow(handle.hwnd()) };
+        let new = dpi * 3 / 2;
+        let suggested = rect(work.left + 20, work.top + 89, w * 3 / 2, 600);
+        unsafe {
+            SendMessageW(
+                handle.hwnd(),
+                WM_DPICHANGED,
+                Some(WPARAM((new | (new << 16)) as usize)),
+                Some(LPARAM(&suggested as *const RECT as isize)),
+            );
+        }
+        let r = handle.window_rect();
+        assert!(within(r, work), "{r:?} in {work:?}");
+        assert_eq!((r.left, r.bottom - r.top), (work.left + 20, 400));
+        let save = handle.screen_rect(SAVE).unwrap();
+        assert!(within(save, client_on_screen(handle)), "Save {save:?}");
+        // The taskbar grows by 60: the window shrinks with the work area and stays in it.
+        let less = rect(work.left, work.top, work.right - work.left, 340);
+        pretend_work_area(Some(less));
+        send(handle, WM_SETTINGCHANGE, SPI_SETWORKAREA.0 as usize);
+        let r = handle.window_rect();
+        assert!(within(r, less), "{r:?} in {less:?}");
+        assert_eq!(r.bottom - r.top, 340);
+        // Dragged down past the bottom: when the move ends, it comes back inside.
+        drag_to(handle, less.left + 30, less.top + 100);
+        let r = handle.window_rect();
+        assert!(within(r, less), "{r:?} in {less:?}");
+        assert_eq!(r.left, less.left + 30);
+        pretend_work_area(None);
         handle.close();
     }
 }
