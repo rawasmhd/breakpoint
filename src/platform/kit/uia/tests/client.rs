@@ -2,8 +2,8 @@
 //! `WM_GETOBJECT` with [`get_object`], as the kit window does, and a UI Automation client reads
 //! and drives it from the test thread, as a screen reader would from its own process.
 
-use std::sync::Once;
 use std::sync::mpsc;
+use std::sync::{Mutex, MutexGuard, Once};
 use std::thread;
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
@@ -20,6 +20,14 @@ use windows::core::w;
 
 use super::super::{get_object, gone};
 use super::*;
+
+/// One in-process UI Automation client at a time: two that start at once on fresh threads make
+/// one `ElementFromHandle` fail with `E_FAIL`, even for plain windows with no providers.
+static ONE_CLIENT: Mutex<()> = Mutex::new(());
+
+pub(super) fn one_client() -> MutexGuard<'static, ()> {
+    ONE_CLIENT.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // SAFETY: plain window messages on the live test window.
@@ -86,9 +94,9 @@ fn frame_part(control: UIA_CONTROLTYPE_ID) -> bool {
     control == UIA_TitleBarControlTypeId || control == UIA_MenuBarControlTypeId
 }
 
-type Seen = Vec<(i32, String, IUIAutomationElement)>;
+pub(super) type Seen = Vec<(i32, String, IUIAutomationElement)>;
 
-fn read(walker: &IUIAutomationTreeWalker, from: &IUIAutomationElement, out: &mut Seen) {
+pub(super) fn read(walker: &IUIAutomationTreeWalker, from: &IUIAutomationElement, out: &mut Seen) {
     // SAFETY: live elements; a missing child or sibling ends the walk.
     unsafe {
         let mut child = walker.GetFirstChildElement(from).ok();
@@ -112,6 +120,7 @@ fn element(seen: &Seen, control: UIA_CONTROLTYPE_ID, name: &str) -> IUIAutomatio
 
 #[test]
 fn a_ui_automation_client_reads_and_drives_the_settings_window() {
+    let _one = one_client();
     let expected: Vec<(i32, String)> = tree(&settings())
         .nodes()
         .iter()

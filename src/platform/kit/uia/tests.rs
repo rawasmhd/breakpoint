@@ -516,18 +516,14 @@ impl Source for Fake {
         done
     }
 
-    fn to_screen(&self, _: HWND, r: RECT) -> RECT {
-        RECT {
+    /// As if the window's client area showed the top 600 pixels of the form.
+    fn on_screen(&self, _: HWND, r: RECT) -> Option<RECT> {
+        (r.top < 600 && r.bottom > r.top).then(|| RECT {
             left: r.left + ORIGIN.0,
             top: r.top + ORIGIN.1,
             right: r.right + ORIGIN.0,
-            bottom: r.bottom + ORIGIN.1,
-        }
-    }
-
-    fn shown(&self, _: HWND, r: RECT) -> bool {
-        // As if the window were 600 tall and scrolled to its top.
-        r.top < 600
+            bottom: r.bottom.min(600) + ORIGIN.1,
+        })
     }
 
     fn has_focus(&self, _: HWND) -> bool {
@@ -963,3 +959,4 @@ fn a_gone_window_says_so() {
 }
 
 mod client;
+mod kit_window;

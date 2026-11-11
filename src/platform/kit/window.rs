@@ -10,6 +10,7 @@
 //!   content above the footer band scrolls under the caption and the band stays in view
 //!   ([`Scroll`], issue #84). The wheel, a painted scrollbar and keyboard focus scroll it. The
 //!   window fits itself again on a DPI change, a move to another monitor and a work-area change.
+//! - Screen readers: `WM_GETOBJECT` hands UI Automation the providers of [`uia`] (#80).
 //! - Input: keys and the pointer go to the [`Form`]; its [`Event`]s go to the caller's callback,
 //!   called with no state borrowed, so it may call back through the [`Handle`], show a message
 //!   box or close the window.
@@ -48,16 +49,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     SystemParametersInfoW, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE,
     WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENTERSIZEMOVE,
-    WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCDESTROY, WM_NCLBUTTONDOWN,
-    WM_NCRBUTTONDOWN, WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE, WM_SYSKEYDOWN,
-    WM_THEMECHANGED, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_POPUP, WS_SYSMENU,
+    WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETOBJECT, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCDESTROY,
+    WM_NCLBUTTONDOWN, WM_NCRBUTTONDOWN, WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE,
+    WM_SYSKEYDOWN, WM_THEMECHANGED, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU,
 };
 use windows::core::{BOOL, HSTRING, PCWSTR, Result, w};
 
 use super::draw::{self, GdiMeasure};
 use super::form::{Form, Key, MenuLayout, Scroll, inside, menu_layout, menu_place, rect};
+use super::uia;
 use super::{Event, Id, Item, Value};
 use crate::platform::paint::{self, FRAME, HOVER, REST, step_fill};
 use crate::platform::theme::{
@@ -624,13 +626,88 @@ fn apply_frame(hwnd: HWND) {
 
 // ---- Frames and repaint ----
 
-/// Repaints and runs frames until the form settles.
+/// Repaints and runs frames until the form settles, and tells screen readers what changed.
+/// Every change to the form, by input or through the [`Handle`], ends here, after any scroll
+/// that brings the focus into view, so a focus event carries the control's bounds as they show.
 fn refresh(hwnd: HWND) {
     with_host(hwnd, |h| h.last_frame = Instant::now());
     // SAFETY: no pointers; a stale handle fails harmlessly.
     unsafe {
         let _ = InvalidateRect(Some(hwnd), None, false);
         SetTimer(Some(hwnd), FRAME_TIMER, FRAME.as_millis() as u32, None);
+    }
+    uia::changed(hwnd, &KIT);
+}
+
+// ---- UI Automation ----
+
+/// The kit window as UI Automation's [`uia::Source`] (issue #80).
+struct Kit;
+
+static KIT: Kit = Kit;
+
+impl uia::Source for Kit {
+    fn tree(&self, hwnd: HWND) -> Option<uia::Tree> {
+        with_host(hwnd, |h| {
+            // The open menu's entries on screen: its window's corner and its rows.
+            let menu = h.menu.zip(h.menu_layout.as_ref()).map(|(menu, layout)| {
+                let mut at = RECT::default();
+                // SAFETY: a valid out-pointer; this sends no message.
+                let _ = unsafe { GetWindowRect(menu, &mut at) };
+                layout
+                    .rows
+                    .iter()
+                    .map(|r| {
+                        rect(
+                            at.left + r.left,
+                            at.top + r.top,
+                            r.right - r.left,
+                            r.bottom - r.top,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
+            uia::Tree::new(&h.form, menu.as_deref())
+        })
+    }
+
+    /// As input: a focus that moves scrolls into view, as from the keyboard, and the window
+    /// takes the keyboard focus.
+    fn act(&self, hwnd: HWND, action: uia::Action) -> bool {
+        let focus = matches!(action, uia::Action::Focus(_) | uia::Action::Expand(_));
+        let Some((events, scrolled)) = with_host(hwnd, |h| {
+            let events = uia::perform(&mut h.form, &action)?;
+            Some((events, focus && h.reveal_focus()))
+        })
+        .flatten() else {
+            return false;
+        };
+        if scrolled {
+            repoint(hwnd);
+        }
+        if focus {
+            // SAFETY: no pointers; no state borrow is held.
+            let _ = unsafe { SetFocus(Some(hwnd)) };
+        }
+        after(hwnd);
+        emit(hwnd, events);
+        true
+    }
+
+    fn on_screen(&self, hwnd: HWND, r: RECT) -> Option<RECT> {
+        with_host(hwnd, |h| {
+            let shown = h.scroll.visible(r)?;
+            let mut corner = POINT::default();
+            // SAFETY: a valid in-out pointer; this sends no message.
+            let _ = unsafe { ClientToScreen(hwnd, &mut corner) };
+            Some(RECT {
+                left: shown.left + corner.x,
+                top: shown.top + corner.y,
+                right: shown.right + corner.x,
+                bottom: shown.bottom + corner.y,
+            })
+        })
+        .flatten()
     }
 }
 
@@ -1197,7 +1274,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 emit(hwnd, events);
                 LRESULT(0)
             }
+            WM_GETOBJECT => uia::get_object(hwnd, wparam, lparam, &KIT)
+                .unwrap_or_else(|| DefWindowProcW(hwnd, msg, wparam, lparam)),
             WM_NCDESTROY => {
+                uia::gone(hwnd);
                 let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut RefCell<Host>;
                 if !p.is_null() {
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);

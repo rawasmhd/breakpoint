@@ -56,7 +56,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{BOOL, BSTR, Error, HRESULT, IUnknown, Interface, PCWSTR, Result, implement};
 
 use super::form::{parse_number, parse_time};
-pub use tree::{Action, Area, Change, Key, Nav, Node, Role, Tree, changes};
+pub use tree::{Action, Area, Change, Key, Nav, Node, Role, Tree, changes, perform};
 
 /// What the providers need from the window that hosts the form. The kit window implements it;
 /// the tests implement it over a bare [`Form`](super::form::Form).
@@ -71,11 +71,10 @@ pub trait Source: Sync {
     /// window's caller. False when it cannot be done.
     fn act(&self, hwnd: HWND, action: Action) -> bool;
 
-    /// A rectangle in the form's pixels ([`Area::Form`]) on screen, scrolling included.
-    fn to_screen(&self, hwnd: HWND, r: RECT) -> RECT;
-
-    /// Whether a rectangle in the form's pixels shows, not scrolled out of view.
-    fn shown(&self, hwnd: HWND, r: RECT) -> bool;
+    /// The part of a rectangle in the form's pixels ([`Area::Form`]) that shows, on screen:
+    /// scrolled, and cut where the scrolling content goes under the caption or the footer
+    /// band. `None` when none of it shows.
+    fn on_screen(&self, hwnd: HWND, r: RECT) -> Option<RECT>;
 
     /// Whether the window has the keyboard focus.
     fn has_focus(&self, hwnd: HWND) -> bool {
@@ -154,12 +153,13 @@ fn none<T>() -> Result<T> {
 
 // ---- Snapshots ----
 
-/// The tree, with what else a provider reads that needs the window's thread: each element's
-/// rectangle on screen and whether it shows, and whether the window has the focus.
+/// The tree, with what else a provider reads that needs the window's thread: the part of each
+/// element that shows on screen, and whether the window has the focus.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub tree: Tree,
-    screen: HashMap<Key, (RECT, bool)>,
+    /// Only the elements that show.
+    screen: HashMap<Key, RECT>,
     focused: bool,
 }
 
@@ -172,9 +172,9 @@ impl Snapshot {
             .iter()
             .filter_map(|n| match n.area {
                 Area::None => None,
-                Area::Form(r) => Some((n.key, (source.to_screen(hwnd, r), source.shown(hwnd, r)))),
-                // The open menu's entries.
-                Area::Screen(r) => Some((n.key, (r, true))),
+                Area::Form(r) => Some((n.key, source.on_screen(hwnd, r)?)),
+                // The open menu and its entries.
+                Area::Screen(r) => Some((n.key, r)),
             })
             .collect();
         Some(Snapshot {
@@ -184,13 +184,14 @@ impl Snapshot {
         })
     }
 
+    /// The part of the element that shows, on screen.
     fn rect(&self, key: Key) -> Option<RECT> {
-        self.screen.get(&key).map(|&(r, _)| r)
+        self.screen.get(&key).copied()
     }
 
-    /// Off screen: nowhere, such as a closed menu, or scrolled out of view.
+    /// Off screen: nowhere, such as a closed menu, or scrolled wholly out of view.
     fn offscreen(&self, key: Key) -> bool {
-        self.screen.get(&key).is_none_or(|&(_, shown)| !shown)
+        !self.screen.contains_key(&key)
     }
 }
 
