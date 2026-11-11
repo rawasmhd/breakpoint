@@ -124,7 +124,7 @@ Sizes are at 96 DPI and scale with the monitor.
 - **Card:** `surface-raised`, 1px `line` border, `radius-md`, `space-4` padding left and right. Each row has `space-3` above and below its content. A 1px `line` hairline separates two rows.
 - Labels sit in one column, 104 wide, left of their controls. Units ("min") follow a stepper in `body`. A note sits under what it explains, in `caption` `ink-muted`.
 - The wizard opens with one `title-lg` heading, "Pick a rhythm". Under it, the three profiles are selectable cards: the radio mark, the name in `body-strong`, the numbers in `caption` `ink-muted`, and a small day timeline on the right. Start with Windows is a checkbox row.
-- The settings window has four sections: Work week, Profile, Nudges and Start with Windows. Its controls are in the Controls table below.
+- The settings window has three sections: Work week, Nudges (the profile drop-down is its first row) and General (Start with Windows). Its controls are in the Controls table below.
 - Buttons sit in a footer band of `surface-sunken` with a `line` hairline above it, right-aligned, `space-2` apart: the primary first, then Cancel. Wizard: Start. Settings: Save, Cancel.
 
 ### Controls
