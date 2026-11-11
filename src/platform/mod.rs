@@ -6,4 +6,5 @@ pub mod log;
 pub mod popup;
 pub mod presence;
 pub mod startup;
+pub mod theme;
 pub mod tray;
