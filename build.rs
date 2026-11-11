@@ -25,48 +25,61 @@ fn main() {
     res.compile().expect("failed to embed Windows resources");
 }
 
+/// Every control is at 0, 0, 0, 0 here: `dialogs.rs` places each one in pixels from the design
+/// tokens, for the monitor's DPI, and sets the fonts. So the templates give no font, and their
+/// order is the tab order. Statics that `dialogs.rs` places have ids; LTEXT starts a new group.
+const PLACED: &str = "0, 0, 0, 0";
+
 /// The first-run wizard (SPEC §9.1): as wide as the settings window, which Change… opens at the
-/// same position. The profile lines, the work-week line and "Change…" are set at run time: the
-/// core writes the lines, and the resource compiler would mangle the ellipsis.
+/// same position. The profile names and lines, the work-week line and "Change…" are set at run
+/// time: the core writes the lines, and the resource compiler would mangle the ellipsis.
 fn wizard_dialog() -> String {
     use ids::*;
+    // The radio buttons sit together, so the arrow keys move only among them; the first starts
+    // the group and is the tab stop. The numbers lines follow them.
     let radios = (0..3)
         .map(|i| {
-            // Only the first radio button starts the group and is a tab stop.
             let first = if i == 0 {
                 " | WS_GROUP | WS_TABSTOP"
             } else {
                 ""
             };
             format!(
-                "    AUTORADIOBUTTON \"\", {}, 14, {}, 272, 18, BS_MULTILINE | BS_TOP{first}
-",
-                IDC_WIZARD_PROFILE + i,
-                20 + 20 * i
+                "    AUTORADIOBUTTON \"\", {}, {PLACED}, BS_TOP{first}\n",
+                IDC_WIZARD_PROFILE + i
+            )
+        })
+        .collect::<String>();
+    let numbers = (0..3)
+        .map(|i| {
+            format!(
+                "    LTEXT \"\", {}, {PLACED}, SS_NOTIFY\n",
+                IDC_WIZARD_NUMBERS + i
             )
         })
         .collect::<String>();
     format!(
         r#"
-{IDD_WIZARD} DIALOGEX 0, 0, 300, 163
-STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+{IDD_WIZARD} DIALOGEX 0, 0, 300, 200
+STYLE DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 EXSTYLE WS_EX_APPWINDOW
 CAPTION "breakpoint"
-FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
-    GROUPBOX "Profile", -1, 7, 7, 286, 76
-{radios}    AUTOCHECKBOX "Start with Windows", {IDC_WIZARD_START_WITH_WINDOWS}, 14, 92, 120, 10, WS_GROUP | WS_TABSTOP
-    LTEXT "", {IDC_WIZARD_WEEK}, 14, 112, 214, 8
-    PUSHBUTTON "", {IDC_WIZARD_CHANGE}, 236, 109, 50, 14, WS_GROUP | WS_TABSTOP
-    LTEXT "breakpoint lives in the tray, under ^ if you don't see it.", -1, 14, 129, 272, 8
-    DEFPUSHBUTTON "Start", IDOK, 243, 142, 50, 14, WS_GROUP | WS_TABSTOP
+    LTEXT "Pick a rhythm", {IDC_WIZARD_TITLE}, {PLACED}
+    LTEXT "Profile", {IDC_WIZARD_PROFILE_HEADING}, {PLACED}
+{radios}{numbers}    LTEXT "Work week", {IDC_WIZARD_WEEK_HEADING}, {PLACED}
+    LTEXT "", {IDC_WIZARD_WEEK}, {PLACED}
+    PUSHBUTTON "", {IDC_WIZARD_CHANGE}, {PLACED}, WS_GROUP | WS_TABSTOP
+    AUTOCHECKBOX "Start with Windows", {IDC_WIZARD_START_WITH_WINDOWS}, {PLACED}, WS_GROUP | WS_TABSTOP
+    LTEXT "breakpoint lives in the tray, under ^ if you don't see it.", {IDC_WIZARD_TRAY_NOTE}, {PLACED}
+    CONTROL "Start", IDOK, "Button", BS_OWNERDRAW | WS_GROUP | WS_TABSTOP, {PLACED}
 END
 "#
     )
 }
 
-/// The settings window (SPEC §9.2): one fixed-size page, in dialog units. Tab order is the
-/// order below; each up-down control follows its edit box, which it takes as its buddy.
+/// The settings window (SPEC §9.2): one fixed-size page. Tab order is the order below; each
+/// up-down control follows its edit box, which it takes as its buddy.
 fn settings_dialog() -> String {
     use ids::*;
     let days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
@@ -74,94 +87,112 @@ fn settings_dialog() -> String {
         .enumerate()
         .map(|(i, day)| {
             format!(
-                "    AUTOCHECKBOX \"{day}\", {}, {}, 20, 30, 10\n",
-                IDC_DAY + i as i32,
-                62 + 32 * i
+                "    AUTOCHECKBOX \"{day}\", {}, {PLACED}\n",
+                IDC_DAY + i as i32
             )
         })
         .collect::<String>();
     let spin = |id: i32| {
         format!(
             "    CONTROL \"\", {id}, \"msctls_updown32\", UDS_AUTOBUDDY | UDS_SETBUDDYINT | \
-             UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_NOTHOUSANDS, 0, 0, 0, 0\n"
+             UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_NOTHOUSANDS, {PLACED}\n"
         )
     };
-    let away_row = |y: i32, name: &str, length: &str, ids: [i32; 6]| {
-        let [on, every, every_spin, len, len_spin, level] = ids;
+    // One nudge row: on, "every" [n] "min", then for Stand/Move and Pause, "<x> length" [n] "min"
+    // and the level.
+    let row = |name: &str, [on, every, every_spin, every_label, every_unit]: [i32; 5]| {
         format!(
-            "    AUTOCHECKBOX \"{name}\", {on}, 14, {y}, 54, 10\n\
-             \x20   LTEXT \"every\", -1, 70, {ty}, 20, 8\n\
-             \x20   EDITTEXT {every}, 92, {ey}, 32, 12, ES_NUMBER\n\
+            "    AUTOCHECKBOX \"{name}\", {on}, {PLACED}\n\
+             \x20   LTEXT \"every\", {every_label}, {PLACED}\n\
+             \x20   EDITTEXT {every}, {PLACED}, ES_NUMBER\n\
              {}\
-             \x20   LTEXT \"min, {length} length\", -1, 128, {ty}, 64, 8\n\
-             \x20   EDITTEXT {len}, 194, {ey}, 28, 12, ES_NUMBER\n\
-             {}\
-             \x20   LTEXT \"min\", -1, 226, {ty}, 14, 8\n\
-             \x20   COMBOBOX {level}, 244, {cy}, 42, 40, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP\n",
+             \x20   LTEXT \"min\", {every_unit}, {PLACED}\n",
             spin(every_spin),
-            spin(len_spin),
-            ty = y + 1,
-            ey = y - 1,
-            cy = y - 2,
         )
     };
-    let stand = away_row(
-        100,
+    let length = |length: &str, [len, len_spin, len_label, len_unit, level]: [i32; 5]| {
+        format!(
+            "    LTEXT \"{length} length\", {len_label}, {PLACED}\n\
+             \x20   EDITTEXT {len}, {PLACED}, ES_NUMBER\n\
+             {}\
+             \x20   LTEXT \"min\", {len_unit}, {PLACED}\n\
+             \x20   COMBOBOX {level}, {PLACED}, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP\n",
+            spin(len_spin),
+        )
+    };
+    let stand = row(
         "Stand/Move",
-        "stand",
         [
             IDC_STAND_ON,
             IDC_STAND_EVERY,
             IDC_STAND_EVERY_SPIN,
+            IDC_STAND_EVERY_LABEL,
+            IDC_STAND_EVERY_UNIT,
+        ],
+    ) + &length(
+        "stand",
+        [
             IDC_STAND_LENGTH,
             IDC_STAND_LENGTH_SPIN,
+            IDC_STAND_LENGTH_LABEL,
+            IDC_STAND_LENGTH_UNIT,
             IDC_STAND_LEVEL,
         ],
     );
-    let pause = away_row(
-        118,
+    let pause = row(
         "Pause",
-        "pause",
         [
             IDC_PAUSE_ON,
             IDC_PAUSE_EVERY,
             IDC_PAUSE_EVERY_SPIN,
+            IDC_PAUSE_EVERY_LABEL,
+            IDC_PAUSE_EVERY_UNIT,
+        ],
+    ) + &length(
+        "pause",
+        [
             IDC_PAUSE_LENGTH,
             IDC_PAUSE_LENGTH_SPIN,
+            IDC_PAUSE_LENGTH_LABEL,
+            IDC_PAUSE_LENGTH_UNIT,
             IDC_PAUSE_LEVEL,
         ],
     );
-    let water_spin = spin(IDC_WATER_EVERY_SPIN);
+    let water = row(
+        "Water",
+        [
+            IDC_WATER_ON,
+            IDC_WATER_EVERY,
+            IDC_WATER_EVERY_SPIN,
+            IDC_WATER_EVERY_LABEL,
+            IDC_WATER_EVERY_UNIT,
+        ],
+    );
     format!(
         r#"
 #include <windows.h>
 #include <commctrl.h>
 
-{IDD_SETTINGS} DIALOGEX 0, 0, 300, 222
-STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+{IDD_SETTINGS} DIALOGEX 0, 0, 300, 200
+STYLE DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 EXSTYLE WS_EX_APPWINDOW
 CAPTION "breakpoint settings"
-FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
-    GROUPBOX "Work week", -1, 7, 7, 286, 54
-    LTEXT "Work days:", -1, 14, 21, 44, 8
-{days}    LTEXT "Work hours from", -1, 14, 41, 56, 8
-    CONTROL "", {IDC_FROM}, "SysDateTimePick32", DTS_TIMEFORMAT | DTS_UPDOWN | WS_TABSTOP, 72, 39, 44, 14
-    LTEXT "to", -1, 122, 41, 10, 8
-    CONTROL "", {IDC_TO}, "SysDateTimePick32", DTS_TIMEFORMAT | DTS_UPDOWN | WS_TABSTOP, 136, 39, 44, 14
+    LTEXT "Work week", {IDC_WEEK_HEADING}, {PLACED}
+    LTEXT "Work days", {IDC_DAYS_LABEL}, {PLACED}
+{days}    LTEXT "Work hours", {IDC_HOURS_LABEL}, {PLACED}
+    CONTROL "", {IDC_FROM}, "SysDateTimePick32", DTS_TIMEFORMAT | DTS_UPDOWN | WS_TABSTOP, {PLACED}
+    CTEXT "to", {IDC_HOURS_TO}, {PLACED}
+    CONTROL "", {IDC_TO}, "SysDateTimePick32", DTS_TIMEFORMAT | DTS_UPDOWN | WS_TABSTOP, {PLACED}
 
-    GROUPBOX "Nudges", -1, 7, 66, 286, 106
-    LTEXT "Profile:", -1, 14, 81, 44, 8
-    COMBOBOX {IDC_PROFILE}, 62, 79, 70, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-{stand}{pause}    AUTOCHECKBOX "Water", {IDC_WATER_ON}, 14, 136, 54, 10
-    LTEXT "every", -1, 70, 137, 20, 8
-    EDITTEXT {IDC_WATER_EVERY}, 92, 135, 32, 12, ES_NUMBER
-{water_spin}    LTEXT "min", -1, 128, 137, 14, 8
-    LTEXT "Always gentle; rides along with the next nudge.", -1, 70, 154, 216, 8
+    LTEXT "Nudges", {IDC_NUDGES_HEADING}, {PLACED}
+    LTEXT "Profile", {IDC_PROFILE_LABEL}, {PLACED}
+    COMBOBOX {IDC_PROFILE}, {PLACED}, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+{stand}{pause}{water}    LTEXT "Always gentle; rides along with the next nudge.", {IDC_WATER_NOTE}, {PLACED}
 
-    AUTOCHECKBOX "Start with Windows", {IDC_START_WITH_WINDOWS}, 14, 180, 120, 10
-    DEFPUSHBUTTON "Save", IDOK, 186, 201, 50, 14
-    PUSHBUTTON "Cancel", IDCANCEL, 243, 201, 50, 14
+    AUTOCHECKBOX "Start with Windows", {IDC_START_WITH_WINDOWS}, {PLACED}, WS_GROUP | WS_TABSTOP
+    CONTROL "Save", IDOK, "Button", BS_OWNERDRAW | WS_GROUP | WS_TABSTOP, {PLACED}
+    PUSHBUTTON "Cancel", IDCANCEL, {PLACED}
 END
 "#
     )
