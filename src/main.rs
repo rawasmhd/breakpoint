@@ -38,7 +38,7 @@ use windows::core::w;
 const MAIN_CLASS: windows::core::PCWSTR = w!("breakpoint.main");
 
 const POLL_TIMER: usize = 1;
-/// Refreshes the popup's away countdown while it is on screen.
+/// Refreshes the away countdowns of the popup and the tray flyout while they are on screen.
 const COUNTDOWN_TIMER: usize = 2;
 const COUNTDOWN_EVERY: Duration = Duration::from_secs(1);
 
@@ -49,7 +49,7 @@ struct App {
     /// The hidden main window, which a Settings Save is posted to.
     window: HWND,
     /// The one in-memory copy of the settings: read at start-up, changed by a Settings Save and
-    /// by the off switch, and written whole to `config.json` by either.
+    /// by the Nudges switch, and written whole to `config.json` by either.
     config: Config,
     /// Where `config.json` lives; `None` if `%APPDATA%` is unknown, and then nothing is saved.
     config_path: Option<PathBuf>,
@@ -92,13 +92,35 @@ impl App {
             let effects = self.scheduler.poll(now, presence);
             self.apply(effects);
         }
-        // Midnight starts the count again (SPEC §10.3).
-        self.tray
-            .set_today(&self.today.text(platform::clock::now()));
+        // Midnight starts the Today count again (SPEC §10.3), and the status line moves on.
+        self.refresh_flyout();
+    }
+
+    /// What the tray flyout shows now: the SPEC §7 state, the pending occurrence with its live
+    /// countdown, and the Today count.
+    fn flyout_content(&self) -> platform::flyout::Content {
+        let wall = platform::clock::now();
+        let prompt = self.scheduler.prompt();
+        let left = prompt
+            .as_ref()
+            .map_or(Duration::ZERO, |p| self.countdown(p.length));
+        platform::flyout::content(
+            &self.quiet.item(wall),
+            prompt.as_ref(),
+            left,
+            self.today.counts(wall),
+        )
+    }
+
+    /// Brings the open flyout up to date, if it is open.
+    fn refresh_flyout(&self) {
+        if platform::flyout::is_open() {
+            platform::flyout::update(&self.flyout_content());
+        }
     }
 
     /// Applies the quiet rules as of the wall clock now (SPEC §7): an edge expires what is
-    /// pending or restarts the clocks. Then the tray's off switch, tooltip and icon follow.
+    /// pending or restarts the clocks. Then the tray's tooltip and icon follow.
     fn sync_quiet(&mut self) {
         let wall = platform::clock::now();
         let now = self.now();
@@ -107,7 +129,7 @@ impl App {
         self.tray.set_switch(&self.quiet.item(wall));
     }
 
-    /// The user pressed the off switch: start or end Off or Overtime, save its end moment in
+    /// The user flipped the Nudges switch: start or end Off or Overtime, save its end moment in
     /// `config.json` so a restart keeps it, and apply the quiet rules at once.
     fn press_switch(&mut self) {
         self.quiet.press(platform::clock::now());
@@ -247,7 +269,7 @@ impl App {
             }
         }
         self.tray.set_pending(self.scheduler.prompt().as_ref());
-        self.tray.set_today(&self.today.text(wall));
+        self.refresh_flyout();
     }
 
     /// The away time an occurrence of `length` still needs as of now (SPEC §6).
@@ -257,30 +279,40 @@ impl App {
         away_left(length, now, platform::presence::last_input(now), held)
     }
 
+    /// Every second: the popup's and the flyout's away countdowns.
     fn tick_countdown(&mut self) {
         if self.popup.is_visible()
             && let Some(prompt) = self.scheduler.prompt()
         {
             self.popup.set_countdown(self.countdown(prompt.length));
         }
+        self.refresh_flyout();
     }
 
-    /// Acts on the tray item picked, if any; false once the user chose Quit.
-    fn tray_command(&mut self) -> bool {
-        match self.tray.next_command() {
-            // During first run the switch would save a config: it shows the wizard instead.
-            Some(Command::Switch) if self.first_run.is_some() => self.open_settings(),
-            Some(Command::Switch) => self.press_switch(),
-            Some(Command::Snooze) => self.snooze(),
-            Some(Command::Skip) => self.skip(),
-            Some(Command::Settings) => self.open_settings(),
-            Some(Command::Quit) => {
-                self.quit();
-                return false;
+    /// Acts on the next thing the user asked for from the tray icon or the flyout: `None` when
+    /// nothing waits, `Some(false)` once the user chose Quit.
+    fn tray_command(&mut self) -> Option<bool> {
+        match self.tray.next_command()? {
+            Command::Toggle { icon, keyboard } => {
+                if platform::flyout::is_open() {
+                    platform::flyout::close();
+                } else {
+                    platform::flyout::open(&self.flyout_content(), icon, keyboard);
+                }
             }
-            None => {}
+            // During first run the switch would save a config: it shows the wizard instead.
+            Command::Switch if self.first_run.is_some() => self.open_settings(),
+            Command::Switch => self.press_switch(),
+            Command::Snooze => self.snooze(),
+            Command::Skip => self.skip(),
+            Command::Settings => self.open_settings(),
+            Command::Quit => {
+                platform::flyout::close();
+                self.quit();
+                return Some(false);
+            }
         }
-        true
+        Some(true)
     }
 }
 
@@ -391,8 +423,21 @@ fn run() -> Result<(), Box<dyn Error>> {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        // Every command queued while that message ran, such as a click on the icon and then
+        // the flyout's own event.
         let mut running = true;
-        with_app(|app| running = app.tray_command());
+        loop {
+            let mut acted = None;
+            with_app(|app| acted = app.tray_command());
+            match acted {
+                Some(true) => {}
+                Some(false) => running = false,
+                None => {}
+            }
+            if acted != Some(true) {
+                break;
+            }
+        }
         if !running {
             break;
         }

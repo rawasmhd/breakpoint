@@ -172,20 +172,22 @@ Decided in [Quiet rules and the off switch](https://github.com/rawasmhd/breakpoi
 - End must be after start; overnight hours are not supported in v1.
 - Every other moment is **quiet**: outside hours, on the weekend, or **Off**.
 - **Starting quiet** expires every pending occurrence (cause `quiet`). **Leaving quiet** restarts every clock from zero: a fresh focus period. Clocks never carry across quiet time.
-- **Off:** during work hours the top tray item reads **Turn off until next work day**. Off ends by itself at the next work day's start time, or earlier from the same item.
-- **Overtime:** outside hours or on the weekend the top item reads **Turn on until midnight**. Nudges then run normally until 00:00. The same item ends it early.
+- **Off:** during work hours, flipping the tray flyout's **Nudges** switch off turns breakpoint off until the next work day's start. Off ends by itself then, or earlier when the switch is flipped back on.
+- **Overtime:** outside hours or on the weekend, flipping the switch on turns breakpoint on until midnight. Nudges then run normally until 00:00. Flipping it off ends it early.
 - Off and Overtime are saved in `config.json` as the moment they end, so a restart or reboot keeps them. At most one is in force; starting one clears the other.
 
-The top tray item, tooltip and icon in every case:
+The flyout's **Nudges** switch is on while nudging (in hours or in Overtime) and off while Off or quiet. Its note says what flipping it does now. The flyout's status line, the switch, the tooltip and the icon in every case:
 
-| Now | Item reads | Pressing it | Tooltip | Icon |
-|---|---|---|---|---|
-| In hours, nudging | Turn off until next work day | starts Off | `breakpoint` | on |
-| In hours, Off | Turn back on | ends Off (clocks restart) | `breakpoint: off until Sunday 08:00` | quiet |
-| Outside hours, quiet | Turn on until midnight | starts Overtime (clocks restart) | `breakpoint: quiet until Sunday 08:00` | quiet |
-| Outside hours, Off still in force | Turn on until midnight | ends Off, starts Overtime | `breakpoint: off until Sunday 08:00` | quiet |
-| Overtime, outside hours | Turn off now | ends Overtime | `breakpoint: on until midnight` | on |
-| Overtime, in hours (started before work began) | Turn off until next work day | ends Overtime, starts Off | `breakpoint: on until midnight` | on |
+| Now | Status line | Switch | Note | Flipping it | Tooltip | Icon |
+|---|---|---|---|---|---|---|
+| In hours, nudging | On until 17:00 | on | Turn off until tomorrow 08:00. | starts Off | `breakpoint` | on |
+| In hours, Off | Off until tomorrow 08:00 | off | Turn back on now. | ends Off (clocks restart) | `breakpoint: off until Sunday 08:00` | quiet |
+| Outside hours, quiet | Quiet until Sunday 08:00 | off | Outside work hours. Turn on until midnight. | starts Overtime (clocks restart) | `breakpoint: quiet until Sunday 08:00` | quiet |
+| Outside hours, Off still in force | Off until Sunday 08:00 | off | Outside work hours. Turn on until midnight. | ends Off, starts Overtime | `breakpoint: off until Sunday 08:00` | quiet |
+| Overtime, outside hours | On until midnight | on | Overtime. Turn off to be quiet again. | ends Overtime | `breakpoint: on until midnight` | on |
+| Overtime, in hours (started before work began) | On until midnight | on | Overtime. Turn off until tomorrow 08:00. | ends Overtime, starts Off | `breakpoint: on until midnight` | on |
+
+The status line and the notes use the real end times: the time alone later today ("On until 17:00"), "tomorrow" and the time for tomorrow, "midnight" for the coming midnight, and otherwise the day's name as the tooltip has it ("Sunday 08:00"). "Turn off until …" names the next work day's start. With no work day at all, the status line reads "Quiet". The tooltip keeps its day names.
 
 Icon names are the states in §8; any state shown as on becomes pending while an occurrence is pending.
 
@@ -194,18 +196,21 @@ Overtime that runs into work hours keeps going until midnight; work hours starti
 
 ## 8. Tray
 
-Uses `tray-icon` on breakpoint's own Win32 message loop. Left or right click opens the menu; there is no click-to-toggle.
+Uses `tray-icon` on breakpoint's own Win32 message loop, with no menu. Decided in [Tray flyout](https://github.com/rawasmhd/breakpoint/issues/89).
 
 **Icon and tooltip:** three icon states told apart by shape ([DESIGN.md](DESIGN.md) §7): **on**, a filled red dot, while nudges can fire; **pending**, a smaller dot inside a ring, while an occurrence is pending (popup shown or closed with ×); **quiet**, a hollow grey ring, while quiet or Off. Quiet wins over pending. Tooltip per the table in §7.
 
-**Menu, top to bottom:**
-1. The off switch (labels in §7).
-2. Separator.
-3. Only while an occurrence is pending: a disabled line naming it (e.g. *Pause pending*), then **Snooze 5 min** (hidden once used) and **Skip**. These act exactly like the popup's buttons, on the whole combined nudge if it is one.
-4. **Today count**, a disabled line: `Today: 7 taken, 2 skipped` (§10.3).
-5. Separator.
-6. **Settings…**
-7. **Quit**
+**The flyout.** A left or right click on the icon opens the tray flyout, breakpoint's own painted panel ([DESIGN.md](DESIGN.md) §6); a click on the icon while it is open closes it. From the keyboard, Win+B, the arrow keys and then Enter, Space or the menu key on the icon open it too, with the focus ring on the Nudges switch. (`tray-icon` registers the icon at the legacy notify-icon version, where Windows reports those keys as a right-button click.)
+- It sits next to the icon: above a bottom taskbar and below a top one with its right edge lined up with the icon's, beside a side taskbar with its bottom edge lined up with the icon's, `space-3` off the taskbar (`Shell_NotifyIconGetRect`, `SHAppBarMessage` `ABM_GETTASKBARPOS`), kept inside the icon's monitor's work area, `space-3` in from its sides.
+- It takes the focus and activates (unlike the popup). Esc, a click outside it, losing activation or any action closes it. It appears and goes at once.
+- While it is open its content follows the app: the countdown runs, and a change of state, pending or count lays it out again in place.
+
+**Content, top to bottom:**
+1. **Header:** the status dot (filled while on, a ring while Off or quiet), "breakpoint", and the status line from §7 under it.
+2. **Nudges** row: the label, the note from §7 under it, and the switch at the right. During first run the switch brings the wizard to the front instead (§9.1).
+3. Only while an occurrence is pending, a card: the nudge glyph and *Pause pending*, the live away countdown ("Away 1:59 more and it counts", as the popup's, §6), the riding Water line if any, and the buttons **Snooze 5 min** (hidden once used) and **Skip**. These act exactly like the popup's buttons, on the whole combined nudge if it is one.
+4. **Today** row: "Today" at the left and the count at the right, `7 taken  2 skipped` (§10.3).
+5. Footer: **Settings…** at the left and **Quit** at the right.
 
 ## 9. First-run wizard and settings window
 
@@ -311,7 +316,7 @@ Fields are written in that order; absent fields are omitted, never `null`. In a 
 
 ### 10.3 Today count
 
-- One total, exactly `Today: 7 taken, 2 skipped` (zero state `Today: 0 taken, 0 skipped`; no plural changes).
+- One total, taken and skipped. The tray flyout shows it as a row: "Today" at the left and `7 taken  2 skipped` at the right, the numbers in `body-strong` (zero state `0 taken  0 skipped`; no plural changes).
 - **Taken** = Stand/Move and Pause occurrences that ended `satisfied`; **skipped** = those that ended `skipped`, any `by`. Water is excluded; snoozes change nothing. An absorbed Stand/Move counts on its own, so a taken combined nudge adds 2.
 - The day ends at **local midnight**; an occurrence counts toward the day it **fired**.
 - Kept in memory; at start-up rebuilt from the current month's file (end events whose `fired` line is dated today). An occurrence left open by a crash is ignored.
@@ -331,7 +336,7 @@ Fields are written in that order; absent fields are omitted, never `null`. In a 
 | Concern | Crate | Notes |
 |---|---|---|
 | Win32 and WinRT calls, dialogs, popup | `windows` (and its own `windows-core`) | Presence APIs, power and session notifications, `SHQueryUserNotificationState`, media controls (WinRT), Run key, named mutex, `PlaySound`, the popup window, the painted dialog windows, GDI+ drawing for the popup and the dialogs, DWM round corners and caption colours, UI Automation (features, not new crates). `windows-core` comes with `windows`; it is named only because the code `windows::core::implement` writes for the UI Automation providers refers to it by name |
-| Tray icon and menu | `tray-icon` (with its `muda` menus) | Needs only a Win32 message loop on the thread; no `winit` |
+| Tray icon | `tray-icon` | Needs only a Win32 message loop on the thread; no `winit`. Its menu is not used: the flyout is painted with the kit |
 | Config and log | `serde` + `serde_json` | No file watcher, no date-time crate: the platform layer supplies local time and UTC offset |
 | Exe resources | `winresource` (build dependency) | Icon, version info, manifest (PerMonitorV2) |
 | Tests | built-in `cargo test` | Core tested with an injected clock and presence feed |
@@ -350,10 +355,11 @@ src/
     config.rs        model, defaults, profiles, validation, JSON load/save
     log.rs           event records, JSONL formatting, Today count rebuild
   platform/          Windows only
-    tray.rs          tray-icon menu and icon states
+    tray.rs          the notification icon: its states, tooltip and clicks
+    flyout.rs        the tray flyout, built from the kit: content, layout, placement
     presence.rs      GetLastInputInfo, vetoes, session and power notifications
     popup.rs         the nudge popup window
-    kit/             the painted dialog window and its controls (switch, day pill, stepper, toggle, drop-down, cards), keyboard, focus, UI Automation
+    kit/             the painted dialog window, the borderless popup window, and their controls (switch, day pill, stepper, toggle, drop-down, cards), keyboard, focus, UI Automation
     settings_window.rs  the settings window, built from the kit
     dialogs.rs       the first-run wizard, built from the kit, and its day timelines
     startup.rs       Run key
@@ -403,7 +409,7 @@ The map left these small gaps; the rewrite closed them with the leanest option, 
 7. **Water** joins only a newly fired popup, its clock restarts when shown, quiet start drops a waiting Water, and with both other nudges off it fires alone at once (§5.4).
 8. **A pending occurrence keeps the length it fired with** after a settings change, as it keeps its level (§5.7).
 9. **The countdown holds during a veto**; any ending closes the popup (§6).
-10. **The off switch in every state** (§7 table), menu order and icon (§8).
+10. **The off switch in every state** (§7 table), menu order and icon (§8). The menu is now the tray flyout and its Nudges switch ([Tray flyout](https://github.com/rawasmhd/breakpoint/issues/89)).
 11. **The `config.json` shape** and its fallbacks (§10.1).
 12. **The bad-config notice** sits in the popup's place, no buttons, until closed (§10.1).
 13. **Single instance**: a second launch opens Settings in the running instance (§11).

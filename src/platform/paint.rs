@@ -12,14 +12,14 @@ use std::time::Duration;
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::HDC;
 use windows::Win32::Graphics::GdiPlus::{
-    CombineModeReplace, FillModeAlternate, GdipAddPathArc, GdipAddPathLine, GdipClosePathFigure,
-    GdipCreateFromHDC, GdipCreatePath, GdipCreatePen1, GdipCreateSolidFill, GdipDeleteBrush,
-    GdipDeleteGraphics, GdipDeletePath, GdipDeletePen, GdipDrawEllipse, GdipDrawLine,
-    GdipDrawLines, GdipDrawPath, GdipFillEllipse, GdipFillPath, GdipFillRectangle, GdipResetClip,
-    GdipSetClipRect, GdipSetPenEndCap, GdipSetPenLineJoin, GdipSetPenStartCap,
-    GdipSetPixelOffsetMode, GdipSetSmoothingMode, GdiplusStartup, GdiplusStartupInput, GpBrush,
-    GpGraphics, GpPath, GpPen, LineCapRound, LineJoinRound, PixelOffsetModeHalf, PointF,
-    SmoothingModeAntiAlias, UnitPixel,
+    CombineModeReplace, FillModeAlternate, GdipAddPathArc, GdipAddPathEllipse, GdipAddPathLine,
+    GdipAddPathPolygon, GdipClosePathFigure, GdipCreateFromHDC, GdipCreatePath, GdipCreatePen1,
+    GdipCreateSolidFill, GdipDeleteBrush, GdipDeleteGraphics, GdipDeletePath, GdipDeletePen,
+    GdipDrawArc, GdipDrawEllipse, GdipDrawLine, GdipDrawLines, GdipDrawPath, GdipFillEllipse,
+    GdipFillPath, GdipFillRectangle, GdipResetClip, GdipSetClipRect, GdipSetPenEndCap,
+    GdipSetPenLineJoin, GdipSetPenStartCap, GdipSetPixelOffsetMode, GdipSetSmoothingMode,
+    GdiplusStartup, GdiplusStartupInput, GpBrush, GpGraphics, GpPath, GpPen, LineCapRound,
+    LineJoinRound, PixelOffsetModeHalf, PointF, SmoothingModeAntiAlias, UnitPixel,
 };
 
 use super::theme::{CLOSE_INSET, CLOSE_MARK, CLOSE_STROKE, HOVER_IN, HOVER_OUT, PRESS, Palette};
@@ -307,6 +307,50 @@ impl Canvas {
         }
     }
 
+    /// `mark` in `colour`, scaled from its 16-unit grid to fill the square `b`. `stroke` is the
+    /// power mark's line width at this scale.
+    pub fn mark(&self, mark: Mark, colour: COLORREF, b: Box2, stroke: f32) {
+        let s = b.w / MARK_GRID;
+        let at = |x: f32, y: f32| (b.x + x * s, b.y + y * s);
+        match mark {
+            Mark::Gear => {
+                let (cx, cy) = at(8.0, 8.0);
+                let points: Vec<PointF> = gear_points()
+                    .into_iter()
+                    .map(|(x, y)| {
+                        let (x, y) = at(x, y);
+                        PointF { X: x, Y: y }
+                    })
+                    .collect();
+                let hole = GEAR_HOLE * s;
+                // SAFETY: `path` is the live path made by `fill_path`; `points` outlives it.
+                // The hole is a second figure, left empty by the alternate fill mode.
+                self.fill_path(colour, |path| unsafe {
+                    GdipAddPathPolygon(path, points.as_ptr(), points.len() as i32);
+                    GdipAddPathEllipse(path, cx - hole, cy - hole, 2.0 * hole, 2.0 * hole);
+                });
+            }
+            Mark::Power => {
+                let (cx, cy) = at(POWER_RING.0, POWER_RING.1);
+                let r = POWER_RING.2 * s;
+                // SAFETY: the pen is valid inside the closure.
+                self.with_pen(colour, stroke, |pen| unsafe {
+                    GdipDrawArc(
+                        self.g,
+                        pen,
+                        cx - r,
+                        cy - r,
+                        2.0 * r,
+                        2.0 * r,
+                        -90.0 + POWER_GAP,
+                        360.0 - 2.0 * POWER_GAP,
+                    );
+                });
+                self.line(colour, stroke, at(8.0, POWER_STEM.0), at(8.0, POWER_STEM.1));
+            }
+        }
+    }
+
     /// The close ×, centred in `hit`, its strokes scaled like the rest by `scale` (dpi / 96).
     pub fn close_mark(&self, colour: COLORREF, hit: Box2, scale: f32) {
         let size = CLOSE_MARK * scale;
@@ -344,6 +388,50 @@ fn round_rect_path(path: *mut GpPath, b: Box2, r: f32) {
         }
         GdipClosePathFigure(path);
     }
+}
+
+// ---- Marks on the flyout's footer buttons (issue #89), on a 16-unit grid ----
+
+/// The icons beside "Settings…" and "Quit".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mark {
+    /// A gear: one polygon with eight teeth, and a round hole.
+    Gear,
+    /// The power sign: a ring open at the top and a stem through the gap.
+    Power,
+}
+
+const MARK_GRID: f32 = 16.0;
+/// The gear's teeth: eight, tips at radius `GEAR_TIP`, roots at `GEAR_ROOT`, each tip
+/// `GEAR_TIP_HALF` degrees each side of its middle and each root `GEAR_ROOT_HALF`.
+const GEAR_TEETH: usize = 8;
+const GEAR_TIP: f32 = 7.25;
+const GEAR_ROOT: f32 = 5.25;
+const GEAR_TIP_HALF: f32 = 10.0;
+const GEAR_ROOT_HALF: f32 = 17.0;
+const GEAR_HOLE: f32 = 2.25;
+/// The power ring `(cx, cy, r)`, the half gap at its top in degrees, and the stem's ends in y.
+const POWER_RING: (f32, f32, f32) = (8.0, 8.75, 5.75);
+const POWER_GAP: f32 = 40.0;
+const POWER_STEM: (f32, f32) = (1.5, 7.5);
+
+/// The gear's outline on the 16-unit grid, round its centre (8, 8), first tooth at the top.
+fn gear_points() -> Vec<(f32, f32)> {
+    let point = |deg: f32, r: f32| {
+        let a = (deg - 90.0).to_radians();
+        (8.0 + r * a.cos(), 8.0 + r * a.sin())
+    };
+    (0..GEAR_TEETH)
+        .flat_map(|k| {
+            let mid = k as f32 * 360.0 / GEAR_TEETH as f32;
+            [
+                point(mid - GEAR_ROOT_HALF, GEAR_ROOT),
+                point(mid - GEAR_TIP_HALF, GEAR_TIP),
+                point(mid + GEAR_TIP_HALF, GEAR_TIP),
+                point(mid + GEAR_ROOT_HALF, GEAR_ROOT),
+            ]
+        })
+        .collect()
 }
 
 // ---- Glyphs (DESIGN.md §7), on a 20-unit grid ----
@@ -473,6 +561,20 @@ mod tests {
         assert_eq!(mix(a, b, 0.0), a);
         assert_eq!(mix(a, b, 1.0), b);
         assert_eq!(mix(a, b, 0.5), rgb(0x804020));
+    }
+
+    #[test]
+    fn the_gear_has_eight_teeth_inside_its_grid() {
+        let points = gear_points();
+        assert_eq!(points.len(), 4 * GEAR_TEETH);
+        for &(x, y) in &points {
+            let r = ((x - 8.0).powi(2) + (y - 8.0).powi(2)).sqrt();
+            assert!((0.0..=MARK_GRID).contains(&x) && (0.0..=MARK_GRID).contains(&y));
+            assert!((r - GEAR_ROOT).abs() < 1e-4 || (r - GEAR_TIP).abs() < 1e-4);
+        }
+        // The first tooth is at the top, its tip level.
+        assert!((points[1].1 - points[2].1).abs() < 1e-4);
+        assert!(points[1].1 < 8.0 - GEAR_ROOT);
     }
 
     #[test]

@@ -27,7 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::draw::{GdiMeasure, paint_form, paint_menu, paint_on};
 use super::form::{Form, Look, Part, menu_layout};
-use super::window::{Spec, open};
+use super::window::{Frame, Spec, open};
 use super::{Aside, ButtonKind, Entry, Ink, Item, Kind, Place};
 use crate::platform::paint::{self, Box2, Glyph, HOVER, PRESSED};
 use crate::platform::theme::{
@@ -364,9 +364,7 @@ fn demo() -> (Vec<(Item, Shot)>, i32) {
     add(
         &mut out,
         Place::new(SPACE_6, y, card_w, rows.iter().sum()),
-        Kind::Card {
-            rows: vec![rows[0], rows[0] + rows[1]],
-        },
+        Kind::card(vec![rows[0], rows[0] + rows[1]]),
         Shot::Rest,
     );
     let inner = SPACE_6 + SPACE_4;
@@ -664,6 +662,7 @@ fn shots() {
         items,
         at: Some(POINT { x: 40, y: 40 }),
         owner: None,
+        frame: Frame::Dialog,
     };
     let handle = open(spec, |_, _| {}).unwrap();
     handle.show();

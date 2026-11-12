@@ -365,7 +365,7 @@ fn layout(content: &Content, dpi: u32, m: &impl Measure) -> Layout {
 }
 
 /// The countdown line cut round its `m:ss`: the words before, the digits, the words after.
-fn split_digits(text: &str) -> (&str, &str, &str) {
+pub(super) fn split_digits(text: &str) -> (&str, &str, &str) {
     let start = text
         .find(|c: char| c.is_ascii_digit())
         .unwrap_or(text.len());

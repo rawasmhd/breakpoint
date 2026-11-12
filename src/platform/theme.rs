@@ -256,6 +256,18 @@ pub const SCROLL_LINE: i32 = Style::Body.line_height();
 /// Room kept round a control that keyboard focus scrolls into view.
 pub const SCROLL_ROOM: i32 = SPACE_4;
 
+// ---- The tray flyout (issue #89), at 96 DPI ----
+
+/// Flyout width. Height follows the content.
+pub const SIZE_FLYOUT: i32 = 320;
+/// The status dot in the flyout header, and the width of its ring while quiet or Off.
+pub const STATUS_DOT: i32 = 10;
+pub const STATUS_RING: f32 = 2.0;
+/// The icon on a footer button (gear, power), and its gap to the label.
+pub const SIZE_ICON: i32 = 16;
+/// Stroke of the power icon, scaled but not rounded.
+pub const ICON_STROKE: f32 = 1.5;
+
 /// The check mark, as points on its square from 0 to 1, drawn with [`MARK_STROKE`].
 pub const CHECK_POINTS: [(f32, f32); 3] = [(0.22, 0.52), (0.42, 0.72), (0.78, 0.3)];
 /// The drop-down chevron, as points on its square from 0 to 1.
@@ -376,6 +388,9 @@ pub struct Colours {
     pub stand: COLORREF,
     pub water: COLORREF,
     pub pause: COLORREF,
+    /// The flyout's status dot while on (`dot`) and its ring while quiet or Off (`quiet`).
+    pub dot: COLORREF,
+    pub quiet: COLORREF,
     /// Whether menus may cast a shadow. Never in high contrast.
     pub shadows: bool,
 }
@@ -410,6 +425,8 @@ impl Colours {
             stand: p.stand,
             water: p.water,
             pause: p.pause,
+            dot: p.dot,
+            quiet: p.quiet,
             shadows: true,
         }
     }
@@ -447,6 +464,8 @@ impl Colours {
             stand: text,
             water: text,
             pause: text,
+            dot: text,
+            quiet: text,
             shadows: false,
         }
     }

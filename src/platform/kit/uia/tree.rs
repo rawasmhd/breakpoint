@@ -18,7 +18,10 @@
 //!   whose label it sits under, the control right above it, or the one control of its card or
 //!   row, in that order. It stays a text element too.
 //!
-//! Glyphs and the footer band are decoration and are left out.
+//! - A line of mixed styles (the flyout's countdown, its Today count) is one text element with
+//!   its pieces' words, and counts as a note when its first piece is `ink-muted`.
+//!
+//! Glyphs, the status dot, hairlines and the footer band are decoration and are left out.
 
 use windows::Win32::Foundation::RECT;
 
@@ -438,12 +441,19 @@ impl<'a> Builder<'a> {
     }
 
     fn is_text(&self, i: usize, which: Ink) -> bool {
-        matches!(self.items[i].kind, Kind::Text { ink, .. } if ink == which)
+        match &self.items[i].kind {
+            Kind::Text { ink, .. } => *ink == which,
+            Kind::Spans { spans, .. } => spans.first().is_some_and(|s| s.ink == which),
+            _ => false,
+        }
     }
 
     fn text(&self, i: usize) -> String {
         match &self.items[i].kind {
             Kind::Text { text, .. } => one_line(text),
+            Kind::Spans { spans, .. } => {
+                one_line(&spans.iter().map(|s| s.text.as_str()).collect::<String>())
+            }
             _ => String::new(),
         }
     }
@@ -650,7 +660,10 @@ impl<'a> Builder<'a> {
         self.nodes
             .push(Node::new(Key::Root, Role::Root, String::new(), Area::None));
         for i in 0..self.items.len() {
-            if matches!(self.items[i].kind, Kind::Glyph(_) | Kind::Band) {
+            if matches!(
+                self.items[i].kind,
+                Kind::Glyph(_) | Kind::Band | Kind::Rule | Kind::Dot { .. }
+            ) {
                 continue;
             }
             self.ensure(Key::Item(i));
@@ -803,7 +816,12 @@ impl<'a> Builder<'a> {
         let area = Area::Form(self.rect(i));
         let role = match &item.kind {
             Kind::Card { .. } => Role::Group,
-            Kind::Text { .. } | Kind::Glyph(_) | Kind::Band => Role::Text,
+            Kind::Text { .. }
+            | Kind::Spans { .. }
+            | Kind::Glyph(_)
+            | Kind::Band
+            | Kind::Rule
+            | Kind::Dot { .. } => Role::Text,
             Kind::Button { .. } => Role::Button,
             Kind::Switch { .. } => Role::Switch,
             Kind::Checkbox { .. } | Kind::Day { .. } => Role::CheckBox,
@@ -834,6 +852,7 @@ impl<'a> Builder<'a> {
                     _ => 0,
                 };
             }
+            Kind::Spans { .. } => node.name = self.text(i),
             _ => {
                 match self.own_label(i) {
                     Some(label) => node.name = label,

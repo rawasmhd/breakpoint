@@ -14,6 +14,9 @@
 //! - [`draw`] paints a laid-out form and its menu on a device context.
 //! - [`window`] is the Win32 side: the window, its menu window, DPI, theme and high contrast.
 //!
+//! A kit window comes in two [`window::Frame`]s: the dialog, with the system caption, and the
+//! borderless popup the tray flyout uses (issue #89), which closes when it loses activation.
+//!
 //! [`theme::px`]: super::theme::px
 
 pub mod draw;
@@ -26,7 +29,7 @@ pub mod window;
 use std::fmt;
 use std::rc::Rc;
 
-use super::paint::{Box2, Canvas, Glyph};
+use super::paint::{Box2, Canvas, Glyph, Mark};
 use super::theme::{Colours, Style};
 
 /// The caller's name for an item, given back in [`Event`]s.
@@ -113,31 +116,68 @@ impl PartialEq for Aside {
     }
 }
 
+/// One piece of a [`Kind::Spans`] line: its text, type style and ink.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Span {
+    pub text: String,
+    pub style: Style,
+    pub ink: Ink,
+}
+
+impl Span {
+    pub fn new(text: &str, style: Style, ink: Ink) -> Span {
+        Span {
+            text: text.to_owned(),
+            style,
+            ink,
+        }
+    }
+}
+
 /// The controls and shapes a form is made of.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Kind {
-    /// A `surface-raised` card with `radius-md` corners. `rows` are the hairlines between its
-    /// rows, as y offsets from the card's top at 96 DPI; they run inside the `space-4` padding.
+    /// A card with `radius-md` corners and a 1px `line` outline: `surface-raised` on a dialog's
+    /// `surface` ground, or `surface` when `inset`, on the flyout's `surface-raised` ground.
+    /// `rows` are the hairlines between its rows, as y offsets from the card's top at 96 DPI;
+    /// they run inside the `space-4` padding.
     Card {
         rows: Vec<i32>,
+        inset: bool,
     },
     /// The footer band: `surface-sunken` with a `line` hairline on its top edge.
     Band,
+    /// A `line` hairline across the item's width, one pixel tall at any DPI.
+    Rule,
     /// Text in one type style. With a width in its place it wraps at spaces.
     Text {
         text: String,
         style: Style,
         ink: Ink,
     },
-    /// A nudge glyph at `size-glyph`, in its nudge colour.
+    /// One line of text in more than one style, such as a countdown with its digits in
+    /// `caption-strong`. With a width in its place and `right`, it ends at the place's right
+    /// edge. It never wraps.
+    Spans {
+        spans: Vec<Span>,
+        right: bool,
+    },
+    /// A nudge glyph at `size-glyph`, or the size its place gives, in its nudge colour.
     Glyph(Glyph),
+    /// The flyout's status dot, `status-dot` across: filled `dot` while `on`, else a ring in
+    /// `quiet`.
+    Dot {
+        on: bool,
+    },
     /// A push button. Enter presses the `default` one; Esc and the caption × press the `cancel`
-    /// one. One button may be both.
+    /// one. One button may be both. An `icon` sits left of the label, `size-icon` square in
+    /// `ink-muted`.
     Button {
         label: String,
         kind: ButtonKind,
         default: bool,
         cancel: bool,
+        icon: Option<Mark>,
     },
     Switch {
         on: bool,
@@ -206,14 +246,26 @@ impl Kind {
             kind,
             default: false,
             cancel: false,
+            icon: None,
         }
+    }
+
+    /// A card on a dialog's ground, with hairlines at `rows`.
+    pub fn card(rows: Vec<i32>) -> Kind {
+        Kind::Card { rows, inset: false }
     }
 
     /// Whether Tab can stop here or the item can take focus some other way.
     pub fn focusable(&self) -> bool {
         !matches!(
             self,
-            Kind::Card { .. } | Kind::Band | Kind::Text { .. } | Kind::Glyph(_)
+            Kind::Card { .. }
+                | Kind::Band
+                | Kind::Rule
+                | Kind::Text { .. }
+                | Kind::Spans { .. }
+                | Kind::Glyph(_)
+                | Kind::Dot { .. }
         )
     }
 }

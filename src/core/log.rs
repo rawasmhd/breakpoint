@@ -186,7 +186,8 @@ impl Today {
         }
     }
 
-    /// The tray line, exactly `Today: 7 taken, 2 skipped`, with no plural changes.
+    /// The count as one line, `Today: 7 taken, 2 skipped`, with no plural changes. The tray
+    /// flyout lays out [`Today::counts`] as a row of its own (SPEC §10.3).
     pub fn text(&self, now: LocalTime) -> String {
         let (taken, skipped) = self.counts(now);
         format!("Today: {taken} taken, {skipped} skipped")

@@ -172,6 +172,7 @@ fn save_is_the_default_and_cancel_the_cancel_button_at_the_right() {
             kind: ButtonKind::Primary,
             default: true,
             cancel: false,
+            icon: None,
             ..
         }
     ));
@@ -181,6 +182,7 @@ fn save_is_the_default_and_cancel_the_cancel_button_at_the_right() {
             kind: ButtonKind::Secondary,
             default: false,
             cancel: true,
+            icon: None,
             ..
         }
     ));
