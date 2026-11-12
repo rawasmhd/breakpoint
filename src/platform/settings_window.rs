@@ -489,7 +489,7 @@ fn on_event(handle: Handle, event: Event) {
         Event::Pressed(CANCEL) | Event::Close => cancel(handle),
         Event::Changed(PROFILE, Value::Index(Some(k))) => pick_profile(handle, k),
         Event::Changed(..) => show_profile(handle),
-        Event::Pressed(_) => {}
+        Event::Pressed(_) | Event::Lost => {}
     }
 }
 

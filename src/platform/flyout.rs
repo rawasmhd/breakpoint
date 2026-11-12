@@ -9,20 +9,32 @@
 //! - The window takes focus and activates (unlike the popup), and closes on Esc, on losing
 //!   activation (a click outside it, a second click on the icon) and after any action. What
 //!   the user picks goes to the main loop as a [`Command`].
+//! - If Windows refuses it the foreground (the foreground lock), it joins the foreground
+//!   thread's input for a moment and asks again, as tray menus do. If that fails too, a timer
+//!   closes it on the next click outside it, so it never stays up without the focus.
+//! - The app hands it its content on every change and every second ([`show_content`]), so a
+//!   click on the icon opens it from the icon's own event handler, also during a modal loop.
 
 use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
 use breakpoint::core::quiet::SwitchItem;
 use breakpoint::core::scheduler::{Nudge, Prompt, WATER_LINE, countdown_text};
-use windows::Win32::Foundation::{POINT, RECT};
+use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect,
 };
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, GetDoubleClickTime, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
+};
 use windows::Win32::UI::Shell::{
     ABE_BOTTOM, ABE_LEFT, ABE_RIGHT, ABE_TOP, ABM_GETTASKBARPOS, APPBARDATA, SHAppBarMessage,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    BringWindowToTop, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId, KillTimer,
+    SetForegroundWindow, SetTimer,
 };
 
 use super::kit::window::{self, Frame, Handle, Spec};
@@ -413,6 +425,9 @@ fn work_area(r: &RECT) -> RECT {
 
 // ---- The window ----
 
+/// How often the watch looks for a click outside a flyout that has no focus.
+const WATCH_EVERY_MS: u32 = 30;
+
 thread_local! {
     /// The open flyout, if any.
     static OPEN: Cell<Option<Handle>> = const { Cell::new(None) };
@@ -420,8 +435,18 @@ thread_local! {
     static ANCHOR: Cell<RECT> = const { Cell::new(RECT { left: 0, top: 0, right: 0, bottom: 0 }) };
     /// What it shows now.
     static SHOWN: RefCell<Option<Content>> = const { RefCell::new(None) };
-    /// When it last closed.
-    static CLOSED_AT: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// The app's latest content, which a click on the icon opens the flyout with.
+    static LATEST: RefCell<Option<Content>> = const { RefCell::new(None) };
+    /// When the flyout last closed because the user clicked outside it, and where the pointer
+    /// was then.
+    static LOST: Cell<Option<(Instant, POINT)>> = const { Cell::new(None) };
+    /// The timer that watches for a click outside a flyout that has no focus; 0 when none.
+    static WATCH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Whether `p` lies in `r`.
+pub fn inside(r: &RECT, p: POINT) -> bool {
+    p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom
 }
 
 fn open_handle() -> Option<Handle> {
@@ -432,23 +457,109 @@ pub fn is_open() -> bool {
     open_handle().is_some()
 }
 
-/// Whether the flyout is open or closed less than a double-click time ago: a press on the icon
-/// now is the one that closed it.
-pub fn busy() -> bool {
+/// Whether the flyout closed less than a double-click time ago because of a click outside it
+/// on the icon at `icon`: a press on the icon now is that click, which only closes it.
+pub fn lost_at(icon: &RECT) -> bool {
     // SAFETY: no pointers.
     let recent = Duration::from_millis(unsafe { GetDoubleClickTime() }.into());
-    is_open() || CLOSED_AT.get().is_some_and(|at| at.elapsed() < recent)
+    LOST.get()
+        .is_some_and(|(at, p)| at.elapsed() < recent && inside(icon, p))
 }
 
-/// Opens the flyout showing `content` next to the notification icon at `icon` on screen, and
-/// activates it. Opened from the keyboard, it shows the focus ring on the Nudges switch.
-pub fn open(content: &Content, icon: RECT, keyboard: bool) {
-    if let Some(handle) = make(content, icon) {
-        handle.show();
-        if keyboard {
-            handle.focus(SWITCH);
+/// The app's content now: kept for the next open, and shown in the open flyout, if it is open.
+pub fn show_content(content: Content) {
+    update(&content);
+    LATEST.set(Some(content));
+}
+
+/// Opens the flyout with the app's latest content next to the notification icon at `icon`
+/// on screen, and activates it. Opened from the keyboard, it shows the focus ring on the
+/// Nudges switch.
+pub fn open(icon: RECT, keyboard: bool) {
+    let Some(content) = LATEST.with_borrow(Clone::clone) else {
+        return;
+    };
+    let Some(handle) = make(&content, icon) else {
+        return;
+    };
+    handle.show();
+    if !take_foreground(handle.hwnd()) {
+        watch();
+    }
+    if keyboard {
+        handle.focus(SWITCH);
+    }
+}
+
+/// Makes `hwnd` the foreground window. When Windows refuses (the foreground lock), it joins
+/// the foreground thread's input for a moment and asks again, as tray menus do. True when it
+/// is the foreground window after.
+fn take_foreground(hwnd: HWND) -> bool {
+    // SAFETY: no pointers; the input is detached again before return.
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if foreground == hwnd {
+            return true;
+        }
+        let theirs = GetWindowThreadProcessId(foreground, None);
+        let ours = GetCurrentThreadId();
+        if theirs != 0 && theirs != ours && AttachThreadInput(ours, theirs, true).as_bool() {
+            let _ = BringWindowToTop(hwnd);
+            let _ = SetForegroundWindow(hwnd);
+            let _ = AttachThreadInput(ours, theirs, false);
+        }
+        GetForegroundWindow() == hwnd
+    }
+}
+
+/// Starts the watch on a flyout that has no focus: it closes on the next click outside it.
+fn watch() {
+    stop_watch();
+    // SAFETY: a thread timer with a plain callback.
+    let id = unsafe { SetTimer(None, 0, WATCH_EVERY_MS, Some(watch_tick)) };
+    WATCH.set(id);
+}
+
+fn stop_watch() {
+    let id = WATCH.replace(0);
+    if id != 0 {
+        // SAFETY: the timer this thread made.
+        let _ = unsafe { KillTimer(None, id) };
+    }
+}
+
+/// Whether a mouse button is `down` at `at`, outside the flyout's rectangle `flyout`.
+fn outside_press(down: bool, at: POINT, flyout: &RECT) -> bool {
+    down && !inside(flyout, at)
+}
+
+unsafe extern "system" fn watch_tick(_: HWND, _: u32, _: usize, _: u32) {
+    let Some(handle) = open_handle() else {
+        stop_watch();
+        return;
+    };
+    // SAFETY: no pointers but the valid out-pointer.
+    unsafe {
+        if GetForegroundWindow() == handle.hwnd() {
+            // A click on it gave it the focus: losing activation closes it from now on.
+            stop_watch();
+            return;
+        }
+        let down = [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON]
+            .iter()
+            .any(|vk| GetAsyncKeyState(vk.0.into()) < 0);
+        let mut at = POINT::default();
+        let _ = GetCursorPos(&mut at);
+        if outside_press(down, at, &handle.window_rect()) {
+            lost(at);
         }
     }
+}
+
+/// Closes the flyout after a click outside it, with the pointer at `at`.
+fn lost(at: POINT) {
+    LOST.set(Some((Instant::now(), at)));
+    close();
 }
 
 /// Makes the flyout window, placed and hidden, in place of any open one.
@@ -493,7 +604,7 @@ fn put(handle: Handle) {
 
 /// Shows `content` in the open flyout, if it is open: the countdown changes in place; any
 /// other change lays the flyout out again next to its icon, keeping the focus.
-pub fn update(content: &Content) {
+fn update(content: &Content) {
     let Some(handle) = open_handle() else {
         return;
     };
@@ -515,9 +626,9 @@ pub fn update(content: &Content) {
 
 /// Closes the flyout if it is open.
 pub fn close() {
+    stop_watch();
     if let Some(handle) = OPEN.take() {
         handle.close();
-        CLOSED_AT.set(Some(Instant::now()));
     }
     SHOWN.set(None);
 }
@@ -530,8 +641,15 @@ fn on_event(handle: Handle, event: Event) {
         Event::Pressed(SKIP) => Some(Command::Skip),
         Event::Pressed(SETTINGS) => Some(Command::Settings),
         Event::Pressed(QUIT) => Some(Command::Quit),
-        // Esc, or lost activation.
         Event::Close => None,
+        Event::Lost if OPEN.get() == Some(handle) => {
+            let mut at = POINT::default();
+            // SAFETY: a valid out-pointer.
+            let _ = unsafe { GetCursorPos(&mut at) };
+            lost(at);
+            return;
+        }
+        Event::Lost => None,
         _ => return,
     };
     if OPEN.get() == Some(handle) {

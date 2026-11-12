@@ -305,4 +305,7 @@ pub enum Event {
     Changed(Id, Value),
     /// Esc or × with no cancel button. The window stays until the caller closes it.
     Close,
+    /// A [`window::Frame::Popup`] lost activation: a click outside it, Alt+Tab, another
+    /// window coming up. The window stays until the caller closes it.
+    Lost,
 }

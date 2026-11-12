@@ -2,13 +2,17 @@
 //! the clicks that open and close the tray flyout ([`super::flyout`], issue #89).
 //!
 //! `tray-icon` runs on the app's own message loop and has no menu. A left or right click opens
-//! the flyout; a click while it is open closes it. `tray-icon` registers its icon at the legacy
-//! notify-icon version, at which Windows reports Enter, Space and the menu key on a focused icon
-//! (Win+B, then the arrows) as a right-button click too; such a click opens the flyout with the
-//! focus ring shown, since the pointer is not on the icon.
+//! the flyout; a click while it is open closes it. The icon's event handler does this itself,
+//! in `tray-icon`'s window procedure, so a click works at once also while a modal loop runs (a
+//! message box, a window being dragged), as a native tray menu does.
 //!
-//! What the user asks for, from the icon or from the flyout, waits in one queue as [`Command`]s
-//! for the main loop, which acts on them with nothing borrowed.
+//! `tray-icon` 0.26 does not set `NOTIFYICON_VERSION_4`, so `NIN_SELECT`, `NIN_KEYSELECT` and
+//! `WM_CONTEXTMENU` never come. At the legacy version Windows reports Enter, Space and the menu
+//! key on a focused icon (Win+B, then the arrows) as a right-button press and release; such a
+//! release opens the flyout with the focus ring shown, since the pointer is not on the icon.
+//!
+//! What the user picks in the flyout waits in a queue as [`Command`]s for the main loop, which
+//! acts on them with nothing borrowed.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -17,7 +21,7 @@ use std::error::Error;
 use breakpoint::core::quiet::SwitchItem;
 use breakpoint::core::scheduler::Prompt;
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use windows::Win32::Foundation::RECT;
+use windows::Win32::Foundation::{POINT, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON, SM_CYSMICON};
 
 use super::flyout;
@@ -27,15 +31,9 @@ const ON_ICON: u16 = 1;
 const QUIET_ICON: u16 = 2;
 const PENDING_ICON: u16 = 3;
 
-/// What the user asked for.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// What the user picked in the flyout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
-    /// A click on the icon: open the flyout next to `icon` (its rectangle on screen), or close
-    /// it if it is open. `keyboard` when it came from the keyboard rather than the pointer.
-    Toggle {
-        icon: RECT,
-        keyboard: bool,
-    },
     /// The flyout's Nudges switch (SPEC §7).
     Switch,
     Snooze,
@@ -47,8 +45,9 @@ pub enum Command {
 
 thread_local! {
     static COMMANDS: RefCell<VecDeque<Command>> = const { RefCell::new(VecDeque::new()) };
-    /// A press on the icon came while the flyout was open, or just after it closed: that
-    /// press closed it, so its release must not open it again.
+    /// The last press on the icon closed the flyout, so its release must not open it again.
+    /// Every press sets it afresh, so a press with no release (a drag of the icon) does not
+    /// eat a later click.
     static SWALLOW_RELEASE: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -86,12 +85,12 @@ impl Look {
     }
 }
 
-/// One press or release on the icon, as far as the flyout cares.
+/// One press or release on the icon at `icon` on screen, as far as the flyout cares.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Click {
     /// A button went down, or a double click's second press.
-    Press,
-    /// A button came up, at `icon` on screen; `keyboard` when the pointer was not on the icon.
+    Press { icon: RECT },
+    /// A button came up; `keyboard` when the pointer was not on the icon.
     Release { icon: RECT, keyboard: bool },
 }
 
@@ -106,53 +105,72 @@ impl Click {
                 ..
             } => (rect, position, *button_state == MouseButtonState::Up),
             TrayIconEvent::DoubleClick {
+                rect,
+                position,
                 button: MouseButton::Left | MouseButton::Right,
                 ..
-            } => return Some(Click::Press),
+            } => (rect, position, false),
             _ => return None,
         };
-        if !up {
-            return Some(Click::Press);
-        }
         let icon = RECT {
             left: rect.position.x.round() as i32,
             top: rect.position.y.round() as i32,
             right: rect.position.x.round() as i32 + rect.size.width as i32,
             bottom: rect.position.y.round() as i32 + rect.size.height as i32,
         };
-        let (x, y) = (position.x.round() as i32, position.y.round() as i32);
-        let on_icon = x >= icon.left && x < icon.right && y >= icon.top && y < icon.bottom;
+        if !up {
+            return Some(Click::Press { icon });
+        }
+        let at = POINT {
+            x: position.x.round() as i32,
+            y: position.y.round() as i32,
+        };
         Some(Click::Release {
             icon,
-            keyboard: !on_icon,
+            keyboard: !flyout::inside(&icon, at),
         })
     }
 }
 
-/// What a click does, given whether the flyout is open or has just closed (`busy`) and whether
-/// the press before it swallows its release. Returns the command to queue, if any, and whether
-/// the next release is swallowed.
+/// What a click on the icon does to the flyout.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Act {
+    Nothing,
+    Close,
+    Open { icon: RECT, keyboard: bool },
+}
+
+/// What `click` does, given whether the flyout is `open`, whether it closed just now because
+/// this same press took the activation away (`lost_here`), and whether the last press
+/// swallows this release. Returns the act and whether the next release is swallowed.
 ///
-/// A press on the icon while the flyout is open takes the activation away from it first, so
-/// the flyout has closed, or is about to, by the time the release comes: that release must
-/// not open it again. A release with no swallowing press toggles the flyout.
-fn on_click(click: Click, busy: bool, swallow: bool) -> (Option<Command>, bool) {
+/// A press on the icon takes the activation away from the flyout, so the flyout has closed by
+/// the time the press is reported, or is about to: the press closes it if it is still open,
+/// and its release must not open it again. A release with no swallowing press opens it.
+fn on_click(click: Click, open: bool, lost_here: bool, swallow: bool) -> (Act, bool) {
     match click {
-        Click::Press => (None, swallow || busy),
-        Click::Release { .. } if swallow => (None, false),
-        Click::Release { icon, keyboard } => (Some(Command::Toggle { icon, keyboard }), false),
+        Click::Press { .. } if open => (Act::Close, true),
+        Click::Press { .. } => (Act::Nothing, lost_here),
+        Click::Release { .. } if swallow => (Act::Nothing, false),
+        Click::Release { icon, keyboard } => (Act::Open { icon, keyboard }, false),
     }
 }
 
+/// The icon's event handler, run in `tray-icon`'s window procedure on the UI thread.
 fn on_event(event: TrayIconEvent) {
     let Some(click) = Click::of(&event) else {
         return;
     };
-    let busy = flyout::busy();
-    let (command, swallow) = on_click(click, busy, SWALLOW_RELEASE.get());
+    let lost_here = match click {
+        Click::Press { icon } => flyout::lost_at(&icon),
+        Click::Release { .. } => false,
+    };
+    let (act, swallow) = on_click(click, flyout::is_open(), lost_here, SWALLOW_RELEASE.get());
     SWALLOW_RELEASE.set(swallow);
-    if let Some(command) = command {
-        push(command);
+    match act {
+        Act::Nothing => {}
+        Act::Close => flyout::close(),
+        Act::Open { icon, keyboard } => flyout::open(icon, keyboard),
     }
 }
 
@@ -252,6 +270,11 @@ mod tests {
         right: 924,
         bottom: 764,
     };
+    const PRESS: Click = Click::Press { icon: ICON };
+    const OPEN: Act = Act::Open {
+        icon: ICON,
+        keyboard: false,
+    };
 
     fn release(keyboard: bool) -> Click {
         Click::Release {
@@ -262,52 +285,67 @@ mod tests {
 
     #[test]
     fn a_click_with_the_flyout_closed_opens_it() {
-        let (none, swallow) = on_click(Click::Press, false, false);
-        assert_eq!((none, swallow), (None, false));
+        let (act, swallow) = on_click(PRESS, false, false, false);
+        assert_eq!((act, swallow), (Act::Nothing, false));
         assert_eq!(
-            on_click(release(false), false, swallow),
-            (
-                Some(Command::Toggle {
-                    icon: ICON,
-                    keyboard: false
-                }),
-                false
-            )
+            on_click(release(false), false, false, swallow),
+            (OPEN, false)
         );
     }
 
     #[test]
-    fn a_click_that_closed_the_flyout_does_not_open_it_again() {
-        // The press took the activation away: the flyout closed just before it came.
-        let (none, swallow) = on_click(Click::Press, true, false);
-        assert_eq!((none, swallow), (None, true));
-        assert_eq!(on_click(release(false), false, swallow), (None, false));
-        // The next click opens it.
-        let (_, swallow) = on_click(Click::Press, false, false);
-        assert!(matches!(
-            on_click(release(false), false, swallow),
-            (Some(Command::Toggle { .. }), false)
-        ));
+    fn a_press_while_open_closes_it_and_its_release_does_nothing() {
+        let (act, swallow) = on_click(PRESS, true, false, false);
+        assert_eq!((act, swallow), (Act::Close, true));
+        assert_eq!(
+            on_click(release(false), false, false, swallow),
+            (Act::Nothing, false)
+        );
     }
 
     #[test]
-    fn a_double_click_toggles_once_per_release() {
-        // Press, release (opens), second press (closes it by activation), release.
-        let (_, s) = on_click(Click::Press, false, false);
-        let (open, s) = on_click(release(false), false, s);
-        assert!(open.is_some());
-        let (_, s) = on_click(Click::Press, true, s);
-        assert_eq!(on_click(release(false), false, s), (None, false));
+    fn a_press_that_took_the_activation_away_does_not_open_it_again() {
+        // The flyout closed on lost activation, at this icon, just before the press came.
+        let (act, swallow) = on_click(PRESS, false, true, false);
+        assert_eq!((act, swallow), (Act::Nothing, true));
+        assert_eq!(
+            on_click(release(false), false, false, swallow),
+            (Act::Nothing, false)
+        );
+    }
+
+    #[test]
+    fn a_press_with_no_release_eats_no_later_click() {
+        // A press that closed the flyout, then the icon dragged away: no release comes.
+        let (_, swallow) = on_click(PRESS, true, false, false);
+        assert!(swallow);
+        // The next click is a press of its own, which sets the swallow afresh.
+        let (_, swallow) = on_click(PRESS, false, false, swallow);
+        assert_eq!(
+            on_click(release(false), false, false, swallow),
+            (OPEN, false)
+        );
+    }
+
+    #[test]
+    fn a_double_click_opens_then_closes() {
+        let (_, s) = on_click(PRESS, false, false, false);
+        let (act, s) = on_click(release(false), false, false, s);
+        assert_eq!(act, OPEN);
+        // The second press closes it, or finds it closed by that press.
+        let (act, s) = on_click(PRESS, true, false, s);
+        assert_eq!(act, Act::Close);
+        assert_eq!(on_click(release(false), false, false, s).0, Act::Nothing);
     }
 
     #[test]
     fn a_keyboard_release_says_so() {
         assert_eq!(
-            on_click(release(true), false, false).0,
-            Some(Command::Toggle {
+            on_click(release(true), false, false, false).0,
+            Act::Open {
                 icon: ICON,
                 keyboard: true
-            })
+            }
         );
     }
 }

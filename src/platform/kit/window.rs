@@ -56,7 +56,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETOBJECT, WM_KEYDOWN, WM_KILLFOCUS,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE,
     WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_NCRBUTTONDOWN, WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE,
-    WM_SYSCOLORCHANGE, WM_SYSKEYDOWN, WM_THEMECHANGED, WM_TIMER, WNDCLASSEXW, WS_CAPTION,
+    WM_SYSCOLORCHANGE, WM_SYSKEYDOWN, WM_THEMECHANGED, WM_TIMER, WM_USER, WNDCLASSEXW, WS_CAPTION,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_SYSMENU,
 };
 use windows::core::{BOOL, HSTRING, PCWSTR, Result, w};
@@ -82,6 +82,8 @@ const POPUP_FLAT_CLASS: PCWSTR = w!("breakpoint.kit.popup.flat");
 const STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_CAPTION.0 | WS_SYSMENU.0);
 /// Runs the hover, press and knob timing, one repaint per [`FRAME`], while anything moves.
 const FRAME_TIMER: usize = 1;
+/// A popup lost activation; posted to itself, then handed on as [`Event::Lost`].
+const WM_LOST: u32 = WM_USER + 0x101;
 
 /// What kind of window holds the form.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1225,7 +1227,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     // it, Alt+Tab, another window coming up. Posted, so nothing is destroyed
                     // while Windows is still switching activation.
                     if with_host(hwnd, |h| h.frame) == Some(Frame::Popup) {
-                        let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                        let _ = PostMessageW(Some(hwnd), WM_LOST, WPARAM(0), LPARAM(0));
                     }
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -1425,6 +1427,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             WM_CLOSE => {
                 let events = with_host(hwnd, |h| vec![h.form.escape()]).unwrap_or_default();
                 emit(hwnd, events);
+                LRESULT(0)
+            }
+            WM_LOST => {
+                emit(hwnd, vec![Event::Lost]);
                 LRESULT(0)
             }
             WM_GETOBJECT => uia::get_object(hwnd, wparam, lparam, &KIT)

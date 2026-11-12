@@ -112,11 +112,10 @@ impl App {
         )
     }
 
-    /// Brings the open flyout up to date, if it is open.
+    /// Hands the flyout the content now: the open flyout shows it, and a click on the tray
+    /// icon opens the flyout with it, also while a modal loop runs.
     fn refresh_flyout(&self) {
-        if platform::flyout::is_open() {
-            platform::flyout::update(&self.flyout_content());
-        }
+        platform::flyout::show_content(self.flyout_content());
     }
 
     /// Applies the quiet rules as of the wall clock now (SPEC §7): an edge expires what is
@@ -289,17 +288,10 @@ impl App {
         self.refresh_flyout();
     }
 
-    /// Acts on the next thing the user asked for from the tray icon or the flyout: `None` when
+    /// Acts on the next thing the user picked in the tray flyout: `None` when
     /// nothing waits, `Some(false)` once the user chose Quit.
     fn tray_command(&mut self) -> Option<bool> {
         match self.tray.next_command()? {
-            Command::Toggle { icon, keyboard } => {
-                if platform::flyout::is_open() {
-                    platform::flyout::close();
-                } else {
-                    platform::flyout::open(&self.flyout_content(), icon, keyboard);
-                }
-            }
             // During first run the switch would save a config: it shows the wizard instead.
             Command::Switch if self.first_run.is_some() => self.open_settings(),
             Command::Switch => self.press_switch(),
@@ -423,8 +415,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        // Every command queued while that message ran, such as a click on the icon and then
-        // the flyout's own event.
+        // Every command the flyout queued while that message ran.
         let mut running = true;
         loop {
             let mut acted = None;

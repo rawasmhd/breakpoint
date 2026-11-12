@@ -585,9 +585,13 @@ fn the_window_is_a_borderless_popup_that_esc_and_lost_activation_close() {
     assert!(r.top >= work.top && r.bottom <= work.bottom);
     assert!(is_open());
 
+    LOST.set(None);
     send_key(hwnd, VK_ESCAPE.0);
     assert!(!is_open(), "Esc closes it");
-    assert!(busy(), "a press on the icon now is the one that closed it");
+    assert!(
+        !lost_at(&EVERYWHERE),
+        "after Esc, a click on the icon opens it again at once"
+    );
     assert_eq!(drain(), []);
 
     let handle = make(&c, some_icon()).unwrap();
@@ -602,7 +606,85 @@ fn the_window_is_a_borderless_popup_that_esc_and_lost_activation_close() {
     }
     pump(50);
     assert!(!is_open(), "losing activation closes it");
+    assert!(
+        lost_at(&EVERYWHERE),
+        "a press on the icon where the pointer was is the one that closed it"
+    );
     assert_eq!(drain(), []);
+    LOST.set(None);
+}
+
+/// A rectangle round every screen.
+const EVERYWHERE: RECT = RECT {
+    left: -100_000,
+    top: -100_000,
+    right: 100_000,
+    bottom: 100_000,
+};
+
+/// Only a press on the icon itself, soon after a click outside closed the flyout, is the
+/// press that closed it; a later one, or one elsewhere, is a click of its own.
+#[test]
+fn a_lost_close_counts_only_for_a_press_on_the_icon_soon_after() {
+    let icon = RECT {
+        left: 900,
+        top: 740,
+        right: 924,
+        bottom: 764,
+    };
+    let on_icon = POINT { x: 910, y: 750 };
+    LOST.set(Some((Instant::now(), on_icon)));
+    assert!(lost_at(&icon));
+    LOST.set(Some((Instant::now(), POINT { x: 500, y: 300 })));
+    assert!(!lost_at(&icon), "the click was elsewhere");
+    let long_ago = Instant::now() - Duration::from_secs(5);
+    LOST.set(Some((long_ago, on_icon)));
+    assert!(!lost_at(&icon), "too long ago");
+    LOST.set(None);
+    assert!(!lost_at(&icon));
+}
+
+#[test]
+fn the_watch_closes_on_a_press_outside_only() {
+    let flyout = RECT {
+        left: 600,
+        top: 300,
+        right: 920,
+        bottom: 526,
+    };
+    assert!(outside_press(true, POINT { x: 910, y: 750 }, &flyout));
+    assert!(!outside_press(true, POINT { x: 700, y: 400 }, &flyout));
+    assert!(!outside_press(false, POINT { x: 910, y: 750 }, &flyout));
+}
+
+/// A flyout that could not take the foreground is watched until it closes.
+#[test]
+fn the_watch_runs_while_the_flyout_is_open_and_stops_with_it() {
+    let c = samples()[0].1.clone();
+    make(&c, some_icon()).unwrap();
+    watch();
+    assert_ne!(WATCH.get(), 0);
+    // A tick with no button down leaves it open.
+    pump(80);
+    if unsafe { GetAsyncKeyState(VK_LBUTTON.0.into()) } >= 0 {
+        assert!(is_open());
+    }
+    close();
+    assert_eq!(WATCH.get(), 0);
+    assert!(!is_open());
+}
+
+/// The icon opens the flyout with the app's latest content, and nothing before there is any.
+#[test]
+fn the_latest_content_is_what_a_click_opens_with() {
+    LATEST.set(None);
+    open(some_icon(), false);
+    assert!(!is_open(), "no content yet");
+    let c = samples()[0].1.clone();
+    show_content(c.clone());
+    assert_eq!(LATEST.with_borrow(Clone::clone), Some(c));
+    assert!(!is_open(), "handing content opens nothing");
+    LATEST.set(None);
 }
 
 #[test]
@@ -739,7 +821,8 @@ fn live() {
             bottom: bar.bottom - 96,
         },
     };
-    open(&samples()[1].1, icon, true);
+    show_content(samples()[1].1.clone());
+    open(icon, true);
     pump(400);
     let handle = OPEN.get().unwrap();
     let r = handle.window_rect();
