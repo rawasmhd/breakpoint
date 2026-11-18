@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use breakpoint::core::config::{self, Config};
 use breakpoint::core::log::Today;
-use breakpoint::core::presence::{POLL_EVERY, Presence, Tracker};
+use breakpoint::core::presence::{POLL_EVERY, Tracker};
 use breakpoint::core::quiet::Quiet;
 use breakpoint::core::scheduler::{Effect, Scheduler, away_left};
 use breakpoint::core::settings::{self, Form};
@@ -19,7 +19,7 @@ use breakpoint::core::wizard::Picks;
 use platform::dialogs::{WM_OPEN_SETTINGS, WM_WIZARD_DONE, WizardDone};
 use platform::log::Log;
 use platform::popup::{Popup, WM_POPUP_SKIP, WM_POPUP_SNOOZE};
-use platform::presence::{Listener, Vetoes};
+use platform::presence::Listener;
 use platform::settings_window::{Saved, WM_SETTINGS_CANCELLED, WM_SETTINGS_SAVED};
 use platform::tray::{Command, Tray};
 use windows::Win32::Foundation::{
@@ -60,9 +60,6 @@ struct App {
     scheduler: Scheduler,
     popup: Popup,
     presence: Tracker,
-    vetoes: Vetoes,
-    /// What the last poll said, which holds the popup's countdown under a veto.
-    last_presence: Presence,
     tray: Tray,
     log: Log,
     today: Today,
@@ -85,8 +82,7 @@ impl App {
             let at = at.saturating_duration_since(self.started);
             self.presence.signal(at, last_input, signal);
         }
-        let presence = self.presence.poll(now, last_input, &mut self.vetoes);
-        self.last_presence = presence;
+        let presence = self.presence.poll(now, last_input);
         // During first run no clock runs: the first poll after it starts them from zero.
         if self.first_run.is_none() {
             let effects = self.scheduler.poll(now, presence);
@@ -253,8 +249,7 @@ impl App {
     /// The away time an occurrence of `length` still needs as of now (SPEC §6).
     fn countdown(&self, length: Duration) -> Duration {
         let now = self.now();
-        let held = self.last_presence == Presence::AtDesk;
-        away_left(length, now, platform::presence::last_input(now), held)
+        away_left(length, now, platform::presence::last_input(now))
     }
 
     fn tick_countdown(&mut self) {
@@ -354,8 +349,6 @@ fn run() -> Result<(), Box<dyn Error>> {
         first_run,
         popup,
         presence: Tracker::new(),
-        vetoes: Vetoes::default(),
-        last_presence: Presence::Active,
         tray: Tray::new()?,
         log,
         today,
