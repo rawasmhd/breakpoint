@@ -1,4 +1,4 @@
-//! GetLastInputInfo, vetoes, and session and power notifications.
+//! GetLastInputInfo, and session and power notifications.
 //!
 //! Events arrive at [`Listener`], a hidden top-level window rather than a message-only one:
 //! message-only windows get no broadcasts, and the suspend and resume `WM_POWERBROADCAST`s are
@@ -8,20 +8,14 @@
 //! of being lost.
 
 use std::cell::{Cell, RefCell};
-use std::ffi::c_void;
 use std::time::{Duration, Instant};
 
-use breakpoint::core::presence::{self, Signal};
-use windows::Media::Control::{
-    GlobalSystemMediaTransportControlsSessionManager as MediaManager,
-    GlobalSystemMediaTransportControlsSessionPlaybackStatus as PlaybackStatus,
-};
+use breakpoint::core::presence::Signal;
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Power::{
-    CallNtPowerInformation, ES_DISPLAY_REQUIRED, EXECUTION_STATE, HPOWERNOTIFY,
-    POWERBROADCAST_SETTING, PowerUserPresent, RegisterPowerSettingNotification,
-    SystemExecutionState, UnregisterPowerSettingNotification,
+    HPOWERNOTIFY, POWERBROADCAST_SETTING, PowerUserPresent, RegisterPowerSettingNotification,
+    UnregisterPowerSettingNotification,
 };
 use windows::Win32::System::RemoteDesktop::{
     NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
@@ -31,9 +25,6 @@ use windows::Win32::System::SystemServices::{
     GUID_SESSION_DISPLAY_STATUS, GUID_SESSION_USER_PRESENCE, PowerMonitorOff, PowerMonitorOn,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
-use windows::Win32::UI::Shell::{
-    QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState,
-};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DEVICE_NOTIFY_WINDOW_HANDLE, DefWindowProcW, DestroyWindow, KillTimer,
     PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PBT_POWERSETTINGCHANGE,
@@ -59,63 +50,6 @@ pub fn last_input(now: Duration) -> Duration {
         GetTickCount().wrapping_sub(info.dwTime)
     };
     now.saturating_sub(Duration::from_millis(idle_ms.into()))
-}
-
-/// The vetoes of SPEC §4, asked by the core only once input has stopped long enough.
-#[derive(Default)]
-pub struct Vetoes {
-    /// The media-controls manager, kept after the first request succeeds.
-    media: Option<MediaManager>,
-}
-
-impl presence::Vetoes for Vetoes {
-    fn shell_busy(&mut self) -> bool {
-        // SAFETY: no arguments.
-        let state = unsafe { SHQueryUserNotificationState() };
-        matches!(
-            state,
-            Ok(QUNS_BUSY | QUNS_RUNNING_D3D_FULL_SCREEN | QUNS_PRESENTATION_MODE)
-        )
-    }
-
-    fn display_required(&mut self) -> bool {
-        let mut state = EXECUTION_STATE(0);
-        // SAFETY: the output buffer is one EXECUTION_STATE (a ULONG), as SystemExecutionState
-        // fills, and its size is passed with it.
-        let status = unsafe {
-            CallNtPowerInformation(
-                SystemExecutionState,
-                None,
-                0,
-                Some(&mut state as *mut EXECUTION_STATE as *mut c_void),
-                size_of::<EXECUTION_STATE>() as u32,
-            )
-        };
-        status.is_ok() && state.contains(ES_DISPLAY_REQUIRED)
-    }
-
-    fn media_playing(&mut self) -> Option<bool> {
-        self.any_media_playing().ok()
-    }
-}
-
-impl Vetoes {
-    /// Whether any session in the Global System Media Transport Controls is playing.
-    fn any_media_playing(&mut self) -> Result<bool> {
-        let manager = match &self.media {
-            Some(manager) => manager.clone(),
-            None => self
-                .media
-                .insert(MediaManager::RequestAsync()?.join()?)
-                .clone(),
-        };
-        for session in manager.GetSessions()? {
-            if session.GetPlaybackInfo()?.PlaybackStatus()? == PlaybackStatus::Playing {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
 }
 
 const RETRY_TIMER: usize = 1;

@@ -656,14 +656,10 @@ impl Scheduler {
 }
 
 /// The popup's live countdown (SPEC §6): how much longer the user must stay away, measured from
-/// the last input, for an occurrence of `length` to count. Held at the full length while a veto
-/// explains the silence (`held`); it restarts on any input because `last_input` moves.
-pub fn away_left(length: Duration, now: Duration, last_input: Duration, held: bool) -> Duration {
-    if held {
-        length
-    } else {
-        length.saturating_sub(now.saturating_sub(last_input))
-    }
+/// the last input, for an occurrence of `length` to count. It restarts on any input because
+/// `last_input` moves.
+pub fn away_left(length: Duration, now: Duration, last_input: Duration) -> Duration {
+    length.saturating_sub(now.saturating_sub(last_input))
 }
 
 /// The countdown line, e.g. "Away 1:59 more and it counts", in whole seconds rounded up.

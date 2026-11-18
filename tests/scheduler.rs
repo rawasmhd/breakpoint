@@ -13,13 +13,13 @@ const MIN: Duration = Duration::from_secs(60);
 const SEC: Duration = Duration::from_secs(1);
 
 /// A fake clock and presence feed: polls the scheduler every [`POLL_EVERY`] like the platform,
-/// with the user either at the keyboard, gone, or in a state that an event or a veto decides,
+/// with the user either at the keyboard, gone, or in a state that an event decides,
 /// and records what came out and when.
 struct Sim {
     sched: Scheduler,
     now: Duration,
     last_input: Duration,
-    /// A presence that events or vetoes decide, in force instead of the input-only verdict.
+    /// A presence that events decide, in force instead of the input-only verdict.
     held: Option<Presence>,
     effects: Vec<(Duration, Effect)>,
 }
@@ -627,20 +627,6 @@ fn windows_user_inactive_verdict_satisfies_only_after_the_length() {
             satisfied(Nudge::Stand, 1, SatisfyCause::Away),
             Effect::Close
         ]
-    );
-}
-
-#[test]
-fn at_desk_counts_as_active_time_and_never_satisfies() {
-    let mut sim = Sim::new();
-    sim.work(10 * MIN);
-    // A video plays with no input: present, not typing.
-    sim.hold(Presence::AtDesk, 30 * MIN);
-    assert_eq!(sim.fired_at(Nudge::Stand), [30 * MIN]);
-    assert_eq!(
-        sim.pending_occ(Nudge::Stand),
-        Some(1),
-        "satisfied while AtDesk"
     );
 }
 
@@ -1417,19 +1403,11 @@ fn a_water_due_later_does_not_join_a_firm_repeat() {
 #[test]
 fn the_countdown_runs_from_the_last_input_and_restarts_on_input() {
     let length = 2 * MIN;
-    assert_eq!(away_left(length, 100 * SEC, 100 * SEC, false), 2 * MIN);
-    assert_eq!(away_left(length, 101 * SEC, 100 * SEC, false), 119 * SEC);
-    assert_eq!(
-        away_left(length, 400 * SEC, 100 * SEC, false),
-        Duration::ZERO
-    );
+    assert_eq!(away_left(length, 100 * SEC, 100 * SEC), 2 * MIN);
+    assert_eq!(away_left(length, 101 * SEC, 100 * SEC), 119 * SEC);
+    assert_eq!(away_left(length, 400 * SEC, 100 * SEC), Duration::ZERO);
     // New input moves the last input, so it starts over.
-    assert_eq!(away_left(length, 400 * SEC, 390 * SEC, false), 110 * SEC);
-}
-
-#[test]
-fn the_countdown_holds_at_the_full_length_under_a_veto() {
-    assert_eq!(away_left(5 * MIN, 400 * SEC, 100 * SEC, true), 5 * MIN);
+    assert_eq!(away_left(length, 400 * SEC, 390 * SEC), 110 * SEC);
 }
 
 #[test]
