@@ -19,7 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{HSTRING, w};
 
-use super::kit::window::{self, Handle, Spec};
+use super::kit::window::{self, Frame, Handle, Spec};
 use super::kit::{Aside, ButtonKind, Event, Id, Ink, Item, Kind, Place, Value};
 use super::paint::Box2;
 use super::settings_window;
@@ -253,7 +253,7 @@ pub(super) fn items(picks: &Picks) -> Vec<Item> {
     add(
         FIXED,
         Place::new(PAD, y, WIDTH - 2 * PAD, ROW_NOTED),
-        Kind::Card { rows: Vec::new() },
+        Kind::card(Vec::new()),
     );
     let line = y + SPACE_3;
     add(
@@ -309,6 +309,7 @@ pub(super) fn items(picks: &Picks) -> Vec<Item> {
             kind: ButtonKind::Primary,
             default: true,
             cancel: true,
+            icon: None,
         },
     );
     out
@@ -337,6 +338,7 @@ fn create(picks: &Picks, at: Option<POINT>) -> Option<Handle> {
         at,
         // No owner, so the window has its own taskbar button.
         owner: None,
+        frame: Frame::Dialog,
     };
     let handle = window::open(spec, on_event).ok()?;
     WIZARD.set(Some(handle));

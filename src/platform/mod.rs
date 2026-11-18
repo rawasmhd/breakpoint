@@ -2,6 +2,7 @@
 
 pub mod clock;
 pub mod dialogs;
+pub mod flyout;
 // The form kit. Part of its API has no caller yet: ghost buttons, `set_text` and `fit`, and
 // `focused`, which UI Automation (#80) will use.
 #[allow(dead_code)]

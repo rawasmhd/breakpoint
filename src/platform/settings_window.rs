@@ -25,7 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::HSTRING;
 
 use super::dialogs::{numbers_line, profile_name};
-use super::kit::window::{self, Handle, Spec};
+use super::kit::window::{self, Frame, Handle, Spec};
 use super::kit::{ButtonKind, Entry, Event, Id, Ink, Item, Kind, Place, Value};
 use super::paint::Glyph;
 use super::theme::{
@@ -171,7 +171,7 @@ impl Builder {
         self.add(
             FIXED,
             Place::new(PAD, top, WIDTH - 2 * PAD, height),
-            Kind::Card { rows },
+            Kind::card(rows),
         );
         *y = top + height;
         top
@@ -408,6 +408,7 @@ pub(super) fn items(form: &Form, start_with_windows: bool) -> Vec<Item> {
             kind: ButtonKind::Primary,
             default: true,
             cancel: false,
+            icon: None,
         },
     );
     b.add(
@@ -418,6 +419,7 @@ pub(super) fn items(form: &Form, start_with_windows: bool) -> Vec<Item> {
             kind: ButtonKind::Secondary,
             default: false,
             cancel: true,
+            icon: None,
         },
     );
     b.0
@@ -449,6 +451,7 @@ fn create(form: &Form, start_with_windows: bool, at: Option<POINT>) -> Option<Ha
         at,
         // No owner, so the window has its own taskbar button.
         owner: None,
+        frame: Frame::Dialog,
     };
     let handle = window::open(spec, on_event).ok()?;
     OPEN.set(Some(handle));
@@ -486,7 +489,7 @@ fn on_event(handle: Handle, event: Event) {
         Event::Pressed(CANCEL) | Event::Close => cancel(handle),
         Event::Changed(PROFILE, Value::Index(Some(k))) => pick_profile(handle, k),
         Event::Changed(..) => show_profile(handle),
-        Event::Pressed(_) => {}
+        Event::Pressed(_) | Event::Lost => {}
     }
 }
 

@@ -185,12 +185,6 @@ impl Today {
             (0, 0)
         }
     }
-
-    /// The tray line, exactly `Today: 7 taken, 2 skipped`, with no plural changes.
-    pub fn text(&self, now: LocalTime) -> String {
-        let (taken, skipped) = self.counts(now);
-        format!("Today: {taken} taken, {skipped} skipped")
-    }
 }
 
 fn is_file_name(name: &str) -> bool {

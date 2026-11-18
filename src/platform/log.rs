@@ -121,7 +121,7 @@ mod tests {
         // Stand/Move 7 fired in October.
         let (last, today) = log.start(november);
         assert_eq!(last, 7);
-        assert_eq!(today.text(november), "Today: 0 taken, 0 skipped");
+        assert_eq!(today.counts(november), (0, 0));
         let _ = fs::remove_dir_all(dir.parent().unwrap());
     }
 
@@ -132,6 +132,6 @@ mod tests {
         let now = at("2026-11-02T09:00:00+03:00");
         let (last, today) = log.start(now);
         assert_eq!(last, 0);
-        assert_eq!(today.text(now), "Today: 0 taken, 0 skipped");
+        assert_eq!(today.counts(now), (0, 0));
     }
 }

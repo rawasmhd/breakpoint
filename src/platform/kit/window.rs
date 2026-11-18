@@ -3,6 +3,10 @@
 //!
 //! - Frame: `WS_CAPTION | WS_SYSMENU`, the app icon, no resize. DWM tints the caption to the
 //!   theme (`DWMWA_USE_IMMERSIVE_DARK_MODE`; on Windows 11 the caption, text and border colours).
+//! - Or [`Frame::Popup`] (issue #89, the tray flyout): `WS_POPUP`, no caption and no frame,
+//!   topmost and off the taskbar, on a `surface-raised` ground, with round corners
+//!   (`DWMWCP_ROUND`) and the system shadow, or a painted `line` outline where DWM gives no round
+//!   corners (Windows 10). It closes when it loses activation: it asks to close as Esc does.
 //! - Theme: [`theme::app_theme`], read again on `WM_SETTINGCHANGE`; high contrast paints with the
 //!   system colours ([`Colours::now`]) and no menu shadow.
 //! - DPI: PerMonitorV2. `WM_DPICHANGED` lays the form out again and resizes the window to fit.
@@ -43,17 +47,17 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DROPSHADOW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect,
     GetCursorPos, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, HICON, IDC_ARROW, IMAGE_ICON,
-    IsWindow, KillTimer, LR_DEFAULTCOLOR, LoadCursorW, LoadImageW, MA_NOACTIVATE, RegisterClassExW,
-    SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, SPI_GETWHEELSCROLLLINES, SPI_SETWORKAREA,
-    SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    SystemParametersInfoW, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE,
-    WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENTERSIZEMOVE,
-    WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETOBJECT, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCDESTROY,
-    WM_NCLBUTTONDOWN, WM_NCRBUTTONDOWN, WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE,
-    WM_SYSKEYDOWN, WM_THEMECHANGED, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU,
+    IsWindow, KillTimer, LR_DEFAULTCOLOR, LoadCursorW, LoadImageW, MA_NOACTIVATE, PostMessageW,
+    RegisterClassExW, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, SPI_GETWHEELSCROLLLINES,
+    SPI_SETWORKAREA, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, SystemParametersInfoW, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_ACTIVATE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETOBJECT, WM_KEYDOWN, WM_KILLFOCUS,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE,
+    WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_NCRBUTTONDOWN, WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE,
+    WM_SYSCOLORCHANGE, WM_SYSKEYDOWN, WM_THEMECHANGED, WM_TIMER, WM_USER, WNDCLASSEXW, WS_CAPTION,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_SYSMENU,
 };
 use windows::core::{BOOL, HSTRING, PCWSTR, Result, w};
 
@@ -63,7 +67,7 @@ use super::uia;
 use super::{Event, Id, Item, Value};
 use crate::platform::paint::{self, FRAME, HOVER, REST, step_fill};
 use crate::platform::theme::{
-    self, Colours, FontCache, Fonts, MENU_GAP, SCROLL_LINE, SCROLL_ROOM, Theme, px,
+    self, Colours, FontCache, Fonts, HAIRLINE, MENU_GAP, SCROLL_LINE, SCROLL_ROOM, Theme, px,
 };
 
 /// The app icon in the caption and on the taskbar (`build.rs` embeds it as icon 1).
@@ -72,9 +76,41 @@ const CLASS: PCWSTR = w!("breakpoint.kit");
 const MENU_CLASS: PCWSTR = w!("breakpoint.kit.menu");
 /// The menu class without the drop shadow, for high contrast.
 const MENU_FLAT_CLASS: PCWSTR = w!("breakpoint.kit.menu.flat");
+/// The borderless popup's classes: with the system shadow, and without it for high contrast.
+const POPUP_CLASS: PCWSTR = w!("breakpoint.kit.popup");
+const POPUP_FLAT_CLASS: PCWSTR = w!("breakpoint.kit.popup.flat");
 const STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_CAPTION.0 | WS_SYSMENU.0);
 /// Runs the hover, press and knob timing, one repaint per [`FRAME`], while anything moves.
 const FRAME_TIMER: usize = 1;
+/// A popup lost activation; posted to itself, then handed on as [`Event::Lost`].
+const WM_LOST: u32 = WM_USER + 0x101;
+
+/// What kind of window holds the form.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Frame {
+    /// A dialog: the system caption and frame on a `surface` ground.
+    #[default]
+    Dialog,
+    /// A borderless popup on a `surface-raised` ground that closes when it loses activation,
+    /// as a menu does: the tray flyout (issue #89). Its caption names it to screen readers only.
+    Popup,
+}
+
+impl Frame {
+    fn style(self) -> WINDOW_STYLE {
+        match self {
+            Frame::Dialog => STYLE,
+            Frame::Popup => WS_POPUP,
+        }
+    }
+
+    fn ex_style(self) -> WINDOW_EX_STYLE {
+        match self {
+            Frame::Dialog => WINDOW_EX_STYLE(0),
+            Frame::Popup => WINDOW_EX_STYLE(WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0),
+        }
+    }
+}
 
 /// A form window to open: its caption, its client size at 96 DPI, its items, and where it goes.
 pub struct Spec {
@@ -89,12 +125,16 @@ pub struct Spec {
     /// window would not fit there. `None` centres it on the primary monitor's work area.
     pub at: Option<POINT>,
     pub owner: Option<HWND>,
+    pub frame: Frame,
 }
 
 type Callback = Box<dyn FnMut(Handle, Event)>;
 
 struct Host {
     form: Form,
+    frame: Frame,
+    /// A popup with no DWM round corners (Windows 10) paints its own `line` outline.
+    outline: bool,
     /// Client size at 96 DPI, then in pixels at the form's DPI.
     size: (i32, i32),
     client: (i32, i32),
@@ -134,7 +174,7 @@ impl Host {
         let fonts = self.fonts.at(dpi);
         with_screen_measure(fonts, |m| self.form.lay_out(dpi, m));
         let (w, full) = (px(self.size.0, dpi), self.form.height(self.size.1));
-        let frame = window_size((w, full), dpi).1 - full;
+        let frame = frame_size(self.frame, (w, full), dpi).1 - full;
         // The same place in the form across a DPI change.
         let offset = self.scroll.offset() * dpi as i32 / before.max(1) as i32;
         self.scroll = Scroll::new(full, self.form.footer(), work.bottom - work.top - frame);
@@ -170,6 +210,14 @@ impl Host {
         self.theme = theme::app_theme();
         self.high_contrast = theme::high_contrast();
         self.colours = Colours::now(self.theme);
+    }
+
+    /// The window's ground: `surface` for a dialog, `surface-raised` for a popup.
+    fn ground(&self) -> windows::Win32::Foundation::COLORREF {
+        match self.frame {
+            Frame::Dialog => self.colours.ground,
+            Frame::Popup => self.colours.raised,
+        }
     }
 }
 
@@ -305,18 +353,50 @@ impl Handle {
     /// that alter text, such as a new work-week line in the wizard.
     pub fn fit(self) {
         let work = work_area(self.0);
-        let Some((client, dpi)) = with_host(self.0, |h| {
+        let Some((client, dpi, frame)) = with_host(self.0, |h| {
             let dpi = h.form.dpi();
-            (h.relayout(dpi, work), dpi)
+            (h.relayout(dpi, work), dpi, h.frame)
         }) else {
             return;
         };
-        let (w, h) = window_size(client, dpi);
+        let (w, h) = frame_size(frame, client, dpi);
         let now = self.window_rect();
         let (x, y) = keep_inside(now.left, now.top, w, h, work);
         // SAFETY: no state borrow is held.
         unsafe { move_to(self.0, rect(x, y, w, h)) };
         refresh(self.0);
+    }
+
+    /// Moves the window's top-left corner to (`x`, `y`) on screen, keeping its size.
+    pub fn move_to(self, x: i32, y: i32) {
+        // SAFETY: no pointers; a stale handle fails harmlessly.
+        let _ = unsafe {
+            SetWindowPos(
+                self.0,
+                None,
+                x,
+                y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        };
+    }
+
+    /// Changes a [`super::Kind::Spans`] line, such as a live countdown, and fits the window.
+    pub fn set_spans(self, id: Id, spans: Vec<super::Span>) -> bool {
+        let done = with_host(self.0, |h| h.form.set_spans(id, spans)).unwrap_or(false);
+        self.fit();
+        done
+    }
+
+    /// Puts `items` in place of the form's, as [`Form::replace`] does, and fits the window.
+    /// The open drop-down menu closes.
+    pub fn replace(self, items: Vec<Item>) {
+        close_menu(self.0);
+        with_host(self.0, |h| h.form = Form::replace(&h.form, items));
+        self.fit();
+        repoint(self.0);
     }
 
     /// Gives the window the keyboard focus, moves it to item `id`, scrolls it into view and
@@ -416,6 +496,20 @@ fn register() {
                 ..Default::default()
             });
             for (class, style) in [
+                (POPUP_CLASS, CS_DROPSHADOW),
+                (POPUP_FLAT_CLASS, Default::default()),
+            ] {
+                RegisterClassExW(&WNDCLASSEXW {
+                    cbSize: size_of::<WNDCLASSEXW>() as u32,
+                    style,
+                    lpfnWndProc: Some(wndproc),
+                    hInstance: instance,
+                    hCursor: cursor,
+                    lpszClassName: class,
+                    ..Default::default()
+                });
+            }
+            for (class, style) in [
                 (MENU_CLASS, CS_DROPSHADOW),
                 (MENU_FLAT_CLASS, Default::default()),
             ] {
@@ -439,14 +533,19 @@ pub fn open(spec: Spec, on_event: impl FnMut(Handle, Event) + 'static) -> Result
     register();
     let theme = theme::app_theme();
     let at = spec.at.unwrap_or_default();
+    let class = match spec.frame {
+        Frame::Dialog => CLASS,
+        Frame::Popup if theme::high_contrast() => POPUP_FLAT_CLASS,
+        Frame::Popup => POPUP_CLASS,
+    };
     // SAFETY: plain Win32 window creation; the state box lives until WM_NCDESTROY.
     unsafe {
         let instance = GetModuleHandleW(None)?;
         let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            CLASS,
+            spec.frame.ex_style(),
+            class,
             &HSTRING::from(spec.caption.as_str()),
-            STYLE,
+            spec.frame.style(),
             at.x,
             at.y,
             0,
@@ -458,6 +557,8 @@ pub fn open(spec: Spec, on_event: impl FnMut(Handle, Event) + 'static) -> Result
         )?;
         let host = Box::new(RefCell::new(Host {
             form: Form::new(spec.items),
+            frame: spec.frame,
+            outline: false,
             size: (spec.width, spec.height),
             client: (0, 0),
             theme,
@@ -481,7 +582,7 @@ pub fn open(spec: Spec, on_event: impl FnMut(Handle, Event) + 'static) -> Result
         let dpi = GetDpiForWindow(hwnd);
         let work = work_area(hwnd);
         let client = with_host(hwnd, |h| h.relayout(dpi, work)).unwrap_or_default();
-        let (w, h) = window_size(client, dpi);
+        let (w, h) = frame_size(spec.frame, client, dpi);
         let (x, y) = match spec.at {
             Some(p) => keep_inside(p.x, p.y, w, h, work),
             None => (
@@ -504,11 +605,18 @@ fn keep_inside(x: i32, y: i32, w: i32, h: i32, work: RECT) -> (i32, i32) {
     )
 }
 
-/// The window size for a client area of `client` pixels at `dpi`.
+/// The dialog window size for a client area of `client` pixels at `dpi`.
 pub(crate) fn window_size(client: (i32, i32), dpi: u32) -> (i32, i32) {
+    frame_size(Frame::Dialog, client, dpi)
+}
+
+/// The window size for a client area of `client` pixels at `dpi` in `frame`. A popup has no
+/// frame: its window is its client area.
+fn frame_size(frame: Frame, client: (i32, i32), dpi: u32) -> (i32, i32) {
     let mut r = rect(0, 0, client.0, client.1);
     // SAFETY: `r` is a valid in-out pointer.
-    let _ = unsafe { AdjustWindowRectExForDpi(&mut r, STYLE, false, WINDOW_EX_STYLE(0), dpi) };
+    let _ =
+        unsafe { AdjustWindowRectExForDpi(&mut r, frame.style(), false, frame.ex_style(), dpi) };
     (r.right - r.left, r.bottom - r.top)
 }
 
@@ -539,16 +647,16 @@ fn work_of(monitor: HMONITOR) -> RECT {
 /// area, since it is as tall as the work area and Save is at its bottom.
 fn refit(hwnd: HWND) {
     let work = work_area(hwnd);
-    let Some((client, before, dpi, scrolls)) = with_host(hwnd, |h| {
+    let Some((client, before, dpi, scrolls, frame)) = with_host(hwnd, |h| {
         let (before, dpi) = (h.client, h.form.dpi());
         let client = h.relayout(dpi, work);
-        (client, before, dpi, h.scroll.scrolls())
+        (client, before, dpi, h.scroll.scrolls(), h.frame)
     }) else {
         return;
     };
     if client != before || scrolls {
         close_menu(hwnd);
-        let (w, h) = window_size(client, dpi);
+        let (w, h) = frame_size(frame, client, dpi);
         let mut now = RECT::default();
         // SAFETY: a valid out-pointer.
         let _ = unsafe { GetWindowRect(hwnd, &mut now) };
@@ -593,11 +701,41 @@ fn repoint(hwnd: HWND) {
 }
 
 /// Tints the frame to the theme: dark mode, then on Windows 11 the caption, its text and the
-/// border. High contrast leaves the frame to Windows.
+/// border. High contrast leaves the frame to Windows. A popup asks for round corners and a
+/// `line` border instead, and paints its own outline where it gets no round corners.
 fn apply_frame(hwnd: HWND) {
-    let Some((theme, hc, c)) = with_host(hwnd, |h| (h.theme, h.high_contrast, h.colours)) else {
+    let Some((theme, hc, c, frame)) =
+        with_host(hwnd, |h| (h.theme, h.high_contrast, h.colours, h.frame))
+    else {
         return;
     };
+    if frame == Frame::Popup {
+        // SAFETY: each value lives through its call and has the size given.
+        let round = unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                &DWMWCP_ROUND as *const _ as _,
+                size_of_val(&DWMWCP_ROUND) as u32,
+            )
+        };
+        let border = if hc {
+            DWMWA_COLOR_DEFAULT
+        } else {
+            c.hairline.0
+        };
+        // SAFETY: as above.
+        let _ = unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_BORDER_COLOR,
+                &border as *const u32 as _,
+                size_of::<u32>() as u32,
+            )
+        };
+        with_host(hwnd, |h| h.outline = round.is_err());
+        return;
+    }
     let dark = BOOL::from(theme == Theme::Dark && !hc);
     // SAFETY: each value lives through its call and has the size given. Windows 10 does not
     // know the colour attributes and says no, which is fine.
@@ -750,6 +888,8 @@ fn paint(hwnd: HWND) {
             let dpi = h.form.dpi();
             let (w, ht) = h.client;
             let c = h.colours;
+            let ground = h.ground();
+            let outline = h.outline;
             let looks = h.form.looks();
             let scroll = h.scroll;
             let thumb = scroll.thumb(w, dpi, h.bar_level);
@@ -769,8 +909,13 @@ fn paint(hwnd: HWND) {
                     },
                 );
             } else {
-                draw::buffered(dc, w, ht, c.ground, fonts, dpi, |canvas, m, runs| {
+                draw::buffered(dc, w, ht, ground, fonts, dpi, |canvas, m, runs| {
                     draw::paint_form(canvas, form, &looks, &c, m, runs);
+                    if outline {
+                        let hair = px(HAIRLINE, dpi) as f32;
+                        let edge = paint::Box2::from(rect(0, 0, w, ht));
+                        canvas.stroke_round_rect(c.hairline, edge, 0.0, hair);
+                    }
                 });
             }
         });
@@ -1078,6 +1223,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             WM_ACTIVATE => {
                 if (wparam.0 & 0xffff) as u32 == WA_INACTIVE {
                     close_menu(hwnd);
+                    // A popup closes when it loses activation, as a menu does: a click outside
+                    // it, Alt+Tab, another window coming up. Posted, so nothing is destroyed
+                    // while Windows is still switching activation.
+                    if with_host(hwnd, |h| h.frame) == Some(Frame::Popup) {
+                        let _ = PostMessageW(Some(hwnd), WM_LOST, WPARAM(0), LPARAM(0));
+                    }
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
@@ -1255,10 +1406,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // as tall as the work area, moves inside it, so Save is not under the taskbar.
                 let work = work_of(MonitorFromRect(&suggested, MONITOR_DEFAULTTONEAREST));
                 let fitted = with_host(hwnd, |h| {
-                    (h.relayout(dpi, work), h.scroll.scrolls() && !h.sizing)
+                    (
+                        h.relayout(dpi, work),
+                        h.scroll.scrolls() && !h.sizing,
+                        h.frame,
+                    )
                 });
-                if let Some((client, inside_work)) = fitted {
-                    let (w, h) = window_size(client, dpi);
+                if let Some((client, inside_work, frame)) = fitted {
+                    let (w, h) = frame_size(frame, client, dpi);
                     let (x, y) = if inside_work {
                         keep_inside(suggested.left, suggested.top, w, h, work)
                     } else {
@@ -1272,6 +1427,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             WM_CLOSE => {
                 let events = with_host(hwnd, |h| vec![h.form.escape()]).unwrap_or_default();
                 emit(hwnd, events);
+                LRESULT(0)
+            }
+            WM_LOST => {
+                emit(hwnd, vec![Event::Lost]);
                 LRESULT(0)
             }
             WM_GETOBJECT => uia::get_object(hwnd, wparam, lparam, &KIT)
@@ -1327,6 +1486,7 @@ mod tests {
             items: vec![Item::new(7, Place::at(8, 8), Kind::Switch { on: false })],
             at: Some(POINT { x: 0, y: 0 }),
             owner: None,
+            frame: Frame::Dialog,
         };
         let space = |hwnd: HWND| unsafe {
             SendMessageW(
@@ -1411,6 +1571,7 @@ mod tests {
                 kind: ButtonKind::Primary,
                 default: true,
                 cancel: true,
+                icon: None,
             },
         ));
         Spec {
@@ -1420,6 +1581,7 @@ mod tests {
             items,
             at: None,
             owner: None,
+            frame: Frame::Dialog,
         }
     }
 

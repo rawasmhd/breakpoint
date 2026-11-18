@@ -2,7 +2,8 @@
 //!
 //! Nudges fire only inside work hours on a work day; every other moment is quiet. The user can
 //! turn breakpoint Off until the next work day's start, or on for Overtime until midnight. The
-//! tray's top item, tooltip and icon come from one table, [`switch_item`].
+//! tray flyout's status line and Nudges switch, the tooltip and the icon come from one table,
+//! [`switch_item`].
 
 use std::time::Duration;
 
@@ -62,7 +63,7 @@ impl Switch {
     }
 }
 
-/// What pressing the tray's top item does (SPEC §7 table, "Pressing it").
+/// What flipping the flyout's Nudges switch does (SPEC §7 table, "Flipping it").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Press {
     StartOff,
@@ -75,55 +76,91 @@ pub enum Press {
     EndOvertimeStartOff,
 }
 
-/// The tray's top item, its tooltip and its icon at one moment (SPEC §7, §8).
+/// The flyout's status line and Nudges switch, the tooltip and the icon at one moment (SPEC §7,
+/// §8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwitchItem {
-    /// What the top menu item reads.
-    pub label: &'static str,
+    /// The flyout's status line under "breakpoint", e.g. "On until 17:00".
+    pub status: String,
+    /// The note under the Nudges label: what flipping the switch does now.
+    pub note: String,
     pub press: Press,
     pub tooltip: String,
-    /// The greyed icon, shown while quiet; the normal one otherwise.
+    /// The greyed icon, shown while quiet; the normal one otherwise. The Nudges switch is off
+    /// exactly while greyed.
     pub greyed: bool,
 }
 
-/// The SPEC §7 table: the top tray item, what pressing it does, the tooltip and the icon, for
-/// the work week, the Off or Overtime in force (if any) and the time now. `switch` must be in
-/// force at `now`, that is end after it.
+impl SwitchItem {
+    /// Whether the Nudges switch shows on: nudging, in hours or in Overtime.
+    pub fn on(&self) -> bool {
+        !self.greyed
+    }
+}
+
+/// The SPEC §7 table: the status line, the Nudges switch and its note, what flipping it does,
+/// the tooltip and the icon, for the work week, the Off or Overtime in force (if any) and the
+/// time now. `switch` must be in force at `now`, that is end after it.
 pub fn switch_item(week: &WorkWeek, switch: Option<Switch>, now: LocalTime) -> SwitchItem {
-    const TURN_OFF: &str = "Turn off until next work day";
-    const TURN_ON: &str = "Turn on until midnight";
+    const TURN_ON: &str = "Outside work hours. Turn on until midnight.";
     const ON_UNTIL_MIDNIGHT: &str = "breakpoint: on until midnight";
     let in_hours = week.in_hours(now);
-    let item = |label, press, tooltip: String, greyed| SwitchItem {
-        label,
+    let item = |status: String, note: String, press, tooltip: String, greyed| SwitchItem {
+        status,
+        note,
         press,
         tooltip,
         greyed,
     };
+    let when = |t: LocalTime| when(t, now);
     let off_until = |until: LocalTime| format!("breakpoint: off until {}", day_and_time(until));
+    // Off from now ends at the next work day's start.
+    let turn_off = |lead: &str| match week.next_start(now) {
+        Some(start) => format!("{lead}Turn off until {}.", when(start)),
+        None => format!("{lead}Turn off."),
+    };
     match (switch, in_hours) {
-        (None, true) => item(TURN_OFF, Press::StartOff, "breakpoint".into(), false),
-        (Some(Switch::Off { until }), true) => {
-            item("Turn back on", Press::EndOff, off_until(until), true)
-        }
+        (None, true) => item(
+            format!("On until {}", when(now.on_day_at(0, week.hours.end))),
+            turn_off(""),
+            Press::StartOff,
+            "breakpoint".into(),
+            false,
+        ),
+        (Some(Switch::Off { until }), true) => item(
+            format!("Off until {}", when(until)),
+            "Turn back on now.".into(),
+            Press::EndOff,
+            off_until(until),
+            true,
+        ),
         (None, false) => {
-            let tooltip = match week.next_start(now) {
-                Some(start) => format!("breakpoint: quiet until {}", day_and_time(start)),
-                None => "breakpoint: quiet".into(),
+            let (status, tooltip) = match week.next_start(now) {
+                Some(start) => (
+                    format!("Quiet until {}", when(start)),
+                    format!("breakpoint: quiet until {}", day_and_time(start)),
+                ),
+                None => ("Quiet".into(), "breakpoint: quiet".into()),
             };
-            item(TURN_ON, Press::StartOvertime, tooltip, true)
+            item(status, TURN_ON.into(), Press::StartOvertime, tooltip, true)
         }
-        (Some(Switch::Off { until }), false) => {
-            item(TURN_ON, Press::EndOffStartOvertime, off_until(until), true)
-        }
-        (Some(Switch::Overtime { .. }), false) => item(
-            "Turn off now",
+        (Some(Switch::Off { until }), false) => item(
+            format!("Off until {}", when(until)),
+            TURN_ON.into(),
+            Press::EndOffStartOvertime,
+            off_until(until),
+            true,
+        ),
+        (Some(Switch::Overtime { until }), false) => item(
+            format!("On until {}", when(until)),
+            "Overtime. Turn off to be quiet again.".into(),
             Press::EndOvertime,
             ON_UNTIL_MIDNIGHT.into(),
             false,
         ),
-        (Some(Switch::Overtime { .. }), true) => item(
-            TURN_OFF,
+        (Some(Switch::Overtime { until }), true) => item(
+            format!("On until {}", when(until)),
+            turn_off("Overtime. "),
             Press::EndOvertimeStartOff,
             ON_UNTIL_MIDNIGHT.into(),
             false,
@@ -144,6 +181,21 @@ pub fn is_quiet(week: &WorkWeek, switch: Option<Switch>, now: LocalTime) -> bool
 /// e.g. `Sunday 08:00`, on the moment's own local clock.
 fn day_and_time(t: LocalTime) -> String {
     format!("{} {}", t.weekday().name(), t.time_of_day())
+}
+
+/// When `t` comes, as seen at `now`, for the flyout: `midnight` for the next midnight, `17:00`
+/// later today, `tomorrow 08:00`, else the day's name as the tooltip has it, `Sunday 08:00`.
+fn when(t: LocalTime, now: LocalTime) -> String {
+    let time = t.time_of_day();
+    if t.unix == midnight_after(now).unix {
+        "midnight".into()
+    } else if now.on_day_at(0, time).unix == t.unix {
+        time.to_string()
+    } else if now.on_day_at(1, time).unix == t.unix {
+        format!("tomorrow {time}")
+    } else {
+        day_and_time(t)
+    }
 }
 
 /// Everything that decides quiet: the work week and the Off or Overtime in force.
@@ -183,12 +235,12 @@ impl Quiet {
         is_quiet(&self.week, self.switch(now), now)
     }
 
-    /// The tray's top item, tooltip and icon at `now`.
+    /// The status line, Nudges switch, tooltip and icon at `now`.
     pub fn item(&self, now: LocalTime) -> SwitchItem {
         switch_item(&self.week, self.switch(now), now)
     }
 
-    /// The user pressed the tray's top item at `now`. At most one of Off and Overtime is in
+    /// The user flipped the Nudges switch at `now`. At most one of Off and Overtime is in
     /// force after it: starting one clears the other.
     pub fn press(&mut self, now: LocalTime) {
         self.switch = match self.item(now).press {
@@ -249,27 +301,29 @@ mod tests {
         Some(Switch::Overtime { until: at(until) })
     }
 
-    /// Checks one row of the SPEC §7 table, that the icon is greyed exactly while quiet, and
-    /// what pressing leaves in force.
+    /// Checks one row of the SPEC §7 table, that the icon is greyed and the switch off exactly
+    /// while quiet, and what flipping the switch leaves in force.
     fn row(
         now: &str,
         switch: Option<Switch>,
-        expect: (&'static str, Press, &str, bool),
+        expect: (&str, &str, Press, &str, bool),
         after_press: Option<Switch>,
     ) {
         let now = at(now);
-        let (label, press, tooltip, greyed) = expect;
+        let (status, note, press, tooltip, greyed) = expect;
         let item = switch_item(&week(), switch, now);
         assert_eq!(
             item,
             SwitchItem {
-                label,
+                status: status.into(),
+                note: note.into(),
                 press,
                 tooltip: tooltip.into(),
                 greyed
             }
         );
         assert_eq!(is_quiet(&week(), switch, now), greyed);
+        assert_eq!(item.on(), !greyed);
 
         let mut config = Config::default();
         (config.off_until, config.overtime_until) = match switch {
@@ -288,7 +342,8 @@ mod tests {
             "2026-11-03T10:00:00",
             None,
             (
-                "Turn off until next work day",
+                "On until 17:00",
+                "Turn off until tomorrow 08:00.",
                 Press::StartOff,
                 "breakpoint",
                 false,
@@ -303,7 +358,8 @@ mod tests {
             "2026-11-03T10:00:00",
             off("2026-11-04T08:00:00"),
             (
-                "Turn back on",
+                "Off until tomorrow 08:00",
+                "Turn back on now.",
                 Press::EndOff,
                 "breakpoint: off until Wednesday 08:00",
                 true,
@@ -318,7 +374,8 @@ mod tests {
             "2026-11-05T18:00:00",
             None,
             (
-                "Turn on until midnight",
+                "Quiet until Sunday 08:00",
+                "Outside work hours. Turn on until midnight.",
                 Press::StartOvertime,
                 "breakpoint: quiet until Sunday 08:00",
                 true,
@@ -333,7 +390,8 @@ mod tests {
             "2026-11-05T18:00:00",
             off("2026-11-08T08:00:00"),
             (
-                "Turn on until midnight",
+                "Off until Sunday 08:00",
+                "Outside work hours. Turn on until midnight.",
                 Press::EndOffStartOvertime,
                 "breakpoint: off until Sunday 08:00",
                 true,
@@ -348,7 +406,8 @@ mod tests {
             "2026-11-05T18:00:00",
             overtime("2026-11-06T00:00:00"),
             (
-                "Turn off now",
+                "On until midnight",
+                "Overtime. Turn off to be quiet again.",
                 Press::EndOvertime,
                 "breakpoint: on until midnight",
                 false,
@@ -363,7 +422,8 @@ mod tests {
             "2026-11-03T09:00:00",
             overtime("2026-11-04T00:00:00"),
             (
-                "Turn off until next work day",
+                "On until midnight",
+                "Overtime. Turn off until tomorrow 08:00.",
                 Press::EndOvertimeStartOff,
                 "breakpoint: on until midnight",
                 false,
@@ -399,6 +459,43 @@ mod tests {
     fn before_work_on_a_work_day_is_quiet_until_that_mornings_start() {
         let item = switch_item(&week(), None, at("2026-11-03T07:00:00"));
         assert_eq!(item.tooltip, "breakpoint: quiet until Tuesday 08:00");
+        assert_eq!(
+            item.status, "Quiet until 08:00",
+            "later today: the time alone"
+        );
+    }
+
+    #[test]
+    fn the_flyout_names_today_tomorrow_or_the_day() {
+        // Thursday in hours: Off would last the weekend, so the note names Sunday.
+        let item = switch_item(&week(), None, at("2026-11-05T10:00:00"));
+        assert_eq!(item.status, "On until 17:00");
+        assert_eq!(item.note, "Turn off until Sunday 08:00.");
+        // Friday: quiet until Sunday, two days on.
+        let item = switch_item(&week(), None, at("2026-11-06T10:00:00"));
+        assert_eq!(item.status, "Quiet until Sunday 08:00");
+        // Saturday evening: Sunday is tomorrow.
+        let item = switch_item(&week(), None, at("2026-11-07T20:00:00"));
+        assert_eq!(item.status, "Quiet until tomorrow 08:00");
+        assert_eq!(item.note, "Outside work hours. Turn on until midnight.");
+    }
+
+    #[test]
+    fn with_no_work_day_the_flyout_says_quiet_with_no_end() {
+        let mut none = week();
+        for day in Weekday::ALL {
+            none.days.set(day, false);
+        }
+        let item = switch_item(&none, None, at("2026-11-03T10:00:00"));
+        assert_eq!(item.status, "Quiet");
+        assert!(!item.on());
+        let item = switch_item(
+            &none,
+            overtime("2026-11-04T00:00:00"),
+            at("2026-11-03T10:00:00"),
+        );
+        assert_eq!(item.status, "On until midnight");
+        assert_eq!(item.note, "Overtime. Turn off to be quiet again.");
     }
 
     #[test]

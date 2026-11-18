@@ -12,15 +12,17 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::USER_DEFAULT_SCREEN_DPI as BASE_DPI;
 
-use super::form::{Form, Laid, Look, Measure, MenuLayout, Part, Scroll, rect, stepper_text};
+use super::form::{
+    Form, Laid, Look, Measure, MenuLayout, Part, Scroll, rect, spans_width, stepper_text,
+};
 use super::{ButtonKind, Entry, Ink, Item, Kind};
 use crate::platform::paint::{Box2, Canvas, Glyph, HOVER, mix};
 use crate::platform::theme::{
     BORDER_THICK, CARET, CHECK_POINTS, CHECKBOX, CHEVRON, CHEVRON_POINTS, CHEVRON_RIGHT,
-    CHOICE_PAD_X, CHOICE_PAD_Y, Colours, FOCUS_RING, Fonts, HAIRLINE, KNOB, KNOB_HOT, KNOB_INSET,
-    MARK_STROKE, MENU_CHECK, MENU_ITEM_PAD_X, MENU_ITEM_PAD_Y, PRESS_DROP, RADIO, RADIO_DOT,
-    RADIUS_MD, RADIUS_SM, SEGMENT_PAD, SPACE_2, SPACE_3, SPACE_4, STEPPER_MARK, SWITCH_H, SWITCH_W,
-    Style, px,
+    CHOICE_PAD_X, CHOICE_PAD_Y, Colours, FOCUS_RING, Fonts, HAIRLINE, ICON_STROKE, KNOB, KNOB_HOT,
+    KNOB_INSET, MARK_STROKE, MENU_CHECK, MENU_ITEM_PAD_X, MENU_ITEM_PAD_Y, PRESS_DROP, RADIO,
+    RADIO_DOT, RADIUS_MD, RADIUS_SM, SEGMENT_PAD, SIZE_ICON, SPACE_2, SPACE_3, SPACE_4,
+    STATUS_RING, STEPPER_MARK, SWITCH_H, SWITCH_W, Style, px,
 };
 
 /// One line of text to draw: `top` is the top of its line box, `Style::line_height` tall.
@@ -301,9 +303,10 @@ fn paint_item(p: &mut Pen, item: &Item, laid: &Laid, look: &Look) {
     let sm = p.s(RADIUS_SM);
     let h = r.bottom - r.top;
     match &item.kind {
-        Kind::Card { .. } => {
+        Kind::Card { inset, .. } => {
             let md = p.s(RADIUS_MD);
-            p.canvas.fill_round_rect(c.raised, b, md);
+            let ground = if *inset { c.ground } else { c.raised };
+            p.canvas.fill_round_rect(ground, b, md);
             p.canvas.stroke_round_rect(c.hairline, b, md, hair);
             let side = p.s(SPACE_4);
             for &row in &laid.rows {
@@ -323,6 +326,29 @@ fn paint_item(p: &mut Pen, item: &Item, laid: &Laid, look: &Look) {
             p.canvas.fill_rect(c.sunken, b);
             p.canvas.fill_rect(c.hairline, Box2 { h: hair, ..b });
         }
+        Kind::Rule => p.canvas.fill_rect(c.hairline, b),
+        Kind::Dot { on } => {
+            let (cx, cy, radius) = (b.x + b.w / 2.0, b.y + b.h / 2.0, b.w / 2.0);
+            if *on {
+                p.canvas.fill_circle(c.dot, cx, cy, radius);
+            } else {
+                p.canvas
+                    .stroke_circle(c.quiet, cx, cy, radius, p.sf(STATUS_RING));
+            }
+        }
+        Kind::Spans { spans, .. } => {
+            let mut x = r.left;
+            for span in spans {
+                let colour = match span.ink {
+                    Ink::Main => c.ink,
+                    Ink::Muted => c.muted,
+                };
+                let top = r.top + (h - p.lh(span.style)) / 2;
+                p.text(span.style, colour, x, top, &span.text);
+                x += p.m.width(span.style, &span.text);
+            }
+            debug_assert_eq!(x - r.left, spans_width(spans, p.m));
+        }
         Kind::Text { style, ink, .. } => {
             let colour = match ink {
                 Ink::Main => c.ink,
@@ -334,7 +360,9 @@ fn paint_item(p: &mut Pen, item: &Item, laid: &Laid, look: &Look) {
             }
         }
         Kind::Glyph(glyph) => p.canvas.glyph(*glyph, glyph_colour(&c, *glyph), b),
-        Kind::Button { label, kind, .. } => {
+        Kind::Button {
+            label, kind, icon, ..
+        } => {
             let label_colour = match kind {
                 ButtonKind::Primary => {
                     p.canvas
@@ -362,7 +390,22 @@ fn paint_item(p: &mut Pen, item: &Item, laid: &Laid, look: &Look) {
             } else {
                 0
             };
-            p.centred(Style::BodyStrong, label_colour, r, label, drop);
+            match icon {
+                None => p.centred(Style::BodyStrong, label_colour, r, label, drop),
+                Some(mark) => {
+                    // The icon and the label centred together, the icon in `ink-muted`.
+                    let size = px(SIZE_ICON, p.dpi);
+                    let gap = px(SPACE_2, p.dpi);
+                    let w = size + gap + p.m.width(Style::BodyStrong, label);
+                    let x = r.left + (r.right - r.left - w) / 2;
+                    let at = boxed(x, r.top + (h - size) / 2 + drop, size, size);
+                    let ink = mix(c.muted, c.hover_ink, hover);
+                    p.canvas.mark(*mark, ink, at, p.sf(ICON_STROKE));
+                    let text = rect(x + size + gap, r.top, w - size - gap, h);
+                    let top = text.top + (h - p.lh(Style::BodyStrong)) / 2 + drop;
+                    p.text(Style::BodyStrong, label_colour, text.left, top, label);
+                }
+            }
             if look.ring {
                 p.ring(b, sm);
             }

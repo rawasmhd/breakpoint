@@ -37,6 +37,7 @@ fn open_settings() -> (isize, thread::JoinHandle<()>) {
             items: settings_items(),
             at: Some(POINT { x: 0, y: 0 }),
             owner: None,
+            frame: window::Frame::Dialog,
         };
         let handle = window::open(spec, |_, _| {}).unwrap();
         tx.send(handle.hwnd().0 as isize).unwrap();
@@ -182,4 +183,75 @@ fn a_ui_automation_client_reads_and_drives_a_scrolled_kit_window() {
     }
     quit(hwnd, thread);
     assert!(kept(hwnd).is_none(), "gone with its window");
+}
+
+/// The tray flyout (issue #89) on a real popup kit window: the window is named "breakpoint" by
+/// its caption, though it shows none, and the switch is named "Nudges" with its note as help.
+#[test]
+fn a_ui_automation_client_reads_the_tray_flyout() {
+    use crate::platform::flyout::{Content, items};
+
+    let _one = one_client();
+    let (tx, rx) = mpsc::channel();
+    let thread = thread::spawn(move || {
+        let content = Content {
+            on: true,
+            status: "On until 17:00".into(),
+            note: "Turn off until tomorrow 08:00.".into(),
+            pending: None,
+            taken: 7,
+            skipped: 2,
+        };
+        let spec = Spec {
+            caption: "breakpoint".into(),
+            width: crate::platform::theme::SIZE_FLYOUT,
+            height: 0,
+            items: items(&content),
+            at: Some(POINT { x: 0, y: 0 }),
+            owner: None,
+            frame: window::Frame::Popup,
+        };
+        let toggled = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = toggled.clone();
+        let handle = window::open(spec, move |_, event| {
+            if matches!(event, Event::Changed(_, Value::On(false))) {
+                seen.set(true);
+            }
+        })
+        .unwrap();
+        tx.send(handle.hwnd().0 as isize).unwrap();
+        let mut msg = MSG::default();
+        // SAFETY: a plain message loop on this thread.
+        unsafe {
+            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        handle.close();
+        assert!(toggled.get(), "the client's Toggle flipped the switch");
+    });
+    let hwnd = HWND(rx.recv().unwrap() as _);
+    // SAFETY: COM on this thread, then client calls on live elements.
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let ua: IUIAutomation =
+            CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).unwrap();
+        let window = ua.ElementFromHandle(hwnd).unwrap();
+        assert_eq!(window.CurrentName().unwrap(), "breakpoint");
+        let mut seen = Vec::new();
+        read(&ua.RawViewWalker().unwrap(), &window, &mut seen);
+        let switch = find(&seen, UIA_CheckBoxControlTypeId, "Nudges");
+        assert_eq!(
+            switch.CurrentHelpText().unwrap(),
+            "Turn off until tomorrow 08:00."
+        );
+        find(&seen, UIA_ButtonControlTypeId, "Settings…");
+        find(&seen, UIA_ButtonControlTypeId, "Quit");
+        let toggle: IUIAutomationTogglePattern =
+            switch.GetCurrentPatternAs(UIA_TogglePatternId).unwrap();
+        assert_eq!(toggle.CurrentToggleState().unwrap(), ToggleState_On);
+        toggle.Toggle().unwrap();
+    }
+    quit(hwnd, thread);
 }

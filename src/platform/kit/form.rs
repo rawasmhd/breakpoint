@@ -9,14 +9,14 @@ use std::time::Duration;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::UI::WindowsAndMessaging::USER_DEFAULT_SCREEN_DPI as BASE_DPI;
 
-use super::{ButtonKind, Entry, Event, Id, Item, Kind, Value};
+use super::{ButtonKind, Entry, Event, Id, Item, Kind, Span, Value};
 use crate::platform::paint::{Box2, HOVER, PRESSED, REST, step_fill};
 use crate::platform::theme::{
     CHECKBOX, CHEVRON, CHEVRON_RIGHT, CHOICE_PAD_X, CHOICE_PAD_Y, HAIRLINE, KNOB_SLIDE, MENU_CHECK,
     MENU_ITEM_PAD_X, MENU_ITEM_PAD_Y, MENU_PAD, PAGE_STEPS, PILL_H, PILL_W, PRIMARY_MIN_WIDTH,
     RADIO, SCROLLBAR_HOT_W, SCROLLBAR_INSET, SCROLLBAR_MIN, SCROLLBAR_W, SEGMENT_GAP, SEGMENT_H,
-    SEGMENT_MIN_W, SEGMENT_PAD, SIZE_BUTTON, SIZE_FIELD, SIZE_GLYPH, SPACE_2, SPACE_3, SPACE_4,
-    STEPPER_VALUE, STEPPER_ZONE, SWITCH_H, SWITCH_W, Style, px,
+    SEGMENT_MIN_W, SEGMENT_PAD, SIZE_BUTTON, SIZE_FIELD, SIZE_GLYPH, SIZE_ICON, SPACE_2, SPACE_3,
+    SPACE_4, STATUS_DOT, STEPPER_VALUE, STEPPER_ZONE, SWITCH_H, SWITCH_W, Style, px,
 };
 
 /// Minutes in a day: time steppers wrap round it.
@@ -217,6 +217,35 @@ impl Form {
         form
     }
 
+    /// A form of `items` in place of `before`, as when the flyout's content changes while it
+    /// is open: the focus stays on the item with the same id if there is one, the focus ring
+    /// and the window's focus carry over, and so do the hover levels and knob of items whose id
+    /// and kind of control match. The pointer starts over. It keeps the DPI; lay it out before
+    /// use.
+    pub fn replace(before: &Form, items: Vec<Item>) -> Form {
+        let mut form = Form::new(items);
+        form.dpi = before.dpi;
+        form.cues = before.cues;
+        form.active = before.active;
+        if let Some(i) = before.focused().and_then(|id| form.index(id))
+            && form.items[i].kind.focusable()
+        {
+            form.focus = Some(i);
+        }
+        for (i, item) in form.items.iter().enumerate() {
+            let old = before.index(item.id).filter(|&j| {
+                std::mem::discriminant(&before.items[j].kind) == std::mem::discriminant(&item.kind)
+            });
+            if let Some(j) = old
+                && before.anim[j].levels.len() == form.anim[i].levels.len()
+            {
+                form.anim[i].levels = before.anim[j].levels.clone();
+                form.anim[i].slide = before.anim[j].slide;
+            }
+        }
+        form
+    }
+
     pub fn items(&self) -> &[Item] {
         &self.items
     }
@@ -285,7 +314,7 @@ impl Form {
             if grows {
                 laid.rect.bottom += grow;
             }
-            if let Kind::Card { rows } = &item.kind {
+            if let Kind::Card { rows, .. } = &item.kind {
                 laid.rows = rows
                     .iter()
                     .map(|&row| laid.rect.top + px(row, dpi) + shift(growth, top + row) - down)
@@ -393,6 +422,18 @@ impl Form {
             | Kind::Day { label: t, .. }
             | Kind::Checkbox { label: t, .. } => *t = text.to_owned(),
             Kind::DropDown { other, .. } => *other = text.to_owned(),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Changes a [`Kind::Spans`] line, such as the flyout's live countdown. Lay out again after.
+    pub fn set_spans(&mut self, id: Id, spans: Vec<Span>) -> bool {
+        let Some(i) = self.index(id) else {
+            return false;
+        };
+        match &mut self.items[i].kind {
+            Kind::Spans { spans: s, .. } => *s = spans,
             _ => return false,
         }
         true
@@ -519,7 +560,21 @@ impl Form {
                     return vec![Event::Pressed(self.items[i].id)];
                 }
                 let mut out = self.commit();
-                out.extend(self.button(|default, _| default).map(Event::Pressed));
+                match self.button(|default, _| default) {
+                    Some(id) => out.push(Event::Pressed(id)),
+                    // With no default button, as in the flyout, Enter acts on a focused switch
+                    // or checkbox as Space does.
+                    None => {
+                        if let Some(i) = self.focus
+                            && matches!(
+                                self.items[i].kind,
+                                Kind::Switch { .. } | Kind::Checkbox { .. }
+                            )
+                        {
+                            out.extend(self.activate(i));
+                        }
+                    }
+                }
                 return out;
             }
             Key::Esc => {
@@ -1197,6 +1252,16 @@ fn lay_out(item: &Item, dpi: u32, m: &dyn Measure) -> Laid {
     let mut parts = Vec::new();
     let r = match &item.kind {
         Kind::Card { .. } | Kind::Band => sized(0, 0),
+        Kind::Rule => sized(0, s(HAIRLINE)),
+        Kind::Dot { .. } => sized(s(STATUS_DOT), s(STATUS_DOT)),
+        Kind::Spans { spans, right } => {
+            let w = spans_width(spans, m);
+            let h = spans.iter().map(|sp| lh(sp.style)).max().unwrap_or(0);
+            match given_w {
+                Some(given) if *right => rect(x + given - w, y, w, given_h.unwrap_or(h)),
+                _ => sized(w, h),
+            }
+        }
         Kind::Text { text, style, .. } => {
             lines = match given_w {
                 Some(w) => wrap(text, w, |t| m.width(*style, t)),
@@ -1214,8 +1279,11 @@ fn lay_out(item: &Item, dpi: u32, m: &dyn Measure) -> Laid {
             )
         }
         Kind::Glyph(_) => sized(s(SIZE_GLYPH), s(SIZE_GLYPH)),
-        Kind::Button { label, kind, .. } => {
-            let w = m.width(Style::BodyStrong, label) + 2 * (s(SPACE_3) + s(HAIRLINE));
+        Kind::Button {
+            label, kind, icon, ..
+        } => {
+            let icon = icon.map_or(0, |_| s(SIZE_ICON) + s(SPACE_2));
+            let w = icon + m.width(Style::BodyStrong, label) + 2 * (s(SPACE_3) + s(HAIRLINE));
             let least = if *kind == ButtonKind::Primary {
                 s(PRIMARY_MIN_WIDTH)
             } else {
@@ -1310,6 +1378,11 @@ fn lay_out(item: &Item, dpi: u32, m: &dyn Measure) -> Laid {
         parts,
         rows: Vec::new(),
     }
+}
+
+/// The width of a [`Kind::Spans`] line: its pieces side by side.
+pub fn spans_width(spans: &[Span], m: &dyn Measure) -> i32 {
+    spans.iter().map(|sp| m.width(sp.style, &sp.text)).sum()
 }
 
 /// How far items placed at `y` (96 DPI) move down for the `growth` above them, in pixels.
@@ -1705,11 +1778,7 @@ mod tests {
     /// A small form with one of everything, in this list order.
     fn sample() -> Form {
         let items = vec![
-            Item::new(
-                CARD,
-                Place::new(0, 0, 400, 300),
-                Kind::Card { rows: vec![40] },
-            ),
+            Item::new(CARD, Place::new(0, 0, 400, 300), Kind::card(vec![40])),
             Item::new(
                 LABEL,
                 Place::at(10, 10),
@@ -1791,6 +1860,7 @@ mod tests {
                     kind: ButtonKind::Primary,
                     default: true,
                     cancel: false,
+                    icon: None,
                 },
             ),
             Item::new(
@@ -1801,6 +1871,7 @@ mod tests {
                     kind: ButtonKind::Secondary,
                     default: false,
                     cancel: true,
+                    icon: None,
                 },
             ),
         ];
@@ -1922,7 +1993,25 @@ mod tests {
         )]);
         f.lay_out(96, &Fixed(96));
         assert_eq!(f.key(Key::Esc), [Event::Close]);
-        assert_eq!(f.key(Key::Enter), []);
+    }
+
+    /// With no default button, as in the tray flyout, Enter acts on a focused switch as Space
+    /// does; with one, Enter presses it.
+    #[test]
+    fn enter_flips_a_focused_switch_only_with_no_default_button() {
+        let switch = Item::new(1, Place::at(0, 0), Kind::Switch { on: false });
+        let mut f = Form::new(vec![switch.clone()]);
+        f.lay_out(96, &Fixed(96));
+        assert_eq!(f.key(Key::Enter), [Event::Changed(1, Value::On(true))]);
+        let mut save = Kind::button("Save", ButtonKind::Primary);
+        if let Kind::Button { default, .. } = &mut save {
+            *default = true;
+        }
+        let mut f = Form::new(vec![switch, Item::new(2, Place::at(0, 40), save)]);
+        f.lay_out(96, &Fixed(96));
+        assert_eq!(f.focused(), Some(1));
+        assert_eq!(f.key(Key::Enter), [Event::Pressed(2)]);
+        assert_eq!(f.value(1), Some(Value::On(false)));
     }
 
     #[test]
@@ -1935,6 +2024,7 @@ mod tests {
                 kind: ButtonKind::Primary,
                 default: true,
                 cancel: true,
+                icon: None,
             },
         )]);
         assert_eq!(f.key(Key::Enter), [Event::Pressed(1)]);
@@ -2555,11 +2645,7 @@ mod tests {
         let note = Kind::text("aaaa bbbb cccc", Style::Caption, Ink::Muted);
         let switch = Kind::Switch { on: false };
         let mut f = Form::new(vec![
-            Item::new(
-                1,
-                Place::new(0, 0, 200, 100),
-                Kind::Card { rows: vec![20, 60] },
-            ),
+            Item::new(1, Place::new(0, 0, 200, 100), Kind::card(vec![20, 60])),
             Item::new(2, Place::new(10, 20, 60, 18), note),
             Item::new(3, Place::at(100, 20), switch.clone()),
             Item::new(4, Place::at(10, 38), switch),

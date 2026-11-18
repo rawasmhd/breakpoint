@@ -105,5 +105,5 @@ The local record of what happened to each occurrence: fired, snoozed, satisfied 
 _Avoid_: history, stats, telemetry, journal, activity log
 
 **Today count**:
-The tray line that shows how many Stand/Move and Pause occurrences fired today were taken (satisfied) and how many were skipped, e.g. "Today: 7 taken, 2 skipped". Water is not counted, and the count starts again at midnight.
+The row in the tray flyout that shows how many Stand/Move and Pause occurrences fired today were taken (satisfied) and how many were skipped, e.g. "Today  7 taken  2 skipped". Water is not counted, and the count starts again at midnight.
 _Avoid_: score, streak, stats, summary

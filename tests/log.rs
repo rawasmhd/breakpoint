@@ -212,11 +212,8 @@ fn a_day_on_balanced_writes_the_example_lines_of_spec_10_2() {
         let (t, event) = log::parse(line.trim_end()).unwrap();
         live.record(t, &event);
     }
-    assert_eq!(live.text(evening), "Today: 13 taken, 2 skipped");
-    assert_eq!(
-        Today::rebuild(&log, evening).text(evening),
-        "Today: 13 taken, 2 skipped"
-    );
+    assert_eq!(live.counts(evening), (13, 2));
+    assert_eq!(Today::rebuild(&log, evening).counts(evening), (13, 2));
     assert_eq!(log::last_occ(&log), Some(60));
 }
 
@@ -232,7 +229,7 @@ fn today_rebuild_ignores_an_occurrence_a_crash_left_open() {
     );
     let now = at("2026-11-02T15:30:00+03:00");
     let mut today = Today::rebuild(&file, now);
-    assert_eq!(today.text(now), "Today: 2 taken, 0 skipped");
+    assert_eq!(today.counts(now), (2, 0));
 
     // After the restart the ids go on above 51; their ends count, and nothing of 50 or 51 ever
     // does.
@@ -261,7 +258,7 @@ fn today_rebuild_ignores_an_occurrence_a_crash_left_open() {
             by: breakpoint::core::scheduler::SkipCause::User,
         },
     );
-    assert_eq!(today.text(now), "Today: 2 taken, 1 skipped");
+    assert_eq!(today.counts(now), (2, 1));
 }
 
 #[test]
@@ -277,10 +274,7 @@ fn today_counts_by_the_day_an_occurrence_fired_and_resets_at_midnight() {
     // A restart at 23:59 on the 2nd, the file as it was then: Pause 2 is still open.
     let before = at("2026-11-02T23:59:00+03:00");
     let then = &file[..file.find(r#"{"t":"2026-11-03"#).unwrap()];
-    assert_eq!(
-        Today::rebuild(then, before).text(before),
-        "Today: 0 taken, 0 skipped"
-    );
+    assert_eq!(Today::rebuild(then, before).counts(before), (0, 0));
 
     // Live: Pause 2 fired on the 2nd and ended after midnight, so it counts for the 2nd.
     let mut today = Today::default();
@@ -290,7 +284,7 @@ fn today_counts_by_the_day_an_occurrence_fired_and_resets_at_midnight() {
     let the_2nd = at("2026-11-02T23:59:59+03:00");
     let the_3rd = at("2026-11-03T00:06:00+03:00");
     assert_eq!(today.counts(the_2nd), (0, 1));
-    assert_eq!(today.text(the_3rd), "Today: 0 taken, 0 skipped");
+    assert_eq!(today.counts(the_3rd), (0, 0));
 
     // Stand/Move 3 fired on the 3rd: taking it starts the 3rd's count.
     let t = at("2026-11-03T00:08:00+03:00");
@@ -302,7 +296,7 @@ fn today_counts_by_the_day_an_occurrence_fired_and_resets_at_midnight() {
             by: breakpoint::core::scheduler::SatisfyCause::Lock,
         },
     );
-    assert_eq!(today.text(t), "Today: 1 taken, 0 skipped");
+    assert_eq!(today.counts(t), (1, 0));
     assert_eq!(today.counts(the_2nd), (0, 0));
 
     // Rebuilt on the 3rd from the same file: Pause 2 belongs to the 2nd and Stand/Move 3 is open.
@@ -321,10 +315,7 @@ garbage
 {"t":"2026-11-02T09:31:00+03:00","ev":"skipped","nudge":"stand","occ":9,"by":"user"}"#;
     let now = at("2026-11-02T10:00:00+03:00");
     // Stand/Move 7's end is cut off, so 7 stays open and does not count.
-    assert_eq!(
-        Today::rebuild(file, now).text(now),
-        "Today: 1 taken, 1 skipped"
-    );
+    assert_eq!(Today::rebuild(file, now).counts(now), (1, 1));
     assert_eq!(log::last_occ(file), Some(9));
 }
 

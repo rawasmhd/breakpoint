@@ -10,13 +10,13 @@ The red dot comes from the debugger. In a code editor, a breakpoint is a red dot
 
 1. **Quiet until needed.** Neutral surfaces, no colour fills in the popup, no motion except the popup's fade, control feedback and the switch knob. A nudge must not feel like an error.
 2. **Behaviour over buttons.** The popup has no primary button. Snooze is a secondary button and Skip is a ghost button. The `action` fill appears only in dialogs, on Start and Save.
-3. **One dot per surface.** `dot` appears once: the tray icon, the popup header, and the app icon in a dialog's caption. Never use it for text, borders or states.
-4. **breakpoint paints its controls.** Windows draws the window frame, the tray menu and message boxes. Every control inside the wizard and the settings window is painted by breakpoint.
+3. **One dot per surface.** `dot` appears once: the tray icon, the popup header, the tray flyout's header, and the app icon in a dialog's caption. Never use it for text, borders or states.
+4. **breakpoint paints its controls.** Windows draws the dialogs' window frame and message boxes. Every control inside the wizard, the settings window and the tray flyout is painted by breakpoint. There is no native tray menu.
 
 ## 2. Voice
 
 - Write `breakpoint` in lowercase, also at the start of a sentence and in window captions.
-- Use sentence case for every title, button and menu item: "Snooze 5 min", "Turn off until next work day".
+- Use sentence case for every title, button and menu item: "Snooze 5 min", "Turn back on now."
 - Speak to the user as "you". Short, plain, kind. No exclamation marks, no emoji, no guilt ("You missed 3 breaks" is wrong).
 - Say what to do, then how to make it count: "Stand up and move", then "Away 1:59 more and it counts".
 - Use the [glossary](../GLOSSARY.md) words exactly: nudge (not reminder or notification), Away (not idle), Skip (not dismiss), Pause (not break).
@@ -30,28 +30,30 @@ The red dot comes from the debugger. In a code editor, a breakpoint is a red dot
 | Pause popup | **Pause** · Step away from the screen for 5 minutes. |
 | Water alone | **Drink some water** |
 | Countdown | Away 1:59 more and it counts |
-| Tray line | Today: 7 taken, 2 skipped |
+| Flyout status line | On until 17:00 |
+| Flyout Nudges note | Turn off until tomorrow 08:00. |
+| Flyout Today row | Today · 7 taken  2 skipped |
 | Tooltip | breakpoint: quiet until Sunday 08:00 |
 
 ## 3. Colour
 
 | Token | Light | Dark | Use |
 | --- | --- | --- | --- |
-| `surface` | `#fafaf9` | `#1c1b1a` | Ground of the wizard and the settings window. Also `on-ink`: the label or mark on a control filled with `ink`. |
-| `surface-raised` | `#ffffff` | `#262422` | Ground of the popup, of the cards in dialogs and of controls at rest. One step lighter than `surface` in both themes. |
-| `surface-sunken` | `#f1f0ee` | `#141312` | Dialog footer band, countdown bar track, segmented toggle track, hover fill of buttons, day pills, stepper zones and menu items. |
+| `surface` | `#fafaf9` | `#1c1b1a` | Ground of the wizard and the settings window, and of the tray flyout's pending card. Also `on-ink`: the label or mark on a control filled with `ink`. |
+| `surface-raised` | `#ffffff` | `#262422` | Ground of the popup and the tray flyout, of the cards in dialogs and of controls at rest. One step lighter than `surface` in both themes. |
+| `surface-sunken` | `#f1f0ee` | `#141312` | Dialog and flyout footer band, countdown bar track, segmented toggle track, hover fill of buttons, day pills, stepper zones and menu items. |
 | `ink` | `#1c1b1a` | `#f2f1ef` | Titles, body text and button labels on every surface. Fill and border of a selected or on control. 16:1 light, 13:1 dark on `surface-raised`. |
 | `ink-muted` | `#57534f` | `#b3aea8` | The nudge line, the countdown, captions and notes. 7.3:1 light, 7.0:1 dark on `surface` and `surface-raised`. |
 | `line` | `#e3e1de` | `#3a3835` | Hairlines, card outlines, the popup outline on Windows 10, press fill of buttons and stepper zones. Never the only edge of a control. |
 | `line-strong` | `#8c8782` | `#77726d` | Border of buttons and every other control at rest, and the knob of an off switch. At least 3.2:1 on `surface` and `surface-raised`. |
-| `dot` | `#e5484d` | `#e5484d` | The breakpoint dot: tray icon, popup header, the app icon in dialog captions. Never text. |
+| `dot` | `#e5484d` | `#e5484d` | The breakpoint dot: tray icon, popup header, the flyout's status dot while on, the app icon in dialog captions. Never text. |
 | `action` | `#c8333a` | `#c8333a` | Fill of the one primary button in a dialog: Start, Save. Never in the popup. |
 | `action-hover` | `#b02a31` | `#b02a31` | Primary button fill on hover and press. |
 | `on-action` | `#ffffff` | `#ffffff` | Label on `action` (5.3:1) and `action-hover` (6.5:1). |
 | `stand` | `#b5651d` | `#f0a04b` | Stand/Move glyph and its countdown bar fill. Marks only, never text. |
 | `water` | `#2b6cb0` | `#6aaef0` | Water glyph. Marks only, never text. |
 | `pause` | `#2f7d5b` | `#5fc495` | Pause glyph and its countdown bar fill. Marks only, never text. |
-| `quiet` | `#969696` | `#969696` | The hollow tray ring while quiet or Off. Reads on light and dark taskbars. |
+| `quiet` | `#969696` | `#969696` | The hollow tray ring and the flyout's status ring while quiet or Off. Reads on light and dark taskbars. |
 | `focus` | `#1c1b1a` | `#f2f1ef` | Keyboard focus ring in dialogs: solid 2px, 2px off the control. It shows only after keyboard use. |
 
 - Popup ground is `surface-raised`; dialog ground is `surface`; a card in a dialog is `surface-raised`; the dialog footer band is `surface-sunken`.
@@ -91,16 +93,19 @@ Sizes are at 96 DPI and scale with the monitor.
 | `space-6` | 24 | Dialog padding. Between dialog sections. |
 | `space-8` | 32 | Wizard heading to its first section. |
 | `radius-sm` | 4 | Buttons, steppers, the drop-down, checkboxes and menu items. |
-| `radius-md` | 8 | The popup window and the drop-down menu (`DWMWCP_ROUND` on Windows 11; square on Windows 10), cards and selectable cards. |
+| `radius-md` | 8 | The popup window, the tray flyout and the drop-down menu (`DWMWCP_ROUND` on Windows 11; square on Windows 10), cards and selectable cards. |
 | `radius-full` | full | The dot, the tray marks, the countdown bar, switches and day pills. |
 | `size-popup` | 360 | Popup width. Height follows the content. |
+| `size-flyout` | 320 | Tray flyout width. Height follows the content. |
+| `size-status` | 10 | The flyout's status dot; its ring while quiet is 2 wide. |
+| `size-icon` | 16 | The gear and power icons on the flyout's footer buttons. |
 | `size-button` | 32 | Button height. |
 | `size-glyph` | 20 | Nudge glyph beside the popup title; 16 beside the Water line. |
 | `size-mark` | 8 | The dot in the popup header. |
 | `size-bar` | 4 | Countdown bar height. |
-| `shadow-popup` | system | The shadow Windows gives a rounded floating window. The popup and the drop-down menu have it. |
+| `shadow-popup` | system | The shadow Windows gives a rounded floating window. The popup, the tray flyout and the drop-down menu have it. |
 
-- Only the popup and the drop-down menu have depth: `shadow-popup`, given by Windows. Do not paint a shadow. Dialogs, cards and controls are flat.
+- Only the popup, the tray flyout and the drop-down menu have depth: `shadow-popup`, given by Windows. Do not paint a shadow. Dialogs, cards and controls are flat.
 
 ## 6. Layout
 
@@ -126,6 +131,17 @@ Sizes are at 96 DPI and scale with the monitor.
 - The wizard opens with one `title-lg` heading, "Pick a rhythm". Under it, the three profiles are selectable cards: the radio mark, the name in `body-strong`, the numbers in `caption` `ink-muted`, and a small day timeline on the right. Start with Windows is a checkbox row.
 - The settings window has three sections: Work week, Nudges (the profile drop-down is its first row) and General (Start with Windows). Its controls are in the Controls table below.
 - Buttons sit in a footer band of `surface-sunken` with a `line` hairline above it, right-aligned, `space-2` apart: the primary first, then Cancel. Wizard: Start. Settings: Save, Cancel.
+
+### Tray flyout
+
+- A borderless popup next to the tray icon ([SPEC.md](SPEC.md) §8 places it): `size-flyout` wide on a `surface-raised` ground, `radius-md` and `shadow-popup` from DWM, a 1px `line` outline on Windows 10. No caption. Unlike the popup, it takes the focus.
+- `space-4` side margins. A 1px `line` hairline, inside the margins, separates the rows.
+- **Header**, `space-4` padding: the status dot (`size-status`, filled `dot` while on, a 2px `quiet` ring while Off or quiet), centred on the first line, then `space-3` and "breakpoint" in `body-strong` `ink`, and the status line under it in `caption` `ink-muted`.
+- **Nudges** row, `space-3` above and below: "Nudges" in `body` `ink`, the note under it in `caption` `ink-muted`, and a switch at the right, centred on the two lines. A note too long for its line wraps and pushes the rows under it down.
+- **Pending card**, only while an occurrence is pending, `space-3` under the Nudges row: `surface`, 1px `line`, `radius-md`, `space-3` padding. The nudge glyph (`size-glyph`, `space-2` gap) and "Pause pending" in `body-strong`; `space-1`, then the countdown in `caption` `ink-muted`, digits in `caption-strong` `ink`, aligned with the title text; a riding Water line `space-2` under it, as in the popup; `space-3`, then Snooze 5 min (secondary, hidden once used) and Skip (ghost), right-aligned, `space-2` apart.
+- **Today** row, `space-3` above and below: "Today" in `body` `ink-muted`, and at the right "7 taken  2 skipped", the numbers in `body-strong` `ink` and the words in `body` `ink-muted`.
+- **Footer band**: `surface-sunken` with a `line` hairline above it, `space-2` padding. Ghost buttons "Settings…" with the gear icon at the left and "Quit" with the power icon at the right. The icon is `size-icon` in `ink-muted`, `space-2` before the label; the icon and label sit centred in the button together.
+- Keyboard: Tab goes top to bottom (the switch, Snooze 5 min, Skip, Settings…, Quit), with the focus ring of the dialogs. Space and Enter act; there is no default button, so Enter on the switch flips it. Esc closes the flyout.
 
 ### Controls
 
@@ -162,7 +178,7 @@ Sizes are at 96 DPI. `on-ink` is the `surface` token. The "Press / on" column is
 | --- | --- | --- | --- | --- | --- |
 | primary | `action` | `action-hover` | `action-hover` | `on-action` | Start, Save. At least 80 wide. |
 | secondary | `surface-raised`, 1px `line-strong` | `surface-sunken` | `line` | `ink` | Snooze 5 min, Cancel, Change… |
-| ghost | none | `surface-sunken` | `line` | `ink` | Skip, the popup's close ×. |
+| ghost | none | `surface-sunken` | `line` | `ink` | Skip, the popup's close ×, the flyout's Settings… and Quit. |
 
 - `size-button` tall, `space-3` side padding, `radius-sm`, label in `body-strong`.
 - One primary button per window at most, and none in the popup. No colour on a label.
@@ -182,14 +198,15 @@ Sizes are at 96 DPI. `on-ink` is the `surface` token. The "Press / on" column is
 
 - Ship each state as an .ico with 16, 20, 24 and 32 px frames. The exe icon (On) adds 48 and 256 px frames.
 - **The mark** is `breakpoint-dot.svg`. There is no wordmark file: set "breakpoint" in lowercase in Segoe UI Variable Display at 600 beside or under the dot, with clear space of half the dot's width.
-- The tray menu is the native Windows menu. Style it only through its copy: sentence case, "…" on items that open a window. No badge, number or animation on the tray icon.
+- **Icons** (16px grid), on the flyout's footer buttons: a gear (one polygon with eight teeth and a round hole) and the power sign (a ring open at the top, 1.5 stroke, and a stem through the gap). Painted from code like the glyphs.
+- There is no native tray menu: the tray flyout is painted (§6). Its copy keeps sentence case and "…" on items that open a window. No badge, number or animation on the tray icon.
 
 ## 8. Motion
 
 - The popup fades in over 150 ms and out over 100 ms.
 - Buttons and the close × answer the pointer. Hover: the fill changes over 150 ms, and back over 120 ms when the pointer leaves. Press: the fill goes one step further within 90 ms and the label moves down 1px. Release: back to hover.
 - The switch knob slides over 150 ms. Day pills, checkboxes, steppers, the segmented toggle and the drop-down answer the pointer as buttons do: hover over 150 ms in and 120 ms out, press within 90 ms.
-- The drop-down menu appears and goes at once, with no fade.
+- The drop-down menu and the tray flyout appear and go at once, with no fade, as a menu does.
 - The focus ring shows at once, with no transition.
 - A Firm repeat shows the popup again the same way. It does not shake, flash or grow.
 - When Windows animation is off (`SPI_GETCLIENTAREAANIMATION`), nothing moves: everything changes at once, and the switch knob jumps to its place.
