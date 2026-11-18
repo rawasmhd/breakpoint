@@ -2,10 +2,8 @@
 //!
 //! Times are offsets on one monotonic timeline whose origin the platform picks (start-up).
 //! [`Tracker`] holds what the session and power events said; each poll combines that with the
-//! last input and, only when the silence is long enough to matter, the vetoes (SPEC §4).
-//!
-//! SPEC §4 lets the vetoes be checked once input has stopped for 10 s. They only change the
-//! verdict at [`AWAY_AFTER`], so that is when the tracker asks, which keeps within the rule.
+//! last keyboard or mouse input (SPEC §4). Nothing else explains a silence: a call, a video or
+//! a full-screen app with no input for [`AWAY_AFTER`] is `Away`.
 
 use std::time::Duration;
 
@@ -19,8 +17,6 @@ pub const AWAY_AFTER: Duration = Duration::from_secs(90);
 pub enum Presence {
     /// Input within the last [`AWAY_AFTER`], or an event that says the user is back.
     Active,
-    /// No input for [`AWAY_AFTER`], but a veto explains the silence: present, not typing.
-    AtDesk,
     /// Not at the computer since `since`, the time of the last input (not when it was noticed).
     Away { since: Duration, reason: AwayReason },
     /// The machine woke itself and nobody has touched it since.
@@ -30,7 +26,7 @@ pub enum Presence {
 /// Why the user is `Away`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AwayReason {
-    /// No input for [`AWAY_AFTER`] and no veto.
+    /// No keyboard or mouse input for [`AWAY_AFTER`].
     NoInput,
     /// Windows' own user-inactive verdict (`GUID_SESSION_USER_PRESENCE`).
     UserInactive,
@@ -64,8 +60,8 @@ impl AwayReason {
 }
 
 impl Presence {
-    /// Classifies one poll on input alone, with no vetoes and no events: `now` and the last
-    /// input, both on the core's timeline.
+    /// Classifies one poll on input alone, with no events: `now` and the last input, both on
+    /// the core's timeline.
     pub fn from_last_input(now: Duration, last_input: Duration) -> Self {
         if now.saturating_sub(last_input) < AWAY_AFTER {
             Presence::Active
@@ -80,7 +76,7 @@ impl Presence {
     /// Whether time spent in this state is active time and advances the cadences.
     pub fn counts_as_active(self) -> bool {
         match self {
-            Presence::Active | Presence::AtDesk => true,
+            Presence::Active => true,
             Presence::Away { .. } | Presence::Unknown => false,
         }
     }
@@ -113,18 +109,6 @@ pub enum Signal {
     UserPresent,
 }
 
-/// What explains a long silence, asked for by [`Tracker::poll`] only once input has stopped
-/// for [`AWAY_AFTER`]. The platform answers from the shell, the power manager and the media
-/// controls.
-pub trait Vetoes {
-    /// Full screen, busy or presentation mode (`SHQueryUserNotificationState`).
-    fn shell_busy(&mut self) -> bool;
-    /// Some app holds the display on (`ES_DISPLAY_REQUIRED`).
-    fn display_required(&mut self) -> bool;
-    /// Media is playing; `None` when the media-controls call failed.
-    fn media_playing(&mut self) -> Option<bool>;
-}
-
 /// The presence state machine: remembers what events said and turns each poll into a
 /// [`Presence`].
 #[derive(Debug)]
@@ -147,8 +131,6 @@ pub struct Tracker {
     /// Input older than this is ignored: set by every event that means the user is here, and
     /// by any resume, so a measurement from before does not count (SPEC §12.3).
     rearmed: Duration,
-    /// False once the media-controls call has failed: no media veto for the rest of the session.
-    media_veto: bool,
 }
 
 impl Default for Tracker {
@@ -167,7 +149,6 @@ impl Tracker {
             unattended: None,
             woken_by_user: false,
             rearmed: Duration::ZERO,
-            media_veto: true,
         }
     }
 
@@ -218,14 +199,8 @@ impl Tracker {
         }
     }
 
-    /// One poll at `now` with the platform's last input. `vetoes` is asked only when the
-    /// answer can change the verdict, and the media veto only until its first failure.
-    pub fn poll(
-        &mut self,
-        now: Duration,
-        last_input: Duration,
-        vetoes: &mut impl Vetoes,
-    ) -> Presence {
+    /// One poll at `now` with the platform's last input.
+    pub fn poll(&mut self, now: Duration, last_input: Duration) -> Presence {
         let last_input = self.last_input(last_input);
         // Input after an event ends the states that input can end.
         for since in [&mut self.asleep, &mut self.display_off, &mut self.inactive] {
@@ -258,26 +233,7 @@ impl Tracker {
             };
         }
 
-        match Presence::from_last_input(now, last_input) {
-            Presence::Away { .. } if self.vetoed(vetoes) => Presence::AtDesk,
-            presence => presence,
-        }
-    }
-
-    fn vetoed(&mut self, vetoes: &mut impl Vetoes) -> bool {
-        if vetoes.display_required() || vetoes.shell_busy() {
-            return true;
-        }
-        if !self.media_veto {
-            return false;
-        }
-        match vetoes.media_playing() {
-            Some(playing) => playing,
-            None => {
-                self.media_veto = false;
-                false
-            }
-        }
+        Presence::from_last_input(now, last_input)
     }
 
     /// An event that means the user is here: they count as having just given input.
@@ -306,39 +262,6 @@ mod tests {
         }
     }
 
-    /// Vetoes with fixed answers that count how often each was asked.
-    #[derive(Default)]
-    struct Fake {
-        shell: bool,
-        display: bool,
-        media: Option<bool>,
-        asked: [u32; 3],
-    }
-
-    impl Fake {
-        fn none() -> Self {
-            Fake {
-                media: Some(false),
-                ..Fake::default()
-            }
-        }
-    }
-
-    impl Vetoes for Fake {
-        fn shell_busy(&mut self) -> bool {
-            self.asked[0] += 1;
-            self.shell
-        }
-        fn display_required(&mut self) -> bool {
-            self.asked[1] += 1;
-            self.display
-        }
-        fn media_playing(&mut self) -> Option<bool> {
-            self.asked[2] += 1;
-            self.media
-        }
-    }
-
     #[test]
     fn input_within_90_s_is_active() {
         assert_eq!(
@@ -363,95 +286,17 @@ mod tests {
     #[test]
     fn the_poll_alone_is_active_then_away_since_the_last_input() {
         let mut t = Tracker::new();
-        let mut v = Fake::none();
-        assert_eq!(t.poll(s(1000), s(1000), &mut v), Presence::Active);
-        assert_eq!(t.poll(s(1089), s(1000), &mut v), Presence::Active);
-        assert_eq!(
-            t.poll(s(1090), s(1000), &mut v),
-            away(1000, AwayReason::NoInput)
-        );
-        assert_eq!(t.poll(s(1095), s(1094), &mut v), Presence::Active);
-    }
-
-    #[test]
-    fn vetoes_are_not_asked_before_the_silence_matters() {
-        let mut t = Tracker::new();
-        let mut v = Fake::none();
-        t.poll(s(1005), s(1000), &mut v);
-        t.poll(s(1015), s(1000), &mut v);
-        t.poll(s(1085), s(1000), &mut v);
-        assert_eq!(v.asked, [0, 0, 0]);
-        t.poll(s(1090), s(1000), &mut v);
-        assert_eq!(v.asked, [1, 1, 1]);
-    }
-
-    #[test]
-    fn each_veto_makes_a_long_silence_at_desk() {
-        for fake in [
-            Fake {
-                shell: true,
-                ..Fake::none()
-            },
-            Fake {
-                display: true,
-                ..Fake::none()
-            },
-            Fake {
-                media: Some(true),
-                ..Fake::none()
-            },
-        ] {
-            let mut v = fake;
-            let mut t = Tracker::new();
-            assert_eq!(t.poll(s(1180), s(1000), &mut v), Presence::AtDesk);
-        }
-    }
-
-    #[test]
-    fn at_desk_turns_away_since_the_last_input_when_the_veto_ends() {
-        let mut t = Tracker::new();
-        let mut v = Fake {
-            media: Some(true),
-            ..Fake::none()
-        };
-        assert_eq!(t.poll(s(1180), s(1000), &mut v), Presence::AtDesk);
-        v.media = Some(false);
-        assert_eq!(
-            t.poll(s(1185), s(1000), &mut v),
-            away(1000, AwayReason::NoInput)
-        );
-    }
-
-    #[test]
-    fn a_failed_media_call_drops_that_veto_for_the_session() {
-        let mut t = Tracker::new();
-        let mut v = Fake {
-            media: None,
-            ..Fake::none()
-        };
-        assert_eq!(
-            t.poll(s(1090), s(1000), &mut v),
-            away(1000, AwayReason::NoInput)
-        );
-        assert_eq!(v.asked[2], 1);
-        // Even once the call would work, it is never asked again.
-        v.media = Some(true);
-        assert_eq!(
-            t.poll(s(1095), s(1000), &mut v),
-            away(1000, AwayReason::NoInput)
-        );
-        assert_eq!(v.asked[2], 1);
-        // The other vetoes still work.
-        v.shell = true;
-        assert_eq!(t.poll(s(1100), s(1000), &mut v), Presence::AtDesk);
+        assert_eq!(t.poll(s(1000), s(1000)), Presence::Active);
+        assert_eq!(t.poll(s(1089), s(1000)), Presence::Active);
+        assert_eq!(t.poll(s(1090), s(1000)), away(1000, AwayReason::NoInput));
+        assert_eq!(t.poll(s(1095), s(1094)), Presence::Active);
     }
 
     #[test]
     fn lock_is_away_at_once_since_the_last_input_and_counts_as_a_lock() {
         let mut t = Tracker::new();
-        let mut v = Fake::none();
         t.signal(s(1010), s(1008), Signal::Lock);
-        let p = t.poll(s(1010), s(1008), &mut v);
+        let p = t.poll(s(1010), s(1008));
         assert_eq!(p, away(1008, AwayReason::Lock));
         assert!(p.is_lock());
         assert!(!p.counts_as_active());
@@ -460,63 +305,46 @@ mod tests {
     #[test]
     fn input_on_the_lock_screen_does_not_end_the_lock() {
         let mut t = Tracker::new();
-        let mut v = Fake::none();
         t.signal(s(1010), s(1008), Signal::Lock);
-        assert_eq!(
-            t.poll(s(1500), s(1499), &mut v),
-            away(1008, AwayReason::Lock)
-        );
+        assert_eq!(t.poll(s(1500), s(1499)), away(1008, AwayReason::Lock));
     }
 
     #[test]
     fn unlock_is_active_even_without_input() {
         let mut t = Tracker::new();
-        let mut v = Fake::none();
         t.signal(s(1010), s(1008), Signal::Lock);
         // Windows Hello face sign-in: no input at all.
         t.signal(s(2000), s(1008), Signal::Unlock);
-        assert_eq!(t.poll(s(2000), s(1008), &mut v), Presence::Active);
+        assert_eq!(t.poll(s(2000), s(1008)), Presence::Active);
         // Measured afresh from the unlock.
-        assert_eq!(t.poll(s(2089), s(1008), &mut v), Presence::Active);
-        assert_eq!(
-            t.poll(s(2090), s(1008), &mut v),
-            away(2000, AwayReason::NoInput)
-        );
+        assert_eq!(t.poll(s(2089), s(1008)), Presence::Active);
+        assert_eq!(t.poll(s(2090), s(1008)), away(2000, AwayReason::NoInput));
     }
 
     #[test]
     fn disconnect_is_a_lock_until_connect() {
         let mut t = Tracker::new();
-        let mut v = Fake::none();
         t.signal(s(1010), s(1000), Signal::Disconnect);
-        let p = t.poll(s(1015), s(1000), &mut v);
+        let p = t.poll(s(1015), s(1000));
         assert_eq!(p, away(1000, AwayReason::Lock));
         assert!(p.is_lock());
         t.signal(s(3000), s(1000), Signal::Connect);
-        assert_eq!(t.poll(s(3000), s(1000), &mut v), Presence::Active);
+        assert_eq!(t.poll(s(3000), s(1000)), Presence::Active);
     }
 
     #[test]
     fn an_earlier_silence_keeps_its_since_when_a_lock_follows() {
         let mut t = Tracker::new();
-        let mut v = Fake::none();
-        assert_eq!(
-            t.poll(s(1200), s(1000), &mut v),
-            away(1000, AwayReason::NoInput)
-        );
+        assert_eq!(t.poll(s(1200), s(1000)), away(1000, AwayReason::NoInput));
         t.signal(s(1300), s(1000), Signal::Lock);
-        assert_eq!(
-            t.poll(s(1300), s(1000), &mut v),
-            away(1000, AwayReason::Lock)
-        );
+        assert_eq!(t.poll(s(1300), s(1000)), away(1000, AwayReason::Lock));
     }
 
     #[test]
     fn suspend_is_away_and_counts_as_a_lock() {
         let mut t = Tracker::new();
-        let mut v = Fake::none();
         t.signal(s(1010), s(1009), Signal::Suspend);
-        let p = t.poll(s(1010), s(1009), &mut v);
+        let p = t.poll(s(1010), s(1009));
         assert_eq!(p, away(1009, AwayReason::Suspend));
         assert!(p.is_lock());
     }
@@ -524,46 +352,39 @@ mod tests {
     #[test]
     fn a_user_resume_is_active_and_rearms_the_idle_measurement() {
         let mut t = Tracker::new();
-        let mut v = Fake::none();
         t.signal(s(1010), s(1009), Signal::Suspend);
         t.signal(s(5000), s(1009), Signal::ResumeAutomatic);
         t.signal(s(5000), s(1009), Signal::Resume);
         // The pre-sleep input reading is ignored: no instant Away after waking.
-        assert_eq!(t.poll(s(5005), s(1009), &mut v), Presence::Active);
-        assert_eq!(
-            t.poll(s(5090), s(1009), &mut v),
-            away(5000, AwayReason::NoInput)
-        );
+        assert_eq!(t.poll(s(5005), s(1009)), Presence::Active);
+        assert_eq!(t.poll(s(5090), s(1009)), away(5000, AwayReason::NoInput));
     }
 
     #[test]
     fn a_user_resume_before_the_automatic_one_is_still_active() {
         // Seen on a real wake: PBT_APMRESUMESUSPEND, then PBT_APMRESUMEAUTOMATIC.
         let mut t = Tracker::new();
-        let mut v = Fake::none();
         t.signal(s(1010), s(1009), Signal::Suspend);
         t.signal(s(5000), s(1009), Signal::Resume);
         t.signal(s(5000), s(1009), Signal::ResumeAutomatic);
-        assert_eq!(t.poll(s(5005), s(1009), &mut v), Presence::Active);
+        assert_eq!(t.poll(s(5005), s(1009)), Presence::Active);
         // The next sleep starts afresh: an automatic wake alone is Unknown again.
         t.signal(s(6000), s(5900), Signal::Suspend);
         t.signal(s(9000), s(5900), Signal::ResumeAutomatic);
-        assert_eq!(t.poll(s(9005), s(5900), &mut v), Presence::Unknown);
+        assert_eq!(t.poll(s(9005), s(5900)), Presence::Unknown);
     }
 
     #[test]
     fn an_automatic_resume_alone_is_unknown_until_input() {
         let mut t = Tracker::new();
-        let mut v = Fake::none();
         t.signal(s(1010), s(1009), Signal::Suspend);
         t.signal(s(5000), s(1009), Signal::ResumeAutomatic);
-        assert_eq!(t.poll(s(5005), s(1009), &mut v), Presence::Unknown);
+        assert_eq!(t.poll(s(5005), s(1009)), Presence::Unknown);
         // Still Unknown long after the 90 s: nobody is known to be here, nor known to be gone.
-        assert_eq!(t.poll(s(5600), s(1009), &mut v), Presence::Unknown);
+        assert_eq!(t.poll(s(5600), s(1009)), Presence::Unknown);
         assert!(!Presence::Unknown.counts_as_active());
-        assert_eq!(v.asked, [0, 0, 0]);
         // Input arrives.
-        assert_eq!(t.poll(s(5605), s(5603), &mut v), Presence::Active);
+        assert_eq!(t.poll(s(5605), s(5603)), Presence::Active);
     }
 
     #[test]
@@ -571,101 +392,68 @@ mod tests {
         // The tick count and the core's clock can disagree across sleep; a reading that lands
         // before the resume is not input.
         let mut t = Tracker::new();
-        let mut v = Fake::none();
         t.signal(s(1010), s(1009), Signal::Suspend);
         t.signal(s(5000), s(0), Signal::ResumeAutomatic);
-        assert_eq!(t.poll(s(5005), s(0), &mut v), Presence::Unknown);
+        assert_eq!(t.poll(s(5005), s(0)), Presence::Unknown);
     }
 
     #[test]
     fn input_after_a_suspend_ends_it_if_the_resume_was_missed() {
         let mut t = Tracker::new();
-        let mut v = Fake::none();
         t.signal(s(1010), s(1009), Signal::Suspend);
-        assert_eq!(t.poll(s(5005), s(5004), &mut v), Presence::Active);
+        assert_eq!(t.poll(s(5005), s(5004)), Presence::Active);
     }
 
     #[test]
     fn a_lock_held_across_sleep_stays_a_lock_after_waking() {
         let mut t = Tracker::new();
-        let mut v = Fake::none();
         t.signal(s(1000), s(999), Signal::Lock);
         t.signal(s(1010), s(999), Signal::Suspend);
         t.signal(s(5000), s(999), Signal::ResumeAutomatic);
         t.signal(s(5000), s(999), Signal::Resume);
-        assert_eq!(
-            t.poll(s(5005), s(5004), &mut v),
-            away(999, AwayReason::Lock)
-        );
+        assert_eq!(t.poll(s(5005), s(5004)), away(999, AwayReason::Lock));
         t.signal(s(5020), s(5004), Signal::Unlock);
-        assert_eq!(t.poll(s(5020), s(5004), &mut v), Presence::Active);
+        assert_eq!(t.poll(s(5020), s(5004)), Presence::Active);
     }
 
     #[test]
     fn display_off_is_away_at_once_and_counts_as_a_lock() {
         let mut t = Tracker::new();
-        let mut v = Fake::none();
         t.signal(s(1600), s(1000), Signal::DisplayOff);
-        let p = t.poll(s(1600), s(1000), &mut v);
+        let p = t.poll(s(1600), s(1000));
         assert_eq!(p, away(1000, AwayReason::DisplayOff));
         assert!(p.is_lock());
     }
 
     #[test]
-    fn display_off_wins_over_a_veto() {
-        let mut t = Tracker::new();
-        let mut v = Fake {
-            display: true,
-            ..Fake::none()
-        };
-        t.signal(s(1600), s(1000), Signal::DisplayOff);
-        assert_eq!(
-            t.poll(s(1605), s(1000), &mut v),
-            away(1000, AwayReason::DisplayOff)
-        );
-    }
-
-    #[test]
     fn display_on_is_active() {
         let mut t = Tracker::new();
-        let mut v = Fake::none();
         t.signal(s(1600), s(1000), Signal::DisplayOff);
         t.signal(s(2000), s(1000), Signal::DisplayOn);
-        assert_eq!(t.poll(s(2000), s(1000), &mut v), Presence::Active);
+        assert_eq!(t.poll(s(2000), s(1000)), Presence::Active);
     }
 
     #[test]
     fn input_ends_display_off_if_display_on_was_missed() {
         let mut t = Tracker::new();
-        let mut v = Fake::none();
         t.signal(s(1600), s(1000), Signal::DisplayOff);
-        assert_eq!(t.poll(s(2005), s(2003), &mut v), Presence::Active);
+        assert_eq!(t.poll(s(2005), s(2003)), Presence::Active);
     }
 
     #[test]
     fn display_on_under_a_lock_is_still_the_lock() {
         let mut t = Tracker::new();
-        let mut v = Fake::none();
         t.signal(s(1000), s(999), Signal::Lock);
         t.signal(s(1600), s(999), Signal::DisplayOff);
         t.signal(s(2000), s(999), Signal::DisplayOn);
-        assert_eq!(
-            t.poll(s(2000), s(1999), &mut v),
-            away(999, AwayReason::Lock)
-        );
+        assert_eq!(t.poll(s(2000), s(1999)), away(999, AwayReason::Lock));
     }
 
     #[test]
     fn user_inactive_is_away_since_the_last_input_like_no_input() {
         let mut t = Tracker::new();
-        let mut v = Fake {
-            media: Some(true),
-            ..Fake::none()
-        };
-        // A podcast left playing vetoes the poll, but Windows' verdict wins.
-        assert_eq!(t.poll(s(1100), s(1000), &mut v), Presence::AtDesk);
         t.signal(s(1300), s(1000), Signal::UserInactive);
-        let p = t.poll(s(1300), s(1000), &mut v);
+        let p = t.poll(s(1300), s(1000));
         assert_eq!(p, away(1000, AwayReason::UserInactive));
         assert!(!p.is_lock());
         assert_eq!(AwayReason::UserInactive.logged_as(), "away");
@@ -674,24 +462,21 @@ mod tests {
     #[test]
     fn user_present_is_active() {
         let mut t = Tracker::new();
-        let mut v = Fake::none();
         t.signal(s(1300), s(1000), Signal::UserInactive);
         t.signal(s(2000), s(1000), Signal::UserPresent);
-        assert_eq!(t.poll(s(2000), s(1000), &mut v), Presence::Active);
+        assert_eq!(t.poll(s(2000), s(1000)), Presence::Active);
     }
 
     #[test]
     fn input_ends_user_inactive() {
         let mut t = Tracker::new();
-        let mut v = Fake::none();
         t.signal(s(1300), s(1000), Signal::UserInactive);
-        assert_eq!(t.poll(s(2000), s(1999), &mut v), Presence::Active);
+        assert_eq!(t.poll(s(2000), s(1999)), Presence::Active);
     }
 
     #[test]
-    fn at_desk_and_active_are_active_time() {
+    fn only_active_is_active_time() {
         assert!(Presence::Active.counts_as_active());
-        assert!(Presence::AtDesk.counts_as_active());
         assert!(!away(0, AwayReason::NoInput).counts_as_active());
     }
 

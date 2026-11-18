@@ -33,7 +33,7 @@ Ending a pending occurrence as skipped on purpose. Affects only that occurrence;
 _Avoid_: dismiss, ignore, cancel, mute
 
 **Away**:
-The presence state in which the user is not at the computer: no input for a while, with nothing on screen that explains the silence, or the session locked or the machine asleep. Any input ends it.
+The presence state in which the user is not at the computer: no keyboard or mouse input for a while, or the session locked or the machine asleep. A call or a video does not count as being there. Any input ends it.
 _Avoid_: idle, inactive, AFK, absent
 
 **Stand length**:
@@ -65,7 +65,7 @@ breakpoint's own small window above the tray that shows a nudge, with its Snooze
 _Avoid_: toast, notification, dialog, alert
 
 **Active time**:
-Time the user is actually at the computer: typing, or sitting still while a full-screen app, a video or a presentation explains the silence. Away, locked and asleep periods do not count, so a cadence of 30 minutes means 30 minutes at the desk.
+Time the user is actually at the computer, measured by keyboard and mouse input. Away, locked and asleep periods do not count, so a cadence of 30 minutes means 30 minutes at the desk.
 _Avoid_: uptime, wall-clock time, elapsed time
 
 **Work day**:

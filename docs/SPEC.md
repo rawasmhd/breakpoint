@@ -67,20 +67,20 @@ The wording is copy, free to polish without a product decision; what each nudge 
 
 From [Activity and presence detection on Windows](https://github.com/rawasmhd/breakpoint/issues/25) ([findings](https://github.com/rawasmhd/breakpoint/blob/research/presence-detection/docs/research/presence-detection.md)).
 
-One **Presence** state machine: `Active`, `AtDesk`, `Away { since, reason }`, `Unknown`.
+One **Presence** state machine: `Active`, `Away { since, reason }`, `Unknown`.
 
 - **Poll every 5 s:** `GetLastInputInfo`. Input within the last 90 s is `Active`.
-- **No input for 90 s or more without a veto** is `Away` with reason *no input*, and `since` is **the time of the last input**, not the moment it was detected. Every length check (stand length, pause length, the resets in §5.2, the popup countdown) measures from `since`.
-- **Vetoes:** when the shell reports full-screen, busy or presentation mode (`SHQueryUserNotificationState`), an app holds the display on (`ES_DISPLAY_REQUIRED`), or media is playing (Global System Media Transport Controls), 90 s or more without input is `AtDesk` instead: present but not typing. Vetoes are checked only once input has stopped for 10 s. If the media-controls call fails once, breakpoint runs without that veto for the rest of the session.
+- **No keyboard or mouse input for 90 s or more** is `Away` with reason *no input*, and `since` is **the time of the last input**, not the moment it was detected. Every length check (stand length, pause length, the resets in §5.2, the popup countdown) measures from `since`.
+- **Input only, no vetoes:** nothing on screen explains a silence. A call, a video, a presentation or a full-screen app with no keyboard or mouse input for 90 s is `Away` too. (Up to 0.1.1 breakpoint had vetoes that made such a silence `AtDesk`; a Teams meeting holds the display on for its whole length, so the popup countdown froze at its full length and a Stand could not be satisfied by stepping away. Removed on Rawas's call, 2026-11-18.)
 - **Events win over the poll:**
   - Session lock, console or remote disconnect (including fast user switching) and suspend make the user `Away` at once; they count as a **lock** (§5.2, §5.5), logged `lock` or `suspend`.
   - Display off (`GUID_SESSION_DISPLAY_STATUS`) makes the user `Away` at once and counts like a lock, logged `display_off`.
   - Windows' user-inactive verdict (`GUID_SESSION_USER_PRESENCE`) makes the user `Away` with `since` at the last input; it satisfies only after the length, like no input, logged `away`.
   - Unlock, connect, resume from suspend, display on and user-present make the user `Active`. An automatic resume alone is `Unknown` until input arrives.
-- The 90 s threshold, the 5 s poll and the vetoes are **hard-coded**, not settings.
+- The 90 s threshold and the 5 s poll are **hard-coded**, not settings.
 - No camera, no presence sensor, no keyboard hooks, no inspection of other processes.
 
-**Active time** is time spent `Active` or `AtDesk`. Every cadence, the snooze and the Firm repeat count active time only; time `Away` or `Unknown`, and all quiet time, does not advance them. Active time is not backdated: the up to 90 s of silence before `Away` is declared counts as active.
+**Active time** is time spent `Active`. Every cadence, the snooze and the Firm repeat count active time only; time `Away` or `Unknown`, and all quiet time, does not advance them. Active time is not backdated: the up to 90 s of silence before `Away` is declared counts as active.
 
 **Known blind spots, accepted:** standing at a sit-stand desk while typing (looks Active; the user presses Skip), hardware or software mouse jigglers, a windowed video that neither sets display-required nor reports to the media controls (can look Away), long reading without input (can look Away).
 
@@ -158,7 +158,7 @@ Decided in [Notification channel: toast vs popup](https://github.com/rawasmhd/br
 
 - breakpoint's own small raw-Win32 window, bottom-right of the primary monitor's work area, just above the tray. Always on top.
 - Shown **without taking focus** (`WS_EX_NOACTIVATE`, `SW_SHOWNOACTIVATE`, `MA_NOACTIVATE`), so typing never lands on it.
-- Content: title, line, a riding Water line if any, a **live away countdown** of the stand or pause length measured from the last input ("Away 1:59 more and it counts"; restarts on any input), and the buttons **Snooze 5 min** and **Skip** (Skip only after the snooze). While a veto applies (§4) the countdown holds at the full length and does not run. The countdown is a display of Presence; satisfaction is decided by Presence (§5.5), never by the countdown alone.
+- Content: title, line, a riding Water line if any, a **live away countdown** of the stand or pause length measured from the last input ("Away 1:59 more and it counts"; restarts on any input), and the buttons **Snooze 5 min** and **Skip** (Skip only after the snooze). The countdown is a display of Presence; satisfaction is decided by Presence (§5.5), never by the countdown alone.
 - **×** (the popup's own close) hides it; the occurrence stays pending and is still reachable from the tray. Snooze hides it until the re-prompt. **Any ending** (satisfied, skipped, any expiry) closes it; an expiry with cause `next` is replaced by the new occurrence's popup.
 - At most one popup on screen. A Firm repeat brings the same window back unchanged.
 - It **ignores Windows Do not disturb** by design; only breakpoint's quiet rules silence it. In v1 this means a popup can appear over a presentation or screen share (see §15).
@@ -359,7 +359,7 @@ src/
   platform/          Windows only
     tray.rs          the notification icon: its states, tooltip and clicks
     flyout.rs        the tray flyout, built from the kit: content, layout, placement
-    presence.rs      GetLastInputInfo, vetoes, session and power notifications
+    presence.rs      GetLastInputInfo, session and power notifications
     popup.rs         the nudge popup window
     kit/             the painted dialog window, the borderless popup window, and their controls (switch, day pill, stepper, toggle, drop-down, cards), keyboard, focus, UI Automation
     settings_window.rs  the settings window, built from the kit
@@ -376,7 +376,7 @@ tests/
 
 - Release profile: `opt-level = "z"`, `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true`; `#![windows_subsystem = "windows"]` (no console).
 - Size reference (prototypes, this profile): bare `windows` exe 110 KB; with the popup 153 KB.
-- **Dev aid, debug builds only:** the environment variable `BREAKPOINT_MINUTE_SECS` (a positive number, fractions allowed) makes one minute that many seconds, for every duration given in minutes: cadences, stand and pause lengths, snooze, the Firm repeat and the combined-nudge window. The durations given in seconds (the 90 s Away threshold, the 5 s poll, the 10 s veto delay, Water alone's 7 s) stay real. Release builds ignore it.
+- **Dev aid, debug builds only:** the environment variable `BREAKPOINT_MINUTE_SECS` (a positive number, fractions allowed) makes one minute that many seconds, for every duration given in minutes: cadences, stand and pause lengths, snooze, the Firm repeat and the combined-nudge window. The durations given in seconds (the 90 s Away threshold, the 5 s poll, Water alone's 7 s) stay real. Release builds ignore it.
 - Presence registration must retry `WTSRegisterSessionNotification` on early-logon failure, re-arm idle measurements after any resume, and fall back to a hidden top-level window if suspend broadcasts do not reach a message-only window (see the presence findings, "What this design will get wrong").
 
 ## 13. Distribution
@@ -402,7 +402,7 @@ Terms used above are defined in [GLOSSARY.md](../GLOSSARY.md): nudge, occurrence
 
 The map left these small gaps; the rewrite closed them with the leanest option, under Rawas's delegation of 2026-11-02 ("Choose the recommended options from your end"). Each can be overturned without touching anything else.
 
-1. **Presence timing:** `Active` is input within 90 s; `AtDesk` (renamed from the research's IdleAtDesk) is a veto beyond that; `Away.since` is the last input; active time counts `Active` and `AtDesk` and is not backdated (§4).
+1. **Presence timing:** `Active` is input within 90 s; `Away.since` is the last input; active time counts `Active` and is not backdated (§4). The research's IdleAtDesk (later `AtDesk`, a veto beyond 90 s) was removed on 2026-11-18: keyboard and mouse input alone decide.
 2. **Disconnect, fast user switching and display-off count as a lock**; Windows' user-inactive verdict counts as no input (§4).
 3. **The presence sensor is dropped** (the research used it opportunistically when present): few machines have one and it adds a WinRT sensors dependency. Back to the fog (§17).
 4. **The focus period's "long absence"** is `Away` for at least the pause length, and any satisfied occurrence restarts its own clock (§5.2).
@@ -410,7 +410,7 @@ The map left these small gaps; the rewrite closed them with the leanest option, 
 6. **Combined nudge:** fires when the first of the two falls due; a Stand/Move and a Pause pending at the same time always merge, Pause absorbing (§5.3).
 7. **Water** joins only a newly fired popup, its clock restarts when shown, quiet start drops a waiting Water, and with both other nudges off it fires alone at once (§5.4).
 8. **A pending occurrence keeps the length it fired with** after a settings change, as it keeps its level (§5.7).
-9. **The countdown holds during a veto**; any ending closes the popup (§6).
+9. **The countdown runs from the last input** and restarts on input; any ending closes the popup (§6).
 10. **The off switch in every state** (§7 table), menu order and icon (§8). The menu is now the tray flyout and its Nudges switch ([Tray flyout](https://github.com/rawasmhd/breakpoint/issues/89)).
 11. **The `config.json` shape** and its fallbacks (§10.1).
 12. **The bad-config notice** sits in the popup's place, no buttons, until closed (§10.1).
